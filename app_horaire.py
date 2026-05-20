@@ -1,0 +1,1713 @@
+# -*- coding: utf-8 -*-
+"""
+HoraireManager - Prison de Namur / SPF Justice
+Application web de gestion des horaires rotatifs
+Lancement: python app_horaire.py  -> http://localhost:5050
+"""
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'lib'))
+
+import json
+from datetime import date, timedelta
+from calendar import monthrange, isleap
+from pathlib import Path
+
+from flask import Flask, jsonify, request, render_template_string
+
+from horaire_agent import get_shift, MONTH_NAMES_FR, DAY_NAMES_FR, CYCLE_LEN, ANCHOR
+from conges_bosa import LEAVE_CATALOG, get_public_holidays, get_vac_entitlement, get_sick_capital
+
+app = Flask(__name__)
+_data_dir = Path(os.environ.get("DATA_DIR", str(Path(__file__).parent)))
+DATA_FILE  = _data_dir / "agenda_data.json"
+
+# ─────────────────────── ROOT + PWA ──────────────────────────
+@app.route("/")
+def index():
+    return render_template_string(HTML)
+
+@app.route("/manifest.json")
+def pwa_manifest():
+    return jsonify({
+        "name": "HoraireManager — Prison de Namur",
+        "short_name": "Horaire",
+        "description": "Gestion des horaires rotatifs SPF Justice",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#0f172a",
+        "theme_color": "#1e293b",
+        "orientation": "any",
+        "icons": [{"src": "/icon.svg", "type": "image/svg+xml", "sizes": "any"}]
+    })
+
+@app.route("/icon.svg")
+def pwa_icon():
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">'
+        '<rect width="100" height="100" rx="20" fill="#0f172a"/>'
+        '<rect x="14" y="28" width="72" height="58" rx="9" fill="none" stroke="#3b82f6" stroke-width="5"/>'
+        '<line x1="14" y1="46" x2="86" y2="46" stroke="#3b82f6" stroke-width="5"/>'
+        '<line x1="34" y1="28" x2="34" y2="18" stroke="#94a3b8" stroke-width="5" stroke-linecap="round"/>'
+        '<line x1="66" y1="28" x2="66" y2="18" stroke="#94a3b8" stroke-width="5" stroke-linecap="round"/>'
+        '<rect x="24" y="54" width="13" height="11" rx="3" fill="#ef4444"/>'
+        '<rect x="44" y="54" width="13" height="11" rx="3" fill="#f97316"/>'
+        '<rect x="64" y="54" width="13" height="11" rx="3" fill="#22c55e"/>'
+        '<rect x="24" y="70" width="13" height="11" rx="3" fill="#22c55e"/>'
+        '<rect x="44" y="70" width="13" height="11" rx="3" fill="#ef4444"/>'
+        '<rect x="64" y="70" width="13" height="11" rx="3" fill="#f97316"/>'
+        '</svg>'
+    )
+    return svg, 200, {"Content-Type": "image/svg+xml"}
+
+# ─────────────────────── DATA HELPERS ────────────────────────
+def load():
+    if DATA_FILE.exists():
+        return json.loads(DATA_FILE.read_text(encoding="utf-8"))
+    return {"agents": {}, "events": []}
+
+def save(data):
+    DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+def _get_4_5_actual_date(d: date, weekday_pref: int, offset: int) -> "date | None":
+    """Return the actual 4/5 rest date for the week containing d.
+    Démarre au jour préféré, glisse à droite sur les R simples seulement.
+    S'arrête dès le premier jour non-R : M/S → jour de repos 4/5,
+    36/38 → absorbé (le 36/38 disparaît, remplacé par 4/5)."""
+    monday = d - timedelta(days=d.weekday())
+    for slide in range(5):
+        candidate = monday + timedelta(weekday_pref + slide)
+        if candidate.weekday() >= 5:
+            return None
+        if get_shift(candidate, offset) != 'R':
+            return candidate   # M, S, 36 ou 38 → c'est le jour 4/5
+    return None
+
+def get_day_info(d: date, agent_id: str, data: dict) -> dict:
+    agent   = data["agents"][agent_id]
+    offset  = agent["team_offset"]
+    base    = get_shift(d, offset)
+    hols    = {h[0]: (h[1], h[2]) for h in get_public_holidays(d.year)}
+    events  = [e for e in data["events"]
+                if e["agent_id"] == agent_id
+                and date.fromisoformat(e["date_start"]) <= d <= date.fromisoformat(e["date_end"])]
+    eff, code, label = base, None, None
+    if d in hols:
+        eff, code, label = hols[d][0], hols[d][0], hols[d][1]
+    if events:
+        ev = events[0]
+        eff, code, label = ev["code"], ev["code"], ev["label"]
+    # Régime 4/5 — seulement si pas de férié/congé déjà posé
+    regime = agent.get("regime_4_5")
+    if regime is not None and d.weekday() < 5 and code is None:
+        actual = _get_4_5_actual_date(d, regime, offset)
+        if actual == d:
+            eff, code, label = 'R', '4/5', 'Régime 4/5'
+    # Couleur
+    if code is None:
+        color = "red" if base == "M" else ("orange" if base == "S" else "green")
+    elif code in ("FERIE", "PONT"):
+        color = "blue"
+    else:
+        color = "green"
+    return {"date": d.isoformat(), "day_num": d.day, "day_name": DAY_NAMES_FR[d.weekday()],
+            "weekday": d.weekday(), "base": base, "effective": eff,
+            "code": code, "label": label, "color": color,
+            "is_today": d == date.today(), "events": events}
+
+# ─────────────────────── API ROUTES ──────────────────────────
+@app.route("/api/agents", methods=["GET"])
+def api_agents():
+    return jsonify(load()["agents"])
+
+@app.route("/api/agents", methods=["POST"])
+def api_add_agent():
+    data = load()
+    body = request.json
+    aid  = body["id"]
+    r45  = body.get("regime_4_5")
+    data["agents"][aid] = {
+        "name":         body["name"],
+        "birth_date":   body.get("birth_date") or None,
+        "career_start": body.get("career_start") or None,
+        "team_offset":  int(body.get("offset", 0)),
+        "regime_4_5":   int(r45) if r45 is not None and r45 != "" else None,
+    }
+    save(data)
+    return jsonify({"ok": True, "id": aid})
+
+@app.route("/api/agents/<aid>", methods=["PATCH"])
+def api_patch_agent(aid):
+    data = load()
+    if aid not in data["agents"]:
+        return jsonify({"error": "Agent inconnu"}), 404
+    body = request.json
+    if "regime_4_5" in body:
+        v = body["regime_4_5"]
+        data["agents"][aid]["regime_4_5"] = int(v) if v is not None else None
+    if "birth_date" in body:
+        data["agents"][aid]["birth_date"] = body["birth_date"] or None
+    if "career_start" in body:
+        data["agents"][aid]["career_start"] = body["career_start"] or None
+    save(data)
+    return jsonify({"ok": True, "agent": data["agents"][aid]})
+
+@app.route("/api/agents/<aid>", methods=["DELETE"])
+def api_del_agent(aid):
+    data = load()
+    data["agents"].pop(aid, None)
+    data["events"] = [e for e in data["events"] if e["agent_id"] != aid]
+    save(data)
+    return jsonify({"ok": True})
+
+@app.route("/api/calendar/<aid>/<int:year>/<int:month>")
+def api_calendar(aid, year, month):
+    data  = load()
+    if aid not in data["agents"]:
+        return jsonify({"error": "Agent inconnu"}), 404
+    days_in_month = monthrange(year, month)[1]
+    first_day_wd  = date(year, month, 1).weekday()   # 0=Lun
+    days = []
+    for d in range(1, days_in_month + 1):
+        days.append(get_day_info(date(year, month, d), aid, data))
+    return jsonify({"year": year, "month": month,
+                    "month_name": MONTH_NAMES_FR[month-1],
+                    "first_weekday": first_day_wd,
+                    "days": days})
+
+@app.route("/api/events", methods=["POST"])
+def api_add_event():
+    data = load()
+    body = request.json
+    aid  = body["agent_id"]
+    if aid not in data["agents"]:
+        return jsonify({"error": "Agent inconnu"}), 400
+    if body["code"] not in LEAVE_CATALOG:
+        return jsonify({"error": f"Code inconnu: {body['code']}"}), 400
+    ev = {"agent_id": aid, "code": body["code"],
+          "label": LEAVE_CATALOG[body["code"]]["label"],
+          "category": LEAVE_CATALOG[body["code"]]["category"],
+          "date_start": body["date_start"], "date_end": body["date_end"],
+          "note": body.get("note", ""), "created": date.today().isoformat()}
+    data["events"].append(ev)
+    save(data)
+    return jsonify({"ok": True})
+
+@app.route("/api/events", methods=["DELETE"])
+def api_del_event():
+    data = load()
+    body = request.json
+    before = len(data["events"])
+    data["events"] = [e for e in data["events"]
+                      if not (e["agent_id"] == body["agent_id"]
+                              and e["date_start"] == body["date_start"]
+                              and e["code"] == body["code"])]
+    save(data)
+    return jsonify({"removed": before - len(data["events"])})
+
+@app.route("/api/balance/<aid>/<int:year>")
+def api_balance(aid, year):
+    data  = load()
+    if aid not in data["agents"]:
+        return jsonify({"error": "Agent inconnu"}), 404
+    agent = data["agents"][aid]
+    # Age exact au 01/01 de l'annee (sans arrondi — pas d'anticipation d'anniversaire)
+    bd_str = agent.get("birth_date")
+    if bd_str:
+        bd  = date.fromisoformat(bd_str)
+        age = year - bd.year - (1 if (1, 1) < (bd.month, bd.day) else 0)
+    else:
+        age = agent.get("age", 40)
+    vac_info  = get_vac_entitlement(age)
+    vac_droit = vac_info["days"]
+    sick_droit = 21   # allocation annuelle indicative affichage solde carte
+    counters   = {}
+    hols       = {h[0] for h in get_public_holidays(year)}
+    offset     = agent["team_offset"]
+    for e in data["events"]:
+        if e["agent_id"] != aid:
+            continue
+        es, ee = date.fromisoformat(e["date_start"]), date.fromisoformat(e["date_end"])
+        code   = e["code"]
+        days   = 0
+        d = es
+        while d <= ee:
+            if d.year == year:
+                base = get_shift(d, offset)
+                if base in ("M","S") and d not in hols:
+                    days += 1
+            d += timedelta(1)
+        counters[code] = counters.get(code, 0) + days
+    vac_used  = counters.get("VAC",  0)
+    sick_used = counters.get("MAL",  0) + counters.get("MAL_LONG", 0)
+    return jsonify({
+        "agent": agent["name"], "year": year, "age": age,
+        "vacances": {"droit": vac_droit,  "utilise": vac_used,  "solde": vac_droit - vac_used},
+        "maladie":  {"droit": sick_droit, "utilise": sick_used, "solde": sick_droit - sick_used},
+        "detail": counters,
+    })
+
+@app.route("/api/entitlements/<aid>/<int:year>")
+def api_entitlements(aid, year):
+    """Tableau de bord complet des droits legaux BOSA pour l'annee donnee."""
+    data = load()
+    if aid not in data["agents"]:
+        return jsonify({"error": "Agent inconnu"}), 404
+    agent  = data["agents"][aid]
+    offset = agent["team_offset"]
+
+    # Age EXACT au 01/01 de l'annee de reference (sans arrondi — sans anticiper l'anniversaire)
+    # L'agent voit l'age qu'il a au debut de l'annee; si son anniversaire change la tranche
+    # en cours d'annee, on affiche la date de changement dans le frontend.
+    bd_str = agent.get("birth_date")
+    if bd_str:
+        bd     = date.fromisoformat(bd_str)
+        # Age au 1er janvier de l'annee cible (exact, pas d'arrondi)
+        age_yr = year - bd.year - (1 if (1, 1) < (bd.month, bd.day) else 0)
+        # Birthday this year (info supplementaire pour le frontend)
+        try:
+            bday_this_year = date(year, bd.month, bd.day).isoformat()
+        except ValueError:
+            bday_this_year = None  # 29 fevrier annee non-bissextile
+    else:
+        age_yr = agent.get("age", 40)
+        bd     = None
+        bday_this_year = None
+
+    # Droits vacances annuels + reliquat
+    vac_info = get_vac_entitlement(age_yr)
+    reliquat = data.get("reliquats", {}).get(aid, {}).get(str(year), 0)
+    # Detecter si l'anniversaire de cette annee change la tranche vacances
+    next_bracket_info = None
+    if bd_str and bday_this_year:
+        age_after_bday = age_yr + 1
+        vac_after = get_vac_entitlement(age_after_bday)
+        if vac_after["days"] != vac_info["days"]:
+            next_bracket_info = {
+                "date":   bday_this_year,
+                "age":    age_after_bday,
+                "days":   vac_after["days"],
+                "delta":  vac_after["days"] - vac_info["days"],
+            }
+
+    # Capital maladie (calcule a partir d'aujourd'hui, annees COMPLETES sans arrondi)
+    cs_str    = agent.get("career_start")
+    sick_info = None
+    if cs_str:
+        cs = date.fromisoformat(cs_str)
+        today = date.today()
+        svc_months = (today.year - cs.year) * 12 + (today.month - cs.month)
+        sick_info = get_sick_capital(svc_months)
+
+    # Cache jours feries par annee
+    _hc: dict = {}
+    def hols(yr):
+        if yr not in _hc:
+            _hc[yr] = {h[0] for h in get_public_holidays(yr)}
+        return _hc[yr]
+
+    # Comptage de tous les conges : cette annee + total toutes annees pour MAL
+    counters_year  = {}   # code -> jours ouvres pris cette annee
+    sick_all_years = 0    # total historique MAL/MAL_LONG pour le capital
+
+    for e in data["events"]:
+        if e["agent_id"] != aid:
+            continue
+        es   = date.fromisoformat(e["date_start"])
+        ee   = date.fromisoformat(e["date_end"])
+        code = e["code"]
+        d = es
+        while d <= ee:
+            base = get_shift(d, offset)
+            if base in ("M", "S") and d not in hols(d.year):
+                if d.year == year:
+                    counters_year[code] = counters_year.get(code, 0) + 1
+                if code in ("MAL", "MAL_LONG"):
+                    sick_all_years += 1
+            d += timedelta(1)
+
+    vac_used = counters_year.get("VAC", 0)
+
+    # Construire le detail de chaque type de conge
+    conges_detail = {}
+    for code, info in LEAVE_CATALOG.items():
+        used_yr = counters_year.get(code, 0)
+        quota   = info.get("days")  # None si variable
+        # Inclure si utilise OU si quota fixe (circonstances, specials)
+        if used_yr > 0 or (quota is not None):
+            conges_detail[code] = {
+                "label":    info["label"],
+                "category": info["category"],
+                "used":     used_yr,
+                "quota":    quota,
+            }
+
+    result = {
+        "agent":              agent["name"],
+        "year":               year,
+        "age_this_year":      age_yr,        # age exact au 01/01 de l'annee
+        "birthday_this_year": bday_this_year,
+        "next_bracket":       next_bracket_info,
+        "birth_date":         bd_str,
+        "career_start":       cs_str,
+        "vacances": {
+            "droit":        vac_info["days"],
+            "reliquat":     reliquat,
+            "total":        vac_info["days"] + reliquat,
+            "utilise":      vac_used,
+            "solde":        vac_info["days"] + reliquat - vac_used,
+            "epargnable_an": vac_info["annual_save"],
+        },
+        "conges_detail": conges_detail,
+    }
+    if sick_info:
+        result["maladie"] = {
+            "capital":       sick_info["capital"],
+            "utilise":       sick_all_years,
+            "solde":         sick_info["capital"] - sick_all_years,
+            "is_advance":    sick_info["is_advance"],
+            "service_months": sick_info["service_months"],
+        }
+    return jsonify(result)
+
+
+@app.route("/api/reliquat/<aid>/<int:year>", methods=["GET", "PUT"])
+def api_reliquat(aid, year):
+    """Reliquat de conges annuels reporte de l'annee precedente."""
+    data = load()
+    if aid not in data["agents"]:
+        return jsonify({"error": "Agent inconnu"}), 404
+    if request.method == "GET":
+        val = data.get("reliquats", {}).get(aid, {}).get(str(year), 0)
+        return jsonify({"reliquat": val})
+    # PUT
+    val = max(0, int(request.json.get("reliquat", 0)))
+    if "reliquats" not in data:
+        data["reliquats"] = {}
+    if aid not in data["reliquats"]:
+        data["reliquats"][aid] = {}
+    data["reliquats"][aid][str(year)] = val
+    save(data)
+    return jsonify({"ok": True, "reliquat": val})
+
+
+@app.route("/api/leaves_catalog")
+def api_catalog():
+    return jsonify({k: {"label": v["label"], "category": v["category"],
+                        "days": v.get("days"), "note": v.get("note","")}
+                    for k,v in LEAVE_CATALOG.items()})
+
+@app.route("/api/day/<aid>/<date_str>")
+def api_day(aid, date_str):
+    data = load()
+    if aid not in data["agents"]:
+        return jsonify({"error": "Agent inconnu"}), 404
+    d = date.fromisoformat(date_str)
+    info = get_day_info(d, aid, data)
+    agent = data["agents"][aid]
+    offset = agent["team_offset"]
+    delta = (d - ANCHOR).days
+    cycle_pos = (delta - offset) % CYCLE_LEN
+    mon = d - timedelta(days=d.weekday())
+    week = [get_day_info(mon + timedelta(i), aid, data) for i in range(7)]
+    shift_hours = {"M": "06:00 – 14:00", "S": "14:00 – 22:00"}.get(info["base"], "Hors service")
+    return jsonify({**info,
+        "week": week,
+        "cycle_pos": cycle_pos + 1,
+        "cycle_len": CYCLE_LEN,
+        "shift_hours": shift_hours,
+        "prev_date": (d - timedelta(1)).isoformat(),
+        "next_date": (d + timedelta(1)).isoformat(),
+    })
+
+@app.route("/api/stats/<aid>/<int:year>")
+def api_stats(aid, year):
+    data = load()
+    if aid not in data["agents"]:
+        return jsonify({"error": "Agent inconnu"}), 404
+    agent  = data["agents"][aid]
+    offset = agent["team_offset"]
+    hols   = {h[0]: h[2] for h in get_public_holidays(year)}
+    months_data = []
+    for m in range(1, 13):
+        cm = cm_s = cr = cf = cl = 0
+        for d in range(1, monthrange(year, m)[1]+1):
+            info = get_day_info(date(year, m, d), aid, data)
+            b = info["base"]
+            if info["code"] in ("FERIE","PONT"): cf += 1
+            elif info["code"]:                   cl += 1
+            elif b == "M":                        cm += 1
+            elif b == "S":                        cm_s += 1
+            else:                                 cr += 1
+        months_data.append({"month": MONTH_NAMES_FR[m-1][:3],
+                             "M": cm, "S": cm_s, "R": cr, "F": cf, "C": cl})
+    return jsonify(months_data)
+
+# ─────────────────────── HTML TEMPLATE ───────────────────────
+HTML = r"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>HoraireManager — Prison de Namur</title>
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#1e293b">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Horaire">
+<link rel="apple-touch-icon" href="/icon.svg">
+<style>
+:root{
+  --red:#ef4444; --orange:#f97316; --green:#22c55e;
+  --green-dark:#16a34a; --red-dark:#dc2626; --orange-dark:#ea580c;
+  --bg:#0f172a; --sidebar:#1e293b; --card:#1e293b; --card2:#263348;
+  --border:#334155; --text:#f1f5f9; --muted:#94a3b8; --accent:#3b82f6;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex}
+
+/* ── SIDEBAR ── */
+#sidebar{width:260px;background:var(--sidebar);display:flex;flex-direction:column;border-right:1px solid var(--border);flex-shrink:0}
+#sidebar .logo{padding:24px 20px;border-bottom:1px solid var(--border)}
+#sidebar .logo h1{font-size:16px;font-weight:700;color:var(--text);letter-spacing:.5px}
+#sidebar .logo p{font-size:11px;color:var(--muted);margin-top:3px}
+.nav-section{padding:16px 12px 8px;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1px}
+.nav-btn{display:flex;align-items:center;gap:10px;padding:10px 16px;border-radius:8px;cursor:pointer;font-size:13px;color:var(--muted);transition:.15s;border:none;background:none;width:100%;text-align:left}
+.nav-btn:hover,.nav-btn.active{background:var(--card2);color:var(--text)}
+.nav-btn svg{width:16px;height:16px;opacity:.7}
+
+/* agent select */
+.agent-section{padding:16px;border-top:1px solid var(--border);margin-top:auto}
+.agent-section label{font-size:11px;color:var(--muted);display:block;margin-bottom:6px}
+select,input{width:100%;padding:8px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px;outline:none}
+select:focus,input:focus{border-color:var(--accent)}
+.btn{padding:8px 16px;border-radius:6px;border:none;font-size:13px;font-weight:600;cursor:pointer;transition:.15s;display:inline-flex;align-items:center;gap:6px}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-primary:hover{background:#2563eb}
+.btn-danger{background:#7f1d1d;color:#fca5a5}
+.btn-danger:hover{background:#991b1b}
+.btn-green{background:#14532d;color:#86efac}
+.btn-green:hover{background:#166534}
+.btn-sm{padding:5px 10px;font-size:11px}
+
+/* ── MAIN ── */
+#main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+#topbar{padding:16px 24px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;background:var(--sidebar)}
+#topbar h2{font-size:18px;font-weight:700}
+.month-nav{display:flex;align-items:center;gap:12px}
+.month-nav button{background:var(--card2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 12px;cursor:pointer;font-size:13px}
+.month-nav button:hover{background:var(--border)}
+.month-nav span{font-size:15px;font-weight:600;min-width:160px;text-align:center}
+
+#content{flex:1;overflow-y:auto;padding:24px;display:grid;grid-template-columns:1fr 280px;gap:20px}
+
+/* ── CALENDAR ── */
+#calendar-wrap{display:flex;flex-direction:column;gap:14px}
+.legend{display:flex;gap:20px;flex-wrap:wrap;padding:10px 14px;background:var(--card);border-radius:10px;border:1px solid var(--border)}
+.legend-item{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--text)}
+.legend-bar{width:4px;height:20px;border-radius:2px}
+.cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:4px}
+.cal-header{text-align:center;font-size:11px;font-weight:700;color:var(--muted);padding:8px 0;letter-spacing:.5px;text-transform:uppercase}
+
+/* cellule jour */
+.cal-day{
+  min-height:82px;background:var(--card);border-radius:8px;
+  padding:8px 8px 8px 13px;cursor:pointer;position:relative;
+  border:1px solid var(--border);border-left-width:4px;
+  display:flex;flex-direction:column;gap:2px;
+  transition:background .12s, box-shadow .12s;
+}
+.cal-day:hover{background:var(--card2);box-shadow:0 2px 12px rgba(0,0,0,.3)}
+.cal-day.empty{background:transparent;border:none;cursor:default}
+.cal-day.today{box-shadow:0 0 0 2px #f8fafc!important}
+.cal-day.weekend{opacity:.85}
+
+/* contenu cellule */
+.day-top{display:flex;justify-content:space-between;align-items:center}
+.day-abbr{font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+.shift-pill{font-size:10px;font-weight:800;padding:2px 8px;border-radius:20px;letter-spacing:.3px;white-space:nowrap}
+.day-num{font-size:30px;font-weight:900;line-height:1;color:var(--text);margin-top:2px}
+.cal-day.today .day-num{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:38px;height:38px;border-radius:50%;
+  background:rgba(248,250,252,.18);color:#fff;
+}
+.day-reason{font-size:11px;font-weight:600;margin-top:auto;line-height:1.3;
+  overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;opacity:.85;}
+.n-red    .day-reason{color:#f87171}
+.n-orange .day-reason{color:#fb923c}
+.n-green  .day-reason{color:#4ade80}
+.n-blue   .day-reason{color:#93c5fd}
+.n-purple .day-reason{color:#c084fc}
+
+/* ── COULEURS PAR TYPE ── */
+/* Bordures gauches */
+.b-red   {border-left-color:#f87171}
+.b-orange{border-left-color:#fb923c}
+.b-green {border-left-color:#4ade80}
+.b-blue  {border-left-color:#60a5fa}
+.b-purple{border-left-color:#c084fc}
+
+/* Fonds tintés des cellules */
+.c-red   {background:rgba(239,68,68,.14)!important}
+.c-orange{background:rgba(249,115,22,.13)!important}
+.c-green {background:rgba(34,197,94,.10)!important}
+.c-blue  {background:rgba(59,130,246,.14)!important}
+.c-purple{background:rgba(168,85,247,.12)!important}
+
+/* Pills plus opaques */
+.p-red   {background:rgba(239,68,68,.35);color:#fca5a5;font-weight:900}
+.p-orange{background:rgba(249,115,22,.35);color:#fdba74;font-weight:900}
+.p-green {background:rgba(34,197,94,.30);color:#86efac;font-weight:900}
+.p-blue  {background:rgba(59,130,246,.35);color:#93c5fd;font-weight:900}
+.p-purple{background:rgba(168,85,247,.30);color:#d8b4fe;font-weight:900}
+
+/* Numéros colorés par type */
+.n-red   .day-num{color:#f87171}
+.n-orange .day-num{color:#fb923c}
+.n-green  .day-num{color:#4ade80}
+.n-blue   .day-num{color:#93c5fd}
+.n-purple .day-num{color:#c084fc}
+/* today override : cercle blanc brillant */
+.cal-day.today .day-num{color:#fff!important}
+
+/* ── RIGHT PANEL ── */
+#right-panel{display:flex;flex-direction:column;gap:16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px}
+.card h3{font-size:13px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px}
+.balance-row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border)}
+.balance-row:last-child{border:none}
+.balance-label{font-size:12px;color:var(--muted)}
+.balance-value{font-size:14px;font-weight:700}
+.balance-bar{height:4px;border-radius:2px;background:var(--border);margin-top:4px;overflow:hidden}
+.balance-fill{height:100%;border-radius:2px;background:var(--green)}
+.balance-fill.warn{background:var(--orange)}
+.balance-fill.danger{background:var(--red)}
+
+/* ── MODAL ── */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:100;display:none;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal{background:var(--sidebar);border:1px solid var(--border);border-radius:16px;padding:24px;width:420px;max-width:95vw;box-shadow:0 25px 60px rgba(0,0,0,.5)}
+.modal h2{font-size:16px;margin-bottom:20px;display:flex;align-items:center;justify-content:space-between}
+.modal h2 .close{cursor:pointer;opacity:.5;font-size:20px;line-height:1}
+.modal h2 .close:hover{opacity:1}
+.form-group{margin-bottom:14px}
+.form-group label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px}
+.form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.form-note{font-size:11px;color:var(--muted);margin-top:4px;padding:6px 10px;background:var(--bg);border-radius:4px}
+.modal-footer{display:flex;gap:8px;justify-content:flex-end;margin-top:20px}
+
+/* ── AGENT MODAL ── */
+#agent-modal .modal{width:360px}
+
+/* ── STATS ── */
+.stat-bar{display:flex;height:20px;border-radius:6px;overflow:hidden;gap:1px;margin-top:8px}
+.stat-bar div{transition:.3s}
+
+/* ── TOAST ── */
+#toast{position:fixed;bottom:24px;right:24px;background:var(--green-dark);color:#fff;padding:12px 20px;border-radius:10px;font-size:13px;z-index:999;transform:translateY(80px);opacity:0;transition:.3s}
+#toast.show{transform:translateY(0);opacity:1}
+#toast.error{background:#7f1d1d}
+
+/* ── 4/5 BUTTONS ── */
+.btn-45{
+  padding:8px 4px;border-radius:8px;border:2px solid var(--border);
+  background:var(--card2);color:var(--muted);font-size:12px;font-weight:700;
+  cursor:pointer;transition:.15s;text-align:center;
+}
+.btn-45:hover{border-color:var(--green);color:var(--green)}
+.btn-45.active{
+  background:rgba(34,197,94,.20);border-color:#4ade80;
+  color:#4ade80;box-shadow:0 0 0 1px #4ade80;
+}
+
+/* ── DAY MODAL WIDE ── */
+#day-modal .modal{width:680px;max-width:96vw;padding:0;overflow:hidden;border-radius:16px}
+.dm-nav{display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid var(--border)}
+.dm-nav-arrow{background:var(--card2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:6px 14px;cursor:pointer;font-size:15px;line-height:1;transition:.12s}
+.dm-nav-arrow:hover{background:var(--border)}
+.dm-date-title{text-align:center}
+.dm-date-title .dm-weekday{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:1px}
+.dm-date-title .dm-main-date{font-size:22px;font-weight:800;line-height:1.1}
+.dm-body{padding:20px}
+.dm-top{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}
+.dm-shift-block{border-radius:12px;padding:16px;display:flex;flex-direction:column;gap:6px}
+.dm-shift-code{font-size:36px;font-weight:900;letter-spacing:-1px;line-height:1}
+.dm-shift-label{font-size:13px;font-weight:600}
+.dm-shift-hours{font-size:12px;opacity:.75;font-family:monospace;margin-top:2px}
+.dm-shift-cycle{font-size:11px;opacity:.6;margin-top:4px}
+.dm-week-strip{border:1px solid var(--border);border-radius:12px;padding:12px 14px}
+.dm-week-strip .dm-ws-title{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px;font-weight:700}
+.dm-week-cells{display:grid;grid-template-columns:repeat(7,1fr);gap:4px}
+.dm-wc{border-radius:6px;padding:5px 2px;text-align:center;cursor:pointer;transition:.12s;border:1px solid transparent}
+.dm-wc:hover{border-color:var(--muted)}
+.dm-wc.dm-wc-active{border-color:#f8fafc!important;box-shadow:0 0 0 1px #f8fafc}
+.dm-wc .dm-wc-d{font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase}
+.dm-wc .dm-wc-n{font-size:15px;font-weight:800;line-height:1.2}
+.dm-wc .dm-wc-s{font-size:8px;font-weight:700;margin-top:2px;opacity:.8}
+.dm-events-section{margin-top:4px}
+.dm-events-section .dm-sec-title{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.7px;font-weight:700;margin-bottom:8px}
+.dm-event-row{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;background:var(--bg);border-radius:8px;margin-bottom:6px;border:1px solid var(--border)}
+.dm-event-row .dm-ev-label{font-size:13px;font-weight:600}
+.dm-event-row .dm-ev-meta{font-size:11px;color:var(--muted);margin-top:2px}
+.dm-footer{padding:16px 20px;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
+
+/* scrollbar */
+::-webkit-scrollbar{width:6px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+
+/* ══════════════════════════════════════════
+   RESPONSIVE — TABLETTE  (≤ 1024px)
+══════════════════════════════════════════ */
+@media(max-width:1024px){
+  #sidebar{width:72px}
+  #sidebar .logo p,.nav-section,.agent-section{display:none}
+  #sidebar .logo{padding:16px;text-align:center}
+  #sidebar .logo h1{font-size:22px}
+  .nav-btn{padding:12px 0;justify-content:center;font-size:0;gap:0}
+  .nav-btn svg{width:22px;height:22px;opacity:1}
+  #mobile-agent-bar{display:flex!important}
+  #content{padding:14px;gap:12px}
+}
+
+/* ══════════════════════════════════════════
+   RESPONSIVE — SMARTPHONE  (≤ 640px)
+══════════════════════════════════════════ */
+@media(max-width:640px){
+  body{flex-direction:column}
+
+  /* Sidebar → barre de navigation en bas */
+  #sidebar{
+    width:100%;height:60px;flex-direction:row;
+    position:fixed;bottom:0;left:0;right:0;z-index:60;
+    border-right:none;border-top:1px solid var(--border);
+    padding-bottom:env(safe-area-inset-bottom,0);
+  }
+  #sidebar .logo,#sidebar .agent-section,.nav-section{display:none}
+  .nav-btn{flex:1;flex-direction:column;justify-content:center;align-items:center;
+    padding:6px 0;font-size:9px;font-weight:700;gap:3px;border-radius:0;color:var(--muted)}
+  .nav-btn svg{width:20px;height:20px;opacity:1}
+  .nav-btn.active{color:var(--text);background:rgba(255,255,255,.05)}
+  #btn-panel-mobile{display:flex!important}
+
+  /* Zone principale */
+  #main{padding-bottom:calc(60px + env(safe-area-inset-bottom,0));overflow:hidden}
+  #topbar{padding:10px 12px;flex-wrap:wrap;gap:6px}
+  #topbar h2{font-size:13px}
+  .month-nav button{padding:5px 8px;font-size:12px}
+  .month-nav span{font-size:13px;min-width:120px}
+
+  /* Barre agent (mobile) */
+  #mobile-agent-bar{display:flex!important}
+
+  /* Grille calendrier */
+  #content{grid-template-columns:1fr;padding:8px;gap:8px}
+  #right-panel{display:none}
+  #right-panel.panel-open{display:flex!important;flex-direction:column}
+  .cal-grid{gap:2px}
+  .cal-header{font-size:9px;padding:5px 0}
+  .cal-day{min-height:54px;padding:4px 4px 4px 7px;gap:1px}
+  .cal-day.today .day-num{width:28px;height:28px;font-size:15px}
+  .day-num{font-size:18px}
+  .shift-pill{font-size:8px;padding:1px 5px}
+  .day-abbr{font-size:8px}
+  .day-reason{font-size:8px}
+
+  /* Modals → tiroir du bas */
+  .modal-overlay{align-items:flex-end;padding:0}
+  .modal{
+    border-radius:20px 20px 0 0!important;
+    width:100%!important;max-width:100%!important;
+    max-height:90dvh;overflow-y:auto;
+    padding-bottom:env(safe-area-inset-bottom,12px);
+  }
+  #day-modal .modal{border-radius:20px 20px 0 0!important}
+  .dm-top{grid-template-columns:1fr}
+  .dm-nav{padding:12px 16px}
+  .dm-main-date{font-size:18px}
+  .dm-body{padding:14px}
+}
+
+/* entitlements bar scroll sur petit écran */
+@media(max-width:640px){
+  #entitlements-content{overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch;padding-bottom:4px}
+  #entitlements-content > div{min-width:140px!important;flex:0 0 auto!important}
+  #ent-details .ent-grid{grid-template-columns:1fr!important}
+}
+
+/* ══════ Très petits écrans (≤ 380px) ══════ */
+@media(max-width:380px){
+  .cal-day{min-height:46px;padding:3px 3px 3px 5px}
+  .day-num{font-size:15px}
+  .shift-pill{display:none}
+}
+</style>
+</head>
+<body>
+
+<!-- SIDEBAR -->
+<div id="sidebar">
+  <div class="logo">
+    <h1>🏛 HoraireManager</h1>
+    <p>Prison de Namur — SPF Justice</p>
+  </div>
+  <div class="nav-section">Navigation</div>
+  <button class="nav-btn active" onclick="showView('calendar')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+    Calendrier
+  </button>
+  <button class="nav-btn" onclick="showView('annuel')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
+    Annuel
+  </button>
+  <button class="nav-btn" onclick="openAgentModal()">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75"/></svg>
+    Agents
+  </button>
+  <button class="nav-btn" id="btn-panel-mobile" style="display:none" onclick="toggleMobilePanel()">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 010 14.14M4.93 19.07a10 10 0 010-14.14"/><path d="M15.54 8.46a5 5 0 010 7.07M8.46 15.54a5 5 0 010-7.07"/></svg>
+    Réglages
+  </button>
+
+  <div class="agent-section">
+    <label>Agent actif</label>
+    <select id="agent-select" onchange="onAgentChange()">
+      <option value="">— Sélectionner —</option>
+    </select>
+    <div style="margin-top:8px;font-size:11px;color:var(--muted)" id="agent-info"></div>
+  </div>
+</div>
+
+<!-- MAIN -->
+<div id="main">
+  <div id="topbar">
+    <div style="display:flex;align-items:center;gap:16px">
+      <h2 id="view-title">Calendrier mensuel</h2>
+    </div>
+    <div class="month-nav">
+      <button onclick="prevPeriod()">◀</button>
+      <span id="period-label"></span>
+      <button onclick="nextPeriod()">▶</button>
+      <button onclick="gotoToday()" style="margin-left:4px">Auj.</button>
+    </div>
+  </div>
+  <!-- Barre agent — visible seulement sur tablette/mobile -->
+  <div id="mobile-agent-bar" style="display:none;padding:8px 14px;border-bottom:1px solid var(--border);background:var(--sidebar);gap:10px;align-items:center">
+    <span style="font-size:11px;color:var(--muted);white-space:nowrap">Agent :</span>
+    <select id="agent-select-mobile" onchange="onAgentChangeMobile()" style="flex:1;padding:6px 8px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px">
+      <option value="">— Sélectionner —</option>
+    </select>
+    <div style="font-size:11px;color:var(--muted)" id="agent-info-mobile"></div>
+  </div>
+
+  <!-- CALENDAR VIEW -->
+  <div id="content" style="display:grid">
+    <div id="calendar-wrap">
+      <div class="legend">
+        <div class="legend-item"><div class="legend-bar" style="background:#ef4444"></div><span style="color:#fca5a5;font-weight:700">M</span> Matin</div>
+        <div class="legend-item"><div class="legend-bar" style="background:#f97316"></div><span style="color:#fdba74;font-weight:700">S</span> Soir</div>
+        <div class="legend-item"><div class="legend-bar" style="background:#22c55e"></div><span style="color:#86efac;font-weight:700">R</span> Repos / Congé</div>
+        <div class="legend-item"><div class="legend-bar" style="background:#3b82f6"></div><span style="color:#93c5fd;font-weight:700">⭐</span> Jour férié</div>
+        <div class="legend-item"><div style="width:18px;height:18px;border-radius:4px;border:2px solid #f8fafc"></div> Aujourd'hui</div>
+      </div>
+      <!-- TABLEAU DE BORD DROITS LEGAUX -->
+      <div id="entitlements-bar" style="display:none;padding:14px 16px;background:var(--card);border-radius:10px;border:1px solid var(--border)">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+          <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;font-weight:700">Droits légaux — <span id="ent-year-label"></span></div>
+          <button id="btn-ent-details" onclick="toggleEntDetails()" style="background:var(--card2);border:1px solid var(--border);color:var(--muted);border-radius:5px;padding:3px 10px;cursor:pointer;font-size:11px;font-weight:700">Détails ▾</button>
+        </div>
+        <div id="entitlements-content" style="display:flex;gap:0;border-radius:8px;overflow:hidden;border:1px solid var(--border)"></div>
+        <div id="ent-details" style="display:none;margin-top:10px"></div>
+      </div>
+      <div id="base-banner" style="display:none;padding:10px 16px;background:rgba(249,115,22,.15);border:1px solid #fb923c;border-radius:10px;color:#fdba74;font-size:13px;font-weight:600;display:flex;align-items:center;justify-content:space-between">
+        <span>⚠ Vue planning de base — le régime 4/5 est masqué</span>
+        <button onclick="toggleBase()" style="background:none;border:1px solid #fb923c;color:#fdba74;border-radius:6px;padding:4px 12px;cursor:pointer;font-size:12px;font-weight:700">Revenir au 4/5</button>
+      </div>
+      <div class="cal-grid" id="cal-grid"></div>
+    </div>
+    <div id="right-panel">
+      <div class="card" id="balance-card">
+        <h3>Soldes congés <span id="bal-year"></span></h3>
+        <div id="balance-content"></div>
+      </div>
+      <div class="card">
+        <h3>Activité du mois</h3>
+        <div id="month-stats"></div>
+      </div>
+      <div class="card" id="card-45">
+        <h3>Régime 4/5 — jour de repos</h3>
+        <div style="font-size:11px;color:var(--muted);margin-bottom:10px">Cliquez pour choisir le jour fixe. Si ce jour est un 36/38/R, la logique de glissement s'applique automatiquement.</div>
+        <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:5px;margin-bottom:10px" id="btn-45-row">
+          <button class="btn-45" data-wd="0" onclick="set45(0)">Lun</button>
+          <button class="btn-45" data-wd="1" onclick="set45(1)">Mar</button>
+          <button class="btn-45" data-wd="2" onclick="set45(2)">Mer</button>
+          <button class="btn-45" data-wd="3" onclick="set45(3)">Jeu</button>
+          <button class="btn-45" data-wd="4" onclick="set45(4)">Ven</button>
+        </div>
+        <div style="display:flex;gap:6px;margin-top:0">
+          <button class="btn btn-sm" style="background:var(--card2);flex:1;color:var(--muted)" onclick="set45(null)">✕ Désactiver</button>
+          <button class="btn btn-sm" id="btn-toggle-base" style="flex:1" onclick="toggleBase()">Voir base</button>
+        </div>
+        <div style="margin-top:10px;font-size:11px;color:var(--muted)" id="label-45"></div>
+      </div>
+      <div class="card">
+        <h3>Actions rapides</h3>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <button class="btn btn-primary" onclick="openLeaveModal()">+ Ajouter un congé</button>
+          <button class="btn btn-green btn-sm" onclick="showView('annuel')">Vue annuelle →</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ANNUAL VIEW -->
+  <div id="annual-content" style="display:none;padding:24px;overflow-y:auto">
+    <div id="annual-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px"></div>
+  </div>
+</div>
+
+<!-- MODAL CONGÉ -->
+<div class="modal-overlay" id="leave-modal">
+  <div class="modal">
+    <h2>Ajouter un congé / absence <span class="close" onclick="closeModal('leave-modal')">✕</span></h2>
+    <div class="form-group">
+      <label>Type de congé</label>
+      <select id="leave-code" onchange="onLeaveCodeChange()"></select>
+      <div class="form-note" id="leave-note"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Date début</label><input type="date" id="leave-start"></div>
+      <div class="form-group"><label>Date fin</label><input type="date" id="leave-end"></div>
+    </div>
+    <div class="form-group">
+      <label>Note (optionnel)</label>
+      <input type="text" id="leave-note-text" placeholder="Ex: grippe, congé été...">
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeModal('leave-modal')" style="background:var(--card2)">Annuler</button>
+      <button class="btn btn-primary" onclick="submitLeave()">Enregistrer</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL AGENT -->
+<div class="modal-overlay" id="agent-modal">
+  <div class="modal">
+    <h2>Gestion des agents <span class="close" onclick="closeModal('agent-modal')">✕</span></h2>
+    <div id="agent-list" style="margin-bottom:16px"></div>
+    <hr style="border-color:var(--border);margin:16px 0">
+    <div style="font-size:13px;font-weight:600;margin-bottom:12px">Nouvel agent</div>
+    <div class="form-row">
+      <div class="form-group"><label>ID</label><input id="na-id" placeholder="EX: TSE"></div>
+      <div class="form-group"><label>Nom</label><input id="na-name" placeholder="Prénom NOM"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Date de naissance</label><input type="date" id="na-birth" max="2007-12-31"></div>
+      <div class="form-group">
+        <label>Équipe (offset)</label>
+        <select id="na-offset">
+          <option value="0">Équipe 4 (0j)</option>
+          <option value="7">Équipe 5 (7j)</option>
+          <option value="14">Équipe 6 (14j)</option>
+          <option value="21">Équipe 7 (21j)</option>
+          <option value="28">Équipe 8 (28j)</option>
+          <option value="35">Équipe 1 (35j)</option>
+          <option value="42">Équipe 2 (42j)</option>
+          <option value="49">Équipe 3 (49j)</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-group">
+      <label>Date de début de carrière (SPF Justice)</label>
+      <input type="date" id="na-career" max="2025-12-31">
+      <div class="form-note">Sert au calcul du capital maladie (21j × années de service)</div>
+    </div>
+    <div class="form-group">
+      <label>Régime 4/5 — jour de repos fixe (lun-ven)</label>
+      <select id="na-45">
+        <option value="">— Pas de régime 4/5 —</option>
+        <option value="0">Lundi</option>
+        <option value="1">Mardi</option>
+        <option value="2">Mercredi</option>
+        <option value="3">Jeudi</option>
+        <option value="4">Vendredi</option>
+      </select>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeModal('agent-modal')" style="background:var(--card2)">Fermer</button>
+      <button class="btn btn-primary" onclick="addAgent()">Ajouter</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL JOUR (detail) -->
+<div class="modal-overlay" id="day-modal">
+  <div class="modal">
+    <div class="dm-nav">
+      <button class="dm-nav-arrow" id="dm-prev">&#8592;</button>
+      <div class="dm-date-title">
+        <div class="dm-weekday" id="dm-weekday"></div>
+        <div class="dm-main-date" id="dm-maindate"></div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <button class="dm-nav-arrow" id="dm-next">&#8594;</button>
+        <span class="close" onclick="closeModal('day-modal')" style="margin-left:6px;opacity:.5;cursor:pointer;font-size:20px">✕</span>
+      </div>
+    </div>
+    <div class="dm-body">
+      <div class="dm-top">
+        <div class="dm-shift-block" id="dm-shift-block"></div>
+        <div class="dm-week-strip" id="dm-week-strip"></div>
+      </div>
+      <div class="dm-events-section" id="dm-events"></div>
+    </div>
+    <div class="dm-footer">
+      <button class="btn" onclick="closeModal('day-modal')" style="background:var(--card2)">Fermer</button>
+      <button class="btn btn-primary" onclick="openLeaveFromDay()">+ Ajouter congé ce jour</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+let curYear  = new Date().getFullYear();
+let curMonth = new Date().getMonth() + 1;
+let curAgent = '';
+let curView  = 'calendar';
+let catalog  = {};
+let selDay   = null;
+let viewBase = false;   // true = masque le 4/5, affiche le planning de base
+const MN = ['Janvier','Février','Mars','Avril','Mai','Juin','Juillet','Août','Septembre','Octobre','Novembre','Décembre'];
+
+// ── INIT ──
+async function init() {
+  catalog = await fetch('/api/leaves_catalog').then(r=>r.json());
+  populateCatalog();
+  await loadAgents();
+  showView('calendar');
+  gotoToday();
+}
+
+function populateCatalog() {
+  const sel = document.getElementById('leave-code');
+  const cats = {};
+  Object.entries(catalog).forEach(([k,v])=>{
+    if(!cats[v.category]) cats[v.category]=[];
+    cats[v.category].push([k,v]);
+  });
+  Object.entries(cats).forEach(([cat,items])=>{
+    const og = document.createElement('optgroup');
+    og.label = cat;
+    items.forEach(([k,v])=>{
+      const o = document.createElement('option');
+      o.value=k; o.textContent=`${v.label}${v.days?' ('+v.days+'j)':''}`;
+      og.appendChild(o);
+    });
+    sel.appendChild(og);
+  });
+  onLeaveCodeChange();
+}
+
+function onLeaveCodeChange() {
+  const code = document.getElementById('leave-code').value;
+  const info = catalog[code];
+  const el   = document.getElementById('leave-note');
+  if(info && info.note) el.textContent = '📌 '+info.note;
+  else el.textContent = '';
+}
+
+// ── AGENTS ──
+async function loadAgents() {
+  const agents = await fetch('/api/agents').then(r=>r.json());
+  const sel  = document.getElementById('agent-select');
+  const selM = document.getElementById('agent-select-mobile');
+  const prev = sel.value || selM.value;
+  [sel, selM].forEach(s=>{
+    s.innerHTML = '<option value="">— Sélectionner —</option>';
+    Object.entries(agents).forEach(([id,a])=>{
+      const o = document.createElement('option');
+      o.value=id; o.textContent=a.name; s.appendChild(o);
+    });
+    if(prev && agents[prev]) s.value = prev;
+    else if(Object.keys(agents).length>0) s.value = Object.keys(agents)[0];
+  });
+  curAgent = sel.value || selM.value;
+  updateAgentInfo(agents);
+  renderAgentList(agents);
+  if(curAgent) refresh();
+}
+
+function onAgentChangeMobile() {
+  const selM = document.getElementById('agent-select-mobile');
+  document.getElementById('agent-select').value = selM.value;
+  onAgentChange();
+}
+
+function toggleMobilePanel() {
+  const rp = document.getElementById('right-panel');
+  rp.classList.toggle('panel-open');
+  document.getElementById('btn-panel-mobile').classList.toggle('active', rp.classList.contains('panel-open'));
+}
+
+const WD_FR=['Lundi','Mardi','Mercredi','Jeudi','Vendredi'];
+const WD_SHORT=['Lun','Mar','Mer','Jeu','Ven'];
+
+function updateAgentInfo(agents) {
+  const el = document.getElementById('agent-info');
+  if(!curAgent || !agents[curAgent]) { el.textContent=''; return; }
+  const a = agents[curAgent];
+  let age_str = '';
+  if(a.birth_date) {
+    const age = new Date().getFullYear() - parseInt(a.birth_date.split('-')[0]);
+    age_str = `${age} ans`;
+  } else if(a.age) age_str = `${a.age} ans`;
+  let info = age_str ? `${age_str} | ` : '';
+  info += `Offset: ${a.team_offset}j`;
+  if(a.regime_4_5 != null) info += ` | 4/5 ${WD_SHORT[a.regime_4_5]}`;
+  el.textContent = info;
+  refresh45UI(a.regime_4_5);
+}
+
+function refresh45UI(wd) {
+  document.querySelectorAll('.btn-45').forEach(b=>{
+    b.classList.toggle('active', wd != null && parseInt(b.dataset.wd)===wd);
+  });
+  const lbl = document.getElementById('label-45');
+  if(lbl) lbl.textContent = wd != null
+    ? `Jour actif : ${WD_FR[wd]} — le 36/38 de la semaine est absorbé automatiquement.`
+    : 'Aucun régime 4/5 actif.';
+}
+
+async function set45(wd) {
+  if(!curAgent){ toast('Sélectionnez un agent','error'); return; }
+  const r = await fetch(`/api/agents/${curAgent}`, {
+    method:'PATCH',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({regime_4_5: wd})
+  });
+  if(!r.ok){ toast('Erreur mise à jour 4/5','error'); return; }
+  const data = await r.json();
+  const newWd = data.agent.regime_4_5;
+  // Quand on change le jour 4/5, on revient à la vue 4/5
+  if(viewBase){ viewBase=false; _applyBaseToggleUI(); }
+  refresh45UI(newWd);
+  const agents = await fetch('/api/agents').then(r=>r.json());
+  updateAgentInfo(agents);
+  toast(wd != null ? `4/5 activé le ${WD_FR[wd]}` : '4/5 désactivé');
+  renderCalendar();
+}
+
+function toggleBase() {
+  viewBase = !viewBase;
+  _applyBaseToggleUI();
+  renderCalendar();
+}
+
+function _applyBaseToggleUI() {
+  const btn  = document.getElementById('btn-toggle-base');
+  const ban  = document.getElementById('base-banner');
+  if(viewBase) {
+    if(btn){ btn.textContent='Voir 4/5'; btn.style.background='rgba(249,115,22,.25)'; btn.style.color='#fdba74'; btn.style.border='1px solid #fb923c'; }
+    if(ban){ ban.style.display='flex'; }
+  } else {
+    if(btn){ btn.textContent='Voir base'; btn.style.background=''; btn.style.color=''; btn.style.border=''; }
+    if(ban){ ban.style.display='none'; }
+  }
+}
+
+function onAgentChange() {
+  curAgent = document.getElementById('agent-select').value;
+  const selM = document.getElementById('agent-select-mobile');
+  if(selM) selM.value = curAgent;
+  viewBase = false;
+  _applyBaseToggleUI();
+  loadAgents();
+}
+
+function renderAgentList(agents) {
+  const el = document.getElementById('agent-list');
+  if(Object.keys(agents).length===0){el.innerHTML='<p style="color:var(--muted);font-size:12px">Aucun agent enregistré.</p>';return;}
+  el.innerHTML = Object.entries(agents).map(([id,a])=>{
+    let meta = id;
+    if(a.birth_date) {
+      const age = new Date().getFullYear() - parseInt(a.birth_date.split('-')[0]);
+      meta += ` · ${age} ans (né ${a.birth_date})`;
+    } else if(a.age) meta += ` · ${a.age} ans`;
+    meta += ` · offset ${a.team_offset}j`;
+    if(a.career_start) meta += ` · carrière depuis ${a.career_start}`;
+    const warn = !a.birth_date ? ' <span style="color:#fb923c;font-size:10px">⚠ Ajouter date naissance</span>' : '';
+    return `<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border)">
+      <div>
+        <div style="font-size:13px;font-weight:600">${a.name}${warn}</div>
+        <div style="font-size:11px;color:var(--muted)">${meta}</div>
+      </div>
+      <button class="btn btn-danger btn-sm" onclick="deleteAgent('${id}')">Suppr.</button>
+    </div>`;
+  }).join('');
+}
+
+async function addAgent() {
+  const id    = document.getElementById('na-id').value.trim().toUpperCase();
+  const name  = document.getElementById('na-name').value.trim();
+  const birth = document.getElementById('na-birth').value;
+  const career= document.getElementById('na-career').value;
+  const offset= parseInt(document.getElementById('na-offset').value);
+  const r45   = document.getElementById('na-45').value;
+  if(!id || !name){ toast('ID et Nom obligatoires','error'); return; }
+  if(!birth){ toast('Date de naissance obligatoire','error'); return; }
+  await fetch('/api/agents',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({id, name, birth_date: birth, career_start: career||null,
+                         offset, regime_4_5: r45===''?null:parseInt(r45)})});
+  toast(`Agent ${name} ajouté`);
+  await loadAgents();
+  document.getElementById('na-id').value='';
+  document.getElementById('na-name').value='';
+  document.getElementById('na-birth').value='';
+  document.getElementById('na-career').value='';
+}
+
+async function deleteAgent(id) {
+  if(!confirm('Supprimer cet agent et tous ses congés ?')) return;
+  await fetch(`/api/agents/${id}`,{method:'DELETE'});
+  toast('Agent supprimé');
+  await loadAgents();
+}
+
+// ── NAVIGATION ──
+function gotoToday() {
+  const now = new Date();
+  curYear=now.getFullYear(); curMonth=now.getMonth()+1;
+  refresh();
+}
+function prevPeriod() {
+  if(curView==='calendar'){ if(--curMonth<1){curMonth=12;curYear--;} }
+  else curYear--;
+  refresh();
+}
+function nextPeriod() {
+  if(curView==='calendar'){ if(++curMonth>12){curMonth=1;curYear++;} }
+  else curYear++;
+  refresh();
+}
+function showView(v) {
+  curView=v;
+  document.getElementById('content').style.display = v==='calendar'?'grid':'none';
+  document.getElementById('annual-content').style.display = v==='annuel'?'block':'none';
+  document.getElementById('view-title').textContent = v==='calendar'?'Calendrier mensuel':'Vue annuelle';
+  document.querySelectorAll('.nav-btn').forEach((b,i)=>{
+    b.classList.toggle('active',(i===0&&v==='calendar')||(i===1&&v==='annuel'));
+  });
+  refresh();
+}
+function refresh() {
+  if(curView==='calendar') renderCalendar();
+  else renderAnnual();
+}
+
+// ── CALENDAR ──
+async function renderCalendar() {
+  document.getElementById('period-label').textContent = `${MN[curMonth-1]} ${curYear}`;
+  if(!curAgent){ clearCalendar(); document.getElementById('entitlements-bar').style.display='none'; return; }
+  const [cal,bal,stats,ent] = await Promise.all([
+    fetch(`/api/calendar/${curAgent}/${curYear}/${curMonth}`).then(r=>r.json()),
+    fetch(`/api/balance/${curAgent}/${curYear}`).then(r=>r.json()),
+    fetch(`/api/stats/${curAgent}/${curYear}`).then(r=>r.json()),
+    fetch(`/api/entitlements/${curAgent}/${curYear}`).then(r=>r.json()),
+  ]);
+  renderGrid(cal);
+  renderBalance(bal);
+  renderMonthStats(stats[curMonth-1]);
+  renderEntitlements(ent);
+}
+
+// ── ENTITLEMENTS ──
+let _lastEnt = null;
+let _entDetailsOpen = false;
+
+function toggleEntDetails() {
+  _entDetailsOpen = !_entDetailsOpen;
+  const btn = document.getElementById('btn-ent-details');
+  const det = document.getElementById('ent-details');
+  if(_entDetailsOpen && _lastEnt) {
+    det.style.display = 'block';
+    renderEntDetails(_lastEnt);
+    if(btn){ btn.textContent = 'Réduire ▴'; btn.style.color='var(--text)'; }
+  } else {
+    det.style.display = 'none';
+    if(btn){ btn.textContent = 'Détails ▾'; btn.style.color=''; }
+  }
+}
+
+function renderEntitlements(ent) {
+  _lastEnt = ent;
+  const bar  = document.getElementById('entitlements-bar');
+  const cont = document.getElementById('entitlements-content');
+  const lbl  = document.getElementById('ent-year-label');
+  const det  = document.getElementById('ent-details');
+  if(!ent || ent.error){ bar.style.display='none'; return; }
+  bar.style.display = 'block';
+  lbl.textContent = `${ent.year} · ${ent.agent}`;
+
+  const v   = ent.vacances;
+  const m   = ent.maladie;
+  const vPct = v.total>0 ? Math.min(Math.round(v.utilise/v.total*100),100) : 0;
+  const vC   = v.solde<=5?'var(--red)':v.solde<=8?'var(--orange)':'var(--green)';
+
+  // ── Pill vacances ──
+  let html = `<div style="flex:1;min-width:170px;padding:10px 14px;border-right:1px solid var(--border)">
+    <div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">🏖️ VACANCES ${ent.year}</div>
+    <div style="display:flex;align-items:baseline;gap:4px">
+      <span style="font-size:24px;font-weight:900;color:${vC}">${v.solde}</span>
+      <span style="font-size:11px;color:var(--muted)">j restants</span>
+    </div>
+    <div style="height:3px;background:var(--border);border-radius:2px;margin:4px 0;overflow:hidden">
+      <div style="width:${vPct}%;height:100%;background:${vC};border-radius:2px"></div>
+    </div>
+    <div style="font-size:10px;color:var(--muted)">${v.droit}j droit ${v.reliquat>0?`<span style="color:var(--accent)">+${v.reliquat}j reliquat</span> = ${v.total}j total · `:``}${v.utilise}j pris
+    </div>
+    <div style="font-size:10px;margin-top:4px">
+      <span onclick="editReliquat()" style="cursor:pointer;color:var(--accent);text-decoration:underline">✏ Reliquat N-1: ${v.reliquat}j</span>
+      <span style="color:var(--muted)"> · éparg. max ${v.epargnable_an}j/an</span>
+    </div>
+  </div>`;
+
+  // ── Pill maladie capital ──
+  if(m){
+    const mPct = m.capital>0 ? Math.min(Math.round(m.utilise/m.capital*100),100) : 0;
+    const mC   = m.solde < 21?'var(--red)':m.solde < 63?'var(--orange)':'var(--green)';
+    html += `<div style="flex:1;min-width:170px;padding:10px 14px;border-right:1px solid var(--border)">
+      <div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">🤒 CAP. MALADIE${m.is_advance?' <span style="color:var(--orange)">(avance)</span>':''}</div>
+      <div style="display:flex;align-items:baseline;gap:4px">
+        <span style="font-size:24px;font-weight:900;color:${mC}">${m.solde}</span>
+        <span style="font-size:11px;color:var(--muted)">j restants / ${m.capital}j</span>
+      </div>
+      <div style="height:3px;background:var(--border);border-radius:2px;margin:4px 0;overflow:hidden">
+        <div style="width:${mPct}%;height:100%;background:${mC};border-radius:2px"></div>
+      </div>
+      <div style="font-size:10px;color:var(--muted)">${m.utilise}j pris (toutes années)${m.is_advance?' · avance garantie &lt;3 ans svc':''}</div>
+    </div>`;
+  } else {
+    html += `<div style="flex:1;min-width:150px;padding:10px 14px;border-right:1px solid var(--border)">
+      <div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">🤒 CAP. MALADIE</div>
+      <div style="font-size:12px;color:var(--orange);margin-top:10px">⚠ Ajouter date début carrière</div>
+    </div>`;
+  }
+
+  // ── Pill ancienneté ──
+  if(m && m.service_months !== undefined){
+    const sy = Math.floor(m.service_months/12), smo = m.service_months%12;
+    const nextCap = (Math.floor(m.service_months/12)+1)*21;
+    html += `<div style="flex:0 0 auto;min-width:120px;padding:10px 14px;border-right:1px solid var(--border)">
+      <div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">📅 ANCIENNETÉ</div>
+      <div style="font-size:22px;font-weight:900;color:var(--text)">${sy}<span style="font-size:12px;color:var(--muted)">a</span> ${smo}<span style="font-size:12px;color:var(--muted)">m</span></div>
+      <div style="font-size:10px;color:var(--muted);margin-top:4px">Prochain cap: ${nextCap}j</div>
+    </div>`;
+  }
+
+  // ── Pill âge ──
+  const ageTxt = ent.age_this_year !== undefined ? ent.age_this_year : '?';
+  let nextBracketHtml = '';
+  if(ent.next_bracket){
+    const nb = ent.next_bracket;
+    const d  = new Date(nb.date);
+    const fmt = d.toLocaleDateString('fr-BE',{day:'numeric',month:'short'});
+    nextBracketHtml = `<div style="font-size:9px;color:var(--accent);margin-top:3px">
+      ▶ ${fmt}: ${nb.age} ans → ${nb.days}j (+${nb.delta}j)</div>`;
+  }
+  html += `<div style="flex:0 0 auto;min-width:110px;padding:10px 14px">
+    <div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">👤 ÂGE au 01/01/${ent.year}</div>
+    <div style="font-size:22px;font-weight:900;color:var(--text)">${ageTxt}<span style="font-size:12px;color:var(--muted)"> ans</span></div>
+    <div style="font-size:10px;color:var(--muted);margin-top:4px">${v.droit}j/an BOSA</div>
+    ${nextBracketHtml}
+    ${!ent.birth_date?`<div style="font-size:9px;color:var(--orange);margin-top:2px">⚠ Ajouter date naiss.</div>`:''}
+  </div>`;
+
+  cont.innerHTML = html;
+
+  // Re-render détails si ouverts
+  if(_entDetailsOpen) renderEntDetails(ent);
+  else det.innerHTML = '';
+}
+
+// Congés de circonstance à afficher avec leurs quotas légaux
+const CIRC_CONFIG = [
+  {code:'CIRC_NAI',         icon:'👶', quota:20,  label:'Naissance / coparentalité'},
+  {code:'CIRC_DEC_CONJOINT',icon:'🖤', quota:10,  label:'Décès conjoint / enfant'},
+  {code:'CIRC_DEC_PARENT',  icon:'🖤', quota:4,   label:'Décès père/mère/beau-parent'},
+  {code:'CIRC_DEC_AUTRE',   icon:'🖤', quota:2,   label:'Décès frère/sœur/grd-parents'},
+  {code:'CIRC_MAR_AGENT',   icon:'💍', quota:4,   label:'Mariage de l\'agent'},
+  {code:'CIRC_MAR_ENFANT',  icon:'💍', quota:1,   label:'Mariage enfant/frère/sœur'},
+  {code:'CIRC_COM',         icon:'✝️', quota:1,   label:'Communion / cérémonie laïque'},
+  {code:'CIRC_DON',         icon:'🩸', quota:null, label:'Don de sang / organe'},
+  {code:'CIRC_JURY',        icon:'⚖️', quota:null, label:'Jury Cour d\'Assises'},
+];
+const OTHER_CONFIG = [
+  {code:'ACC_TRAV',   label:'Accident travail / mal. prof.'},
+  {code:'CONG_MAT',   label:'Congé de maternité (semaines)'},
+  {code:'CONG_PAR',   label:'Congé parental'},
+  {code:'SOINS_FAM',  label:'Soins à un proche'},
+  {code:'SYNDI',      label:'Congé syndical'},
+  {code:'FORM',       label:'Formation / examen'},
+  {code:'RECUP',      label:'Récupération / compensé'},
+  {code:'INTERR_CARR',label:'Interruption de carrière'},
+  {code:'COMPEN',     label:'Compensation férié weekend'},
+];
+
+function renderEntDetails(ent) {
+  const det  = document.getElementById('ent-details');
+  const used = ent.conges_detail || {};
+
+  // Compter les congés de circonstance actifs cette année
+  let circHtml = '';
+  CIRC_CONFIG.forEach(cfg => {
+    const u = used[cfg.code]?.used || 0;
+    const q = cfg.quota;
+    const pct = q ? Math.min(Math.round(u/q*100),100) : 0;
+    const col = !q ? 'var(--muted)' : (u>=q ? 'var(--red)' : u>0 ? 'var(--orange)' : 'var(--green)');
+    const solde = q ? `${u}/${q}j` : (u>0 ? `${u}j pris` : '—');
+    circHtml += `<div style="background:var(--bg);border-radius:6px;padding:8px 10px;border:1px solid var(--border)">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <span style="font-size:11px;font-weight:600">${cfg.icon} ${cfg.label}</span>
+        <span style="font-size:13px;font-weight:700;color:${col}">${solde}</span>
+      </div>
+      ${q?`<div style="height:2px;background:var(--border);border-radius:1px;margin-top:5px;overflow:hidden"><div style="width:${pct}%;height:100%;background:${col};border-radius:1px"></div></div>`:''}
+    </div>`;
+  });
+
+  // Autres congés utilisés cette année
+  let otherHtml = '';
+  OTHER_CONFIG.forEach(cfg => {
+    const u = (used[cfg.code]?.used || 0);
+    if(u === 0) return;
+    otherHtml += `<div style="background:var(--bg);border-radius:6px;padding:8px 10px;border:1px solid var(--border)">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <span style="font-size:11px;font-weight:600">${cfg.label}</span>
+        <span style="font-size:13px;font-weight:700;color:var(--green)">${u}j</span>
+      </div>
+    </div>`;
+  });
+
+  det.innerHTML = `<div style="border-top:1px solid var(--border);padding-top:12px">
+    <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;font-weight:700;margin-bottom:8px">
+      Congés de circonstance · ${ent.year}
+    </div>
+    <div class="ent-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:6px">
+      ${circHtml}
+    </div>
+    ${otherHtml ? `<div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;font-weight:700;margin:12px 0 8px">
+      Autres congés utilisés · ${ent.year}
+    </div>
+    <div class="ent-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:6px">
+      ${otherHtml}
+    </div>` : ''}
+  </div>`;
+}
+
+async function editReliquat() {
+  if(!curAgent) return;
+  const cur = _lastEnt?.vacances?.reliquat ?? 0;
+  const val = prompt(`Reliquat vacances reporté de ${curYear-1} vers ${curYear}\n(jours non pris l'an passé) :`, cur);
+  if(val === null) return;
+  const num = parseInt(val);
+  if(isNaN(num) || num < 0){ toast('Valeur invalide','error'); return; }
+  const r = await fetch(`/api/reliquat/${curAgent}/${curYear}`,{
+    method:'PUT', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({reliquat: num})
+  });
+  if(r.ok){ toast(`Reliquat ${curYear}: ${num}j enregistré`); renderCalendar(); }
+  else toast('Erreur','error');
+}
+
+function clearCalendar() {
+  document.getElementById('cal-grid').innerHTML='<div style="color:var(--muted);font-size:13px;padding:20px;grid-column:span 7">Sélectionnez un agent pour afficher le calendrier.</div>';
+}
+
+function renderGrid(cal) {
+  const grid = document.getElementById('cal-grid');
+  const days_hdr = ['Lun','Mar','Mer','Jeu','Ven','Sam','Dim'];
+  let html = days_hdr.map(d=>`<div class="cal-header">${d}</div>`).join('');
+
+  for(let i=0;i<cal.first_weekday;i++) html+=`<div class="cal-day empty"></div>`;
+
+  cal.days.forEach(day=>{
+    let bCls, cCls, nCls, pCls, pillTxt, reasonTxt='';
+    // En mode "base": ignorer le 4/5, afficher le poste du cycle brut
+    const code = (viewBase && day.code==='4/5') ? null : day.code;
+    const base = day.base;  // toujours disponible dans la réponse API
+
+    if(code==='FERIE'||code==='PONT'){
+      bCls='b-blue'; cCls='c-blue'; nCls='n-blue'; pCls='p-blue';
+      pillTxt=code==='PONT'?'PONT':'FÉRIÉ';
+      reasonTxt=day.label||'';
+    } else if(code==='4/5'){
+      bCls='b-green'; cCls='c-green'; nCls='n-green'; pCls='p-green';
+      pillTxt='4/5'; reasonTxt='Régime 4/5';
+    } else if(code){
+      bCls='b-green'; cCls='c-green'; nCls='n-green'; pCls='p-green';
+      pillTxt='CONGÉ';
+      const lbl=day.label||code;
+      reasonTxt=lbl.length>26?lbl.substring(0,24)+'…':lbl;
+    } else if(base==='M'){
+      bCls='b-red';    cCls='c-red';    nCls='n-red';    pCls='p-red';    pillTxt='MATIN';
+    } else if(base==='S'){
+      bCls='b-orange'; cCls='c-orange'; nCls='n-orange'; pCls='p-orange'; pillTxt='SOIR';
+    } else if(base==='36'||base==='38'){
+      bCls='b-purple'; cCls='c-purple'; nCls='n-purple'; pCls='p-purple'; pillTxt='REPOS '+base;
+    } else {
+      bCls='b-green';  cCls='c-green';  nCls='n-green';  pCls='p-green';  pillTxt='REPOS';
+    }
+
+    const todayCls = day.is_today?'today':'';
+    const weCls    = (day.weekday>=5)?'weekend':'';
+    const dataStr  = JSON.stringify(day).replace(/"/g,'&quot;');
+
+    html+=`<div class="cal-day ${bCls} ${cCls} ${nCls} ${todayCls} ${weCls}"
+      onclick="openDayModal(${dataStr})"
+      title="${day.day_name} ${day.day_num} — ${pillTxt}${reasonTxt?' : '+reasonTxt:''}">
+      <div class="day-top">
+        <span class="day-abbr">${day.day_name}</span>
+        <span class="shift-pill ${pCls}">${pillTxt}</span>
+      </div>
+      <div class="day-num">${day.day_num}</div>
+      ${reasonTxt?`<div class="day-reason">${reasonTxt}</div>`:''}
+    </div>`;
+  });
+  grid.innerHTML=html;
+}
+
+function renderBalance(bal) {
+  document.getElementById('bal-year').textContent=bal.year;
+  const v=bal.vacances, m=bal.maladie;
+  const vPct=Math.round((v.utilise/v.droit)*100);
+  const mPct=Math.round((m.utilise/m.droit)*100);
+  const vCls=vPct>80?'danger':vPct>60?'warn':'';
+  const mCls=mPct>80?'danger':mPct>60?'warn':'';
+  let detail='';
+  Object.entries(bal.detail||{}).forEach(([k,v])=>{
+    if(k!=='VAC'&&k!=='MAL'&&v>0) detail+=`<div class="balance-row"><span class="balance-label">${catalog[k]?.label||k}</span><span class="balance-value" style="color:var(--green)">${v}j</span></div>`;
+  });
+  document.getElementById('balance-content').innerHTML=`
+    <div class="balance-row">
+      <div style="flex:1">
+        <div style="display:flex;justify-content:space-between"><span class="balance-label">Vacances</span><span class="balance-value" style="color:var(--green)">${v.solde}/${v.droit}j</span></div>
+        <div class="balance-bar"><div class="balance-fill ${vCls}" style="width:${vPct}%"></div></div>
+      </div>
+    </div>
+    <div class="balance-row">
+      <div style="flex:1">
+        <div style="display:flex;justify-content:space-between"><span class="balance-label">Maladie</span><span class="balance-value" style="color:${mPct>80?'var(--red)':'var(--green)'}">${m.solde}/${m.droit}j</span></div>
+        <div class="balance-bar"><div class="balance-fill ${mCls}" style="width:${mPct}%"></div></div>
+      </div>
+    </div>
+    ${detail}`;
+}
+
+function renderMonthStats(s) {
+  if(!s){document.getElementById('month-stats').innerHTML='';return;}
+  const total=s.M+s.S+s.R+s.F+s.C;
+  document.getElementById('month-stats').innerHTML=`
+    <div class="stat-bar">
+      <div style="width:${s.M/total*100}%;background:var(--red);border-radius:6px 0 0 6px" title="Matin ${s.M}j"></div>
+      <div style="width:${s.S/total*100}%;background:var(--orange)" title="Soir ${s.S}j"></div>
+      <div style="width:${(s.R+s.C)/total*100}%;background:var(--green)" title="Repos/Congés ${s.R+s.C}j"></div>
+      <div style="width:${s.F/total*100}%;background:var(--green-dark);border-radius:0 6px 6px 0" title="Fériés ${s.F}j"></div>
+    </div>
+    <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:10px;font-size:12px;color:var(--muted)">
+      <span><span style="color:var(--red)">●</span> Matin: ${s.M}j</span>
+      <span><span style="color:var(--orange)">●</span> Soir: ${s.S}j</span>
+      <span><span style="color:var(--green)">●</span> Repos: ${s.R}j</span>
+      <span><span style="color:var(--green-dark)">●</span> Fériés: ${s.F}j</span>
+      ${s.C?`<span><span style="color:#86efac">●</span> Congés: ${s.C}j</span>`:''}
+    </div>`;
+}
+
+// ── ANNUAL VIEW ──
+async function renderAnnual() {
+  document.getElementById('period-label').textContent = curYear.toString();
+  if(!curAgent){document.getElementById('annual-grid').innerHTML='<p style="color:var(--muted)">Sélectionnez un agent.</p>';return;}
+  const grid=document.getElementById('annual-grid');
+  grid.innerHTML='<div style="color:var(--muted);font-size:13px">Chargement…</div>';
+  const months = await Promise.all(
+    Array.from({length:12},(_,i)=>fetch(`/api/calendar/${curAgent}/${curYear}/${i+1}`).then(r=>r.json()))
+  );
+  grid.innerHTML=months.map(cal=>renderMiniMonth(cal)).join('');
+}
+
+function renderMiniMonth(cal) {
+  let html=`<div class="card" style="padding:14px">
+    <div style="font-weight:700;font-size:13px;margin-bottom:10px;color:var(--text)">${cal.month_name}</div>
+    <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:2px">
+    ${['L','M','M','J','V','S','D'].map(d=>`<div style="text-align:center;font-size:9px;font-weight:700;color:var(--muted);padding:2px 0">${d}</div>`).join('')}`;
+  for(let i=0;i<cal.first_weekday;i++) html+=`<div></div>`;
+  cal.days.forEach(d=>{
+    let bc, tc;
+    if(d.code==='FERIE'||d.code==='PONT'){bc='rgba(59,130,246,.35)';tc='#93c5fd';}
+    else if(d.code){bc='rgba(34,197,94,.28)';tc='#86efac';}
+    else if(d.base==='M'){bc='rgba(239,68,68,.35)';tc='#fca5a5';}
+    else if(d.base==='S'){bc='rgba(249,115,22,.35)';tc='#fdba74';}
+    else if(d.base==='36'||d.base==='38'){bc='rgba(168,85,247,.28)';tc='#d8b4fe';}
+    else{bc='rgba(34,197,94,.22)';tc='#86efac';}
+    const ring=d.is_today?'box-shadow:0 0 0 1.5px #f8fafc;':'';
+    html+=`<div style="background:${bc};border-radius:3px;text-align:center;font-size:10px;font-weight:800;padding:4px 1px;cursor:pointer;color:${tc};${ring}"
+      title="${d.day_name} ${d.day_num} — ${d.label||d.code||d.base}"
+      onclick="showView('calendar');curMonth=${cal.month};renderCalendar()">${d.day_num}</div>`;
+  });
+  html+=`</div></div>`;
+  return html;
+}
+
+// ── DAY MODAL ──
+let _dayDate=null;
+
+const COLOR_MAP={
+  red:   {bg:'rgba(239,68,68,.15)',border:'#ef4444',text:'#fca5a5'},
+  orange:{bg:'rgba(249,115,22,.15)',border:'#f97316',text:'#fdba74'},
+  green: {bg:'rgba(34,197,94,.15)', border:'#22c55e',text:'#86efac'},
+  blue:  {bg:'rgba(59,130,246,.15)',border:'#3b82f6',text:'#93c5fd'},
+};
+const SHIFT_FULL={M:'MATIN',S:'SOIR',R:'REPOS','36':'REPOS-36','38':'REPOS-38'};
+const DAY_FR=['Lundi','Mardi','Mercredi','Jeudi','Vendredi','Samedi','Dimanche'];
+const MO_FR=['janvier','février','mars','avril','mai','juin','juillet','août','septembre','octobre','novembre','décembre'];
+
+async function openDayModal(dayOrStr) {
+  let dateStr;
+  if(typeof dayOrStr==='string') dateStr=dayOrStr;
+  else dateStr=dayOrStr.date||`${curYear}-${String(curMonth).padStart(2,'0')}-${String(dayOrStr.day_num).padStart(2,'0')}`;
+  if(!curAgent) return;
+  _dayDate=dateStr;
+  openModal('day-modal');
+  await renderDayModal(dateStr);
+}
+
+async function renderDayModal(dateStr) {
+  const d=await fetch(`/api/day/${curAgent}/${dateStr}`).then(r=>r.json());
+  if(d.error){toast(d.error,'error');return;}
+  _dayDate=dateStr;
+
+  // Nav buttons
+  document.getElementById('dm-prev').onclick=()=>renderDayModal(d.prev_date);
+  document.getElementById('dm-next').onclick=()=>renderDayModal(d.next_date);
+
+  // Header
+  const parts=dateStr.split('-');
+  const mo=parseInt(parts[1])-1;
+  document.getElementById('dm-weekday').textContent=DAY_FR[d.weekday];
+  document.getElementById('dm-maindate').textContent=`${d.day_num} ${MO_FR[mo]} ${parts[0]}`;
+
+  // Shift block
+  const clr=COLOR_MAP[d.color]||COLOR_MAP.green;
+  const shiftLabel=d.code&&d.code!=='FERIE'&&d.code!=='PONT'
+    ? (d.label||d.code)
+    : (SHIFT_FULL[d.effective]||d.effective);
+  document.getElementById('dm-shift-block').innerHTML=`
+    <div style="border-left:4px solid ${clr.border};padding-left:12px;height:100%;display:flex;flex-direction:column;justify-content:center;gap:5px;background:${clr.bg};border-radius:10px;padding:14px 14px 14px 16px">
+      <div class="dm-shift-code" style="color:${clr.text}">${d.effective}</div>
+      <div class="dm-shift-label" style="color:${clr.text}">${shiftLabel}</div>
+      <div class="dm-shift-hours" style="color:${clr.text}">${d.shift_hours}</div>
+      <div class="dm-shift-cycle">Cycle · position ${d.cycle_pos} / ${d.cycle_len}</div>
+    </div>`;
+
+  // Week strip
+  const wdays=['L','M','M','J','V','S','D'];
+  let wcHTML='<div class="dm-ws-title">Semaine en cours</div><div class="dm-week-cells">';
+  d.week.forEach((wd,i)=>{
+    const wclr=COLOR_MAP[wd.color]||COLOR_MAP.green;
+    const isAct=wd.date===dateStr;
+    const pill=wd.code&&wd.code!=='FERIE'&&wd.code!=='PONT'?'C':(wd.code==='FERIE'||wd.code==='PONT'?'F':(SHIFT_FULL[wd.base]||wd.base).slice(0,1));
+    wcHTML+=`<div class="dm-wc${isAct?' dm-wc-active':''}"
+      style="background:${wclr.bg};border-color:${isAct?'#f8fafc':wclr.border}"
+      onclick="renderDayModal('${wd.date}')" title="${DAY_FR[i]} ${wd.day_num}">
+      <div class="dm-wc-d" style="color:${wclr.text}">${wdays[i]}</div>
+      <div class="dm-wc-n" style="color:${wclr.text}">${wd.day_num}</div>
+      <div class="dm-wc-s" style="color:${wclr.text}">${pill}</div>
+    </div>`;
+  });
+  wcHTML+='</div>';
+  document.getElementById('dm-week-strip').innerHTML=wcHTML;
+
+  // Events
+  let evHTML=`<div class="dm-sec-title">Congés / Absences</div>`;
+  if(d.events&&d.events.length>0){
+    evHTML+=d.events.map(e=>`
+      <div class="dm-event-row">
+        <div>
+          <div class="dm-ev-label">${e.label}</div>
+          <div class="dm-ev-meta">${e.date_start} au ${e.date_end}${e.note?' · '+e.note:''}</div>
+        </div>
+        <button class="btn btn-danger btn-sm" onclick="removeEvent('${e.agent_id}','${e.date_start}','${e.code}')">Suppr.</button>
+      </div>`).join('');
+  } else {
+    evHTML+=`<div style="color:var(--muted);font-size:12px;padding:10px 0">Aucun congé enregistré pour ce jour.</div>`;
+  }
+  document.getElementById('dm-events').innerHTML=evHTML;
+}
+
+function openLeaveFromDay() {
+  if(!_dayDate) return;
+  closeModal('day-modal');
+  document.getElementById('leave-start').value=_dayDate;
+  document.getElementById('leave-end').value=_dayDate;
+  openModal('leave-modal');
+}
+
+// ── LEAVE MODAL ──
+function openLeaveModal() {
+  const today=new Date();
+  const ds=today.toISOString().split('T')[0];
+  document.getElementById('leave-start').value=ds;
+  document.getElementById('leave-end').value=ds;
+  openModal('leave-modal');
+}
+
+async function submitLeave() {
+  const code=document.getElementById('leave-code').value;
+  const start=document.getElementById('leave-start').value;
+  const end=document.getElementById('leave-end').value;
+  const note=document.getElementById('leave-note-text').value;
+  if(!curAgent){toast('Sélectionnez un agent','error');return;}
+  if(!code||!start||!end){toast('Remplissez tous les champs','error');return;}
+  if(start>end){toast('Date fin < date début','error');return;}
+  const r=await fetch('/api/events',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({agent_id:curAgent,code,date_start:start,date_end:end,note})});
+  if(r.ok){toast('Congé enregistré');closeModal('leave-modal');renderCalendar();}
+  else toast('Erreur lors de l\'enregistrement','error');
+}
+
+async function removeEvent(agent,start,code) {
+  const r=await fetch('/api/events',{method:'DELETE',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({agent_id:agent,date_start:start,code})});
+  if(r.ok){toast('Congé supprimé');renderCalendar();if(_dayDate) renderDayModal(_dayDate);}
+}
+
+// ── MODALS ──
+function openModal(id){document.getElementById(id).classList.add('open')}
+function closeModal(id){document.getElementById(id).classList.remove('open')}
+function openAgentModal(){loadAgents();openModal('agent-modal')}
+
+// ── TOAST ──
+function toast(msg,type='ok'){
+  const el=document.getElementById('toast');
+  el.textContent=msg; el.className='show'+(type==='error'?' error':'');
+  setTimeout(()=>el.className='',2500);
+}
+
+// ── KEYBOARD ──
+document.addEventListener('keydown',e=>{if(e.key==='Escape'){
+  document.querySelectorAll('.modal-overlay.open').forEach(m=>m.classList.remove('open'));
+}});
+
+init();
+</script>
+</body>
+</html>"""
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5050))
+    host = "0.0.0.0" if os.environ.get("PORT") else "127.0.0.1"
+    print("=" * 55)
+    print("  HoraireManager — Prison de Namur / SPF Justice")
+    print(f"  http://localhost:{port}")
+    print("  Ctrl+C pour arrêter")
+    print("=" * 55)
+    app.run(host=host, port=port, debug=False)

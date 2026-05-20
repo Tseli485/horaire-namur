@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+lib/
+*.pdf
+agenda_data.json
+.claude/

@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: horaire-namur
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app_horaire.py
+    envVars:
+      - key: DATA_DIR
+        value: /data
+    disk:
+      name: horaire-data
+      mountPath: /data
+      sizeGB: 1
