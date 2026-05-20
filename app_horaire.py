@@ -7,7 +7,7 @@ Lancement: python app_horaire.py  -> http://localhost:5050
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'lib'))
 
-import json, base64, threading
+import json, base64, threading, uuid as _uuid
 import urllib.request as _urllib
 import urllib.error as _urlerr
 from datetime import date, timedelta
@@ -517,6 +517,91 @@ def api_capitals(aid, year):
     return jsonify({"ok": True, "capitals": caps})
 
 
+# ─────────────────────── ÉCHANGES DE SERVICE ─────────────────
+@app.route("/api/exchanges/<aid>")
+def api_exchanges_list(aid):
+    data = load()
+    exs  = sorted(
+        [e for e in data.get("exchanges", []) if e["agent_id"] == aid],
+        key=lambda x: x.get("date_service",""), reverse=True
+    )
+    return jsonify(exs)
+
+@app.route("/api/exchanges/<aid>/balance")
+def api_exchanges_balance(aid):
+    data = load()
+    exs  = [e for e in data.get("exchanges", []) if e["agent_id"] == aid and e["status"] == "pending"]
+    hier_pending = sum(1 for e in exs if e["type"] == "hierarchie")
+    cols: dict = {}
+    for e in exs:
+        if e["type"] != "collegue":
+            continue
+        c = (e.get("colleague") or "?").strip() or "?"
+        if c not in cols:
+            cols[c] = {"donne": 0, "recu": 0}
+        if e.get("direction") == "donne":
+            cols[c]["donne"] += 1
+        else:
+            cols[c]["recu"] += 1
+    return jsonify({
+        "hierarchie_pending": hier_pending,
+        "collegues": {
+            c: {"donne": v["donne"], "recu": v["recu"], "balance": v["donne"] - v["recu"]}
+            for c, v in cols.items()
+        },
+    })
+
+@app.route("/api/exchanges", methods=["POST"])
+def api_exchanges_create():
+    data = load()
+    body = request.json or {}
+    aid  = body.get("agent_id")
+    if not aid or aid not in data["agents"]:
+        return jsonify({"error": "Agent inconnu"}), 400
+    dr   = body.get("date_remboursement") or None
+    ex   = {
+        "id":                  str(_uuid.uuid4())[:8],
+        "agent_id":            aid,
+        "type":                body.get("type", "collegue"),
+        "direction":           body.get("direction", "donne"),
+        "date_service":        body.get("date_service", ""),
+        "poste_service":       body.get("poste_service", ""),
+        "colleague":           body.get("colleague", ""),
+        "date_remboursement":  dr,
+        "poste_remboursement": body.get("poste_remboursement") or None,
+        "note":                body.get("note", ""),
+        "status":              "done" if dr else "pending",
+        "created":             date.today().isoformat(),
+    }
+    data.setdefault("exchanges", []).append(ex)
+    save(data)
+    return jsonify({"ok": True, "id": ex["id"]})
+
+@app.route("/api/exchanges/<eid>", methods=["PATCH"])
+def api_exchanges_update(eid):
+    data = load()
+    for ex in data.get("exchanges", []):
+        if ex["id"] == eid:
+            body = request.json or {}
+            for f in ("date_service", "poste_service", "colleague", "note", "direction"):
+                if f in body:
+                    ex[f] = body[f]
+            for f in ("date_remboursement", "poste_remboursement"):
+                if f in body:
+                    ex[f] = body[f] or None
+            ex["status"] = "done" if ex.get("date_remboursement") else "pending"
+            save(data)
+            return jsonify({"ok": True, "exchange": ex})
+    return jsonify({"error": "Exchange not found"}), 404
+
+@app.route("/api/exchanges/<eid>", methods=["DELETE"])
+def api_exchanges_delete(eid):
+    data   = load()
+    before = len(data.get("exchanges", []))
+    data["exchanges"] = [e for e in data.get("exchanges", []) if e["id"] != eid]
+    save(data)
+    return jsonify({"removed": before - len(data["exchanges"])})
+
 @app.route("/api/leaves_catalog")
 def api_catalog():
     return jsonify({k: {"label": v["label"], "category": v["category"],
@@ -862,6 +947,37 @@ select:focus,input:focus{border-color:var(--accent)}
   #ent-details .ent-grid{grid-template-columns:1fr!important}
 }
 
+/* ── EXCHANGES VIEW ── */
+#exchanges-content{flex:1;padding:24px;overflow-y:auto;display:none}
+.exch-balance-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:12px;margin-bottom:20px}
+.exch-balance-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px 16px}
+.exch-balance-card .ebc-title{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;font-weight:700;margin-bottom:6px}
+.exch-balance-card .ebc-num{font-size:30px;font-weight:900;line-height:1}
+.exch-balance-card .ebc-sub{font-size:11px;color:var(--muted);margin-top:4px}
+.exch-filter{display:flex;gap:6px;margin-bottom:14px}
+.exch-filter button{padding:5px 14px;border-radius:20px;border:1px solid var(--border);background:var(--card2);color:var(--muted);font-size:12px;cursor:pointer;font-weight:600}
+.exch-filter button.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+.exch-list{display:flex;flex-direction:column;gap:8px}
+.exch-row{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px 16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.exch-row:hover{background:var(--card2)}
+.exr-date{font-size:12px;font-weight:700;min-width:90px;color:var(--muted)}
+.exr-type{font-size:10px;padding:3px 8px;border-radius:20px;font-weight:700;white-space:nowrap}
+.exr-type.hier{background:rgba(168,85,247,.2);color:#d8b4fe}
+.exr-type.col-donne{background:rgba(34,197,94,.15);color:#86efac}
+.exr-type.col-recu{background:rgba(249,115,22,.15);color:#fdba74}
+.exr-who{flex:1;font-size:13px;font-weight:600;min-width:120px}
+.exr-poste{font-size:11px;color:var(--muted);white-space:nowrap}
+.exr-note{font-size:11px;color:var(--muted);font-style:italic;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.exr-status{font-size:11px;font-weight:700;padding:3px 10px;border-radius:20px;white-space:nowrap}
+.exr-status.pending{background:rgba(249,115,22,.2);color:#fdba74}
+.exr-status.done{background:rgba(34,197,94,.15);color:#86efac}
+.exr-actions{display:flex;gap:6px;margin-left:auto}
+@media(max-width:640px){
+  #exchanges-content{padding:12px}
+  .exch-row{gap:8px}
+  .exr-note{display:none}
+}
+
 /* ══════ Très petits écrans (≤ 380px) ══════ */
 @media(max-width:380px){
   .cal-day{min-height:46px;padding:3px 3px 3px 5px}
@@ -886,6 +1002,10 @@ select:focus,input:focus{border-color:var(--accent)}
   <button class="nav-btn" onclick="showView('annuel')">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
     Annuel
+  </button>
+  <button class="nav-btn" onclick="showView('exchanges')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 16V4m0 0L3 8m4-4l4 4M17 8v12m0 0l4-4m-4 4l-4-4"/></svg>
+    Échanges
   </button>
   <button class="nav-btn" onclick="openAgentModal()">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75"/></svg>
@@ -991,6 +1111,24 @@ select:focus,input:focus{border-color:var(--accent)}
   <div id="annual-content" style="display:none;padding:24px;overflow-y:auto">
     <div id="annual-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px"></div>
   </div>
+
+  <!-- EXCHANGES VIEW -->
+  <div id="exchanges-content">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;flex-wrap:wrap;gap:10px">
+      <div>
+        <div style="font-size:15px;font-weight:700;color:var(--text)">Échanges de service</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:2px">Suivi des changements hiérarchie + échanges collègues</div>
+      </div>
+      <button class="btn btn-primary" onclick="openExchangeModal()">+ Nouvel échange</button>
+    </div>
+    <div id="exch-balance-area"></div>
+    <div class="exch-filter" id="exch-filter">
+      <button class="active" onclick="filterExchanges('all',this)">Tout</button>
+      <button onclick="filterExchanges('pending',this)">⏳ En attente</button>
+      <button onclick="filterExchanges('done',this)">✅ Soldés</button>
+    </div>
+    <div class="exch-list" id="exch-list"></div>
+  </div>
 </div>
 
 <!-- MODAL CONGÉ -->
@@ -1091,6 +1229,73 @@ select:focus,input:focus{border-color:var(--accent)}
     <div class="dm-footer">
       <button class="btn" onclick="closeModal('day-modal')" style="background:var(--card2)">Fermer</button>
       <button class="btn btn-primary" onclick="openLeaveFromDay()">+ Ajouter congé ce jour</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL ÉCHANGE DE SERVICE -->
+<div class="modal-overlay" id="exchange-modal">
+  <div class="modal" style="width:480px">
+    <h2>Échange de service <span class="close" onclick="closeModal('exchange-modal')">✕</span></h2>
+    <div class="form-group">
+      <label>Type d'échange</label>
+      <select id="ex-type" onchange="onExTypeChange()">
+        <option value="collegue">Échange avec un collègue</option>
+        <option value="hierarchie">Changement imposé par la hiérarchie</option>
+      </select>
+    </div>
+    <div id="ex-collegue-section">
+      <div class="form-row">
+        <div class="form-group">
+          <label>Sens</label>
+          <select id="ex-direction">
+            <option value="donne">↗ J'ai travaillé POUR lui/elle</option>
+            <option value="recu">↙ Il/elle a travaillé POUR moi</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Nom du collègue</label>
+          <input type="text" id="ex-colleague" placeholder="Ex: Jean Dupont">
+        </div>
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>Date du service échangé</label>
+        <input type="date" id="ex-date-service">
+      </div>
+      <div class="form-group">
+        <label>Poste ce jour-là</label>
+        <select id="ex-poste-service">
+          <option value="M">🔴 Matin (M)</option>
+          <option value="S">🟠 Soir (S)</option>
+          <option value="R">🟢 Repos (R)</option>
+          <option value="">— Non précisé</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>Date de remboursement <span style="color:var(--muted)">(si déjà connu)</span></label>
+        <input type="date" id="ex-date-remb">
+      </div>
+      <div class="form-group">
+        <label>Poste remboursement</label>
+        <select id="ex-poste-remb">
+          <option value="">— Non précisé</option>
+          <option value="M">🔴 Matin (M)</option>
+          <option value="S">🟠 Soir (S)</option>
+          <option value="R">🟢 Repos (R)</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-group">
+      <label>Note / motif</label>
+      <input type="text" id="ex-note" placeholder="Ex: urgence, accord verbal avec chef...">
+    </div>
+    <div class="modal-footer">
+      <button class="btn" style="background:var(--card2);color:var(--muted)" onclick="closeModal('exchange-modal')">Annuler</button>
+      <button class="btn btn-primary" onclick="saveExchange()">Enregistrer</button>
     </div>
   </div>
 </div>
@@ -1319,17 +1524,21 @@ function nextPeriod() {
 }
 function showView(v) {
   curView=v;
-  document.getElementById('content').style.display = v==='calendar'?'grid':'none';
-  document.getElementById('annual-content').style.display = v==='annuel'?'block':'none';
-  document.getElementById('view-title').textContent = v==='calendar'?'Calendrier mensuel':'Vue annuelle';
+  document.getElementById('content').style.display          = v==='calendar'  ? 'grid'  : 'none';
+  document.getElementById('annual-content').style.display   = v==='annuel'    ? 'block' : 'none';
+  document.getElementById('exchanges-content').style.display= v==='exchanges' ? 'block' : 'none';
+  const titles={calendar:'Calendrier mensuel',annuel:'Vue annuelle',exchanges:'Échanges de service'};
+  document.getElementById('view-title').textContent = titles[v]||v;
   document.querySelectorAll('.nav-btn').forEach((b,i)=>{
-    b.classList.toggle('active',(i===0&&v==='calendar')||(i===1&&v==='annuel'));
+    b.classList.toggle('active',
+      (i===0&&v==='calendar')||(i===1&&v==='annuel')||(i===2&&v==='exchanges'));
   });
   refresh();
 }
 function refresh() {
-  if(curView==='calendar') renderCalendar();
-  else renderAnnual();
+  if(curView==='calendar')  renderCalendar();
+  else if(curView==='annuel') renderAnnual();
+  else if(curView==='exchanges') renderExchanges();
 }
 
 // ── CALENDAR ──
@@ -1881,6 +2090,180 @@ function toast(msg,type='ok'){
   const el=document.getElementById('toast');
   el.textContent=msg; el.className='show'+(type==='error'?' error':'');
   setTimeout(()=>el.className='',2500);
+}
+
+// ─────────────── ÉCHANGES DE SERVICE ───────────────
+let _exchFilter = 'all';
+let _allExchanges = [];
+
+async function renderExchanges() {
+  const balArea = document.getElementById('exch-balance-area');
+  const listEl  = document.getElementById('exch-list');
+  if(!curAgent){
+    balArea.innerHTML = '<div style="color:var(--muted);padding:20px 0">Sélectionnez un agent pour voir les échanges.</div>';
+    listEl.innerHTML  = ''; return;
+  }
+  const [exs, balance] = await Promise.all([
+    fetch(`/api/exchanges/${curAgent}`).then(r=>r.json()),
+    fetch(`/api/exchanges/${curAgent}/balance`).then(r=>r.json()),
+  ]);
+  _allExchanges = exs;
+  renderExchangeBalance(balance);
+  renderExchangeList(_allExchanges, _exchFilter);
+}
+
+function renderExchangeBalance(balance) {
+  const area = document.getElementById('exch-balance-area');
+  let html = '<div class="exch-balance-grid">';
+  // Hiérarchie
+  const hp = balance.hierarchie_pending || 0;
+  html += `<div class="exch-balance-card">
+    <div class="ebc-title">🏛 Hiérarchie</div>
+    <div class="ebc-num" style="color:${hp>0?'var(--orange)':'var(--green)'}">${hp}</div>
+    <div class="ebc-sub">compensation${hp>1?'s':''} à récupérer</div>
+  </div>`;
+  // Collègues
+  const cols = balance.collegues || {};
+  const names = Object.keys(cols);
+  if(names.length===0){
+    html += `<div class="exch-balance-card">
+      <div class="ebc-title">👥 Collègues</div>
+      <div class="ebc-num" style="color:var(--green)">0</div>
+      <div class="ebc-sub">aucun échange en cours</div>
+    </div>`;
+  } else {
+    names.forEach(name=>{
+      const c   = cols[name];
+      const bal = c.balance;
+      const bC  = bal>0?'var(--green)':(bal<0?'var(--red)':'var(--muted)');
+      const bTxt= bal>0?`me doit ${bal}`:(bal<0?`je dois ${-bal}`:'soldé');
+      html += `<div class="exch-balance-card">
+        <div class="ebc-title">👤 ${name}</div>
+        <div class="ebc-num" style="color:${bC}">${Math.abs(bal)}</div>
+        <div class="ebc-sub">${bTxt} service${Math.abs(bal)>1?'s':''}</div>
+      </div>`;
+    });
+  }
+  html += '</div>';
+  area.innerHTML = html;
+}
+
+const POSTE_COLORS={M:'var(--red)',S:'var(--orange)',R:'var(--green)'};
+function posteTag(p){ if(!p)return''; const c=POSTE_COLORS[p]||'var(--muted)'; return `<span style="font-size:11px;font-weight:800;color:${c};margin-left:4px">${p}</span>`;}
+
+function renderExchangeList(exs, filter) {
+  const list = document.getElementById('exch-list');
+  const data  = filter==='all' ? exs : exs.filter(e=>e.status===filter);
+  if(!data.length){
+    list.innerHTML = `<div style="color:var(--muted);text-align:center;padding:30px;background:var(--card);border-radius:10px;border:1px solid var(--border)">Aucun échange enregistré.</div>`;
+    return;
+  }
+  list.innerHTML = data.map(ex=>{
+    const isHier = ex.type==='hierarchie';
+    const isDone = ex.status==='done';
+    const ds     = new Date(ex.date_service+'T00:00:00');
+    const dsf    = ds.toLocaleDateString('fr-BE',{day:'2-digit',month:'2-digit',year:'numeric'});
+    // Type badge
+    const dir    = ex.direction;
+    const typeCls= isHier?'hier':(dir==='donne'?'col-donne':'col-recu');
+    const typeTxt= isHier?'🏛 Hiérarchie':(dir==='donne'?'↗ J\'ai donné':'↙ J\'ai reçu');
+    // Who
+    const who    = isHier?'<span style="color:var(--muted);font-style:italic">Hiérarchie</span>'
+      :`<span style="font-weight:800">${ex.colleague||'?'}</span>`;
+    // Remboursement
+    let rembHtml = '';
+    if(isDone && ex.date_remboursement){
+      const dr  = new Date(ex.date_remboursement+'T00:00:00');
+      const drf = dr.toLocaleDateString('fr-BE',{day:'2-digit',month:'2-digit',year:'numeric'});
+      rembHtml  = `<span style="font-size:11px;color:var(--green);margin-left:10px">✅ rembours. ${drf}${ex.poste_remboursement?posteTag(ex.poste_remboursement):''}</span>`;
+    }
+    return `<div class="exch-row">
+      <div class="exr-date">${dsf}</div>
+      <div class="exr-type ${typeCls}">${typeTxt}</div>
+      <div class="exr-who">${who}${posteTag(ex.poste_service)}${rembHtml}</div>
+      ${ex.note?`<div class="exr-note" title="${ex.note}">📝 ${ex.note}</div>`:''}
+      <div class="exr-status ${ex.status}">${isDone?'✅ Soldé':'⏳ En attente'}</div>
+      <div class="exr-actions">
+        ${!isDone?`<button class="btn btn-sm btn-green" onclick="markRepaid('${ex.id}')" title="Marquer remboursé">✓ Soldé</button>`:''}
+        <button class="btn btn-sm btn-danger" onclick="deleteExchange('${ex.id}')" title="Supprimer">🗑</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function filterExchanges(f,btn){
+  _exchFilter=f;
+  document.querySelectorAll('.exch-filter button').forEach(b=>b.classList.remove('active'));
+  if(btn) btn.classList.add('active');
+  renderExchangeList(_allExchanges,f);
+}
+
+function onExTypeChange(){
+  const t=document.getElementById('ex-type').value;
+  document.getElementById('ex-collegue-section').style.display=t==='collegue'?'block':'none';
+}
+
+function openExchangeModal(){
+  document.getElementById('ex-type').value          = 'collegue';
+  document.getElementById('ex-direction').value     = 'donne';
+  document.getElementById('ex-colleague').value     = '';
+  document.getElementById('ex-date-service').value  = new Date().toISOString().slice(0,10);
+  document.getElementById('ex-poste-service').value = 'M';
+  document.getElementById('ex-date-remb').value     = '';
+  document.getElementById('ex-poste-remb').value    = '';
+  document.getElementById('ex-note').value          = '';
+  document.getElementById('ex-collegue-section').style.display='block';
+  document.getElementById('exchange-modal').classList.add('open');
+}
+
+async function saveExchange(){
+  if(!curAgent) return;
+  const type = document.getElementById('ex-type').value;
+  const colleague = (document.getElementById('ex-colleague').value||'').trim();
+  if(type==='collegue' && !colleague){ toast('Nom du collègue requis','error'); return; }
+  const dateService = document.getElementById('ex-date-service').value;
+  if(!dateService){ toast('Date du service requise','error'); return; }
+  const payload = {
+    agent_id:            curAgent,
+    type,
+    direction:           document.getElementById('ex-direction').value,
+    date_service:        dateService,
+    poste_service:       document.getElementById('ex-poste-service').value,
+    colleague,
+    date_remboursement:  document.getElementById('ex-date-remb').value||null,
+    poste_remboursement: document.getElementById('ex-poste-remb').value||null,
+    note:                document.getElementById('ex-note').value.trim(),
+  };
+  const r = await fetch('/api/exchanges',{
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(payload)
+  });
+  if(r.ok){ closeModal('exchange-modal'); toast('Échange enregistré ✅'); renderExchanges(); }
+  else toast('Erreur','error');
+}
+
+async function markRepaid(eid){
+  const today = new Date().toISOString().slice(0,10);
+  const dateRemb = prompt('Date de remboursement :', today);
+  if(dateRemb===null) return;
+  const posteOpts = ['M — Matin','S — Soir','R — Repos',''];
+  const posteRemb = prompt('Poste remboursement (M / S / R ou laisser vide) :', '')
+  const r = await fetch(`/api/exchanges/${eid}`,{
+    method:'PATCH', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({
+      date_remboursement: dateRemb||null,
+      poste_remboursement: (posteRemb||'').toUpperCase()||null
+    })
+  });
+  if(r.ok){ toast('Échange soldé ✅'); renderExchanges(); }
+  else toast('Erreur','error');
+}
+
+async function deleteExchange(eid){
+  if(!confirm('Supprimer cet échange de service ?')) return;
+  const r = await fetch(`/api/exchanges/${eid}`,{method:'DELETE'});
+  if(r.ok){ toast('Supprimé'); renderExchanges(); }
+  else toast('Erreur','error');
 }
 
 // ── KEYBOARD ──
