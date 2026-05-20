@@ -7,7 +7,9 @@ Lancement: python app_horaire.py  -> http://localhost:5050
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'lib'))
 
-import json
+import json, base64, threading
+import urllib.request as _urllib
+import urllib.error as _urlerr
 from datetime import date, timedelta
 from calendar import monthrange, isleap
 from pathlib import Path
@@ -20,6 +22,67 @@ from conges_bosa import LEAVE_CATALOG, get_public_holidays, get_vac_entitlement,
 app = Flask(__name__)
 _data_dir = Path(os.environ.get("DATA_DIR", str(Path(__file__).parent)))
 DATA_FILE  = _data_dir / "agenda_data.json"
+
+# ── GitHub persistence (Render free tier) ──────────────────────
+GITHUB_TOKEN  = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPO   = os.environ.get("GITHUB_REPO",  "Tseli485/horaire-namur")
+GITHUB_BRANCH = "master"
+_GH_FILE      = "agenda_data.json"
+_gh_sha: str | None = None
+_gh_lock = threading.Lock()
+
+def _gh_api(method: str, path: str, payload: dict | None = None):
+    url  = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+    hdrs = {"Authorization": f"token {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github.v3+json",
+            "Content-Type": "application/json"}
+    body = json.dumps(payload).encode() if payload else None
+    req  = _urllib.Request(url, data=body, headers=hdrs, method=method)
+    with _urllib.urlopen(req, timeout=10) as r:
+        return json.loads(r.read())
+
+def _gh_load():
+    """Fetch agenda_data.json from GitHub; returns (data, sha) or (None, None)."""
+    global _gh_sha
+    if not GITHUB_TOKEN:
+        return None, None
+    try:
+        res     = _gh_api("GET", _GH_FILE)
+        content = base64.b64decode(res["content"].replace("\n","")).decode("utf-8")
+        _gh_sha = res["sha"]
+        return json.loads(content), _gh_sha
+    except Exception as e:
+        print(f"[GH] load error: {e}", flush=True)
+        return None, None
+
+def _gh_save_bg(data: dict):
+    """Push agenda_data.json to GitHub in background thread."""
+    global _gh_sha
+    if not GITHUB_TOKEN:
+        return
+    with _gh_lock:
+        try:
+            content = base64.b64encode(
+                json.dumps(data, ensure_ascii=False, indent=2, default=str).encode()
+            ).decode()
+            payload: dict = {"message": "data: agenda_data update",
+                             "content": content, "branch": GITHUB_BRANCH}
+            # Fetch current SHA if not cached
+            if not _gh_sha:
+                try:
+                    r = _gh_api("GET", _GH_FILE)
+                    _gh_sha = r["sha"]
+                except _urlerr.HTTPError as e:
+                    if e.code != 404:
+                        raise  # file genuinely missing → create without sha
+            if _gh_sha:
+                payload["sha"] = _gh_sha
+            res    = _gh_api("PUT", _GH_FILE, payload)
+            _gh_sha = res["content"]["sha"]
+            print(f"[GH] saved sha={_gh_sha[:7]}", flush=True)
+        except Exception as e:
+            print(f"[GH] save error: {e}", flush=True)
+            _gh_sha = None  # reset so next save fetches fresh sha
 
 # ─────────────────────── ROOT + PWA ──────────────────────────
 @app.route("/")
@@ -63,10 +126,24 @@ def pwa_icon():
 def load():
     if DATA_FILE.exists():
         return json.loads(DATA_FILE.read_text(encoding="utf-8"))
-    return {"agents": {}, "events": []}
+    # Fichier absent (redémarrage Render) → récupérer depuis GitHub
+    if GITHUB_TOKEN:
+        data, _ = _gh_load()
+        if data:
+            _data_dir.mkdir(parents=True, exist_ok=True)
+            DATA_FILE.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8")
+            print("[GH] data restored from GitHub", flush=True)
+            return data
+    return {"agents": {}, "events": [], "reliquats": {}, "capitals": {}}
 
 def save(data):
+    _data_dir.mkdir(parents=True, exist_ok=True)
     DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    # Push vers GitHub en arrière-plan (persistance gratuite)
+    if GITHUB_TOKEN:
+        threading.Thread(target=_gh_save_bg, args=(data,), daemon=True).start()
 
 def _get_4_5_actual_date(d: date, weekday_pref: int, offset: int) -> "date | None":
     """Return the actual 4/5 rest date for the week containing d.
@@ -276,6 +353,12 @@ def api_entitlements(aid, year):
     # Droits vacances annuels + reliquat
     vac_info = get_vac_entitlement(age_yr)
     reliquat = data.get("reliquats", {}).get(aid, {}).get(str(year), 0)
+    # Capitals manuels saisis par l'utilisateur (overrides calcul auto)
+    manual_caps = data.get("capitals", {}).get(aid, {}).get(str(year), {})
+    vac_droit_manual = manual_caps.get("vacances")   # None = calcul auto
+    sick_cap_manual  = manual_caps.get("maladie")    # None = calcul auto
+    # Droit vacances effectif
+    vac_droit_eff = vac_droit_manual if vac_droit_manual is not None else vac_info["days"]
     # Detecter si l'anniversaire de cette annee change la tranche vacances
     next_bracket_info = None
     if bd_str and bday_this_year:
@@ -344,28 +427,42 @@ def api_entitlements(aid, year):
     result = {
         "agent":              agent["name"],
         "year":               year,
-        "age_this_year":      age_yr,        # age exact au 01/01 de l'annee
+        "age_this_year":      age_yr,
         "birthday_this_year": bday_this_year,
         "next_bracket":       next_bracket_info,
         "birth_date":         bd_str,
         "career_start":       cs_str,
         "vacances": {
-            "droit":        vac_info["days"],
-            "reliquat":     reliquat,
-            "total":        vac_info["days"] + reliquat,
-            "utilise":      vac_used,
-            "solde":        vac_info["days"] + reliquat - vac_used,
+            "droit":         vac_droit_eff,
+            "droit_auto":    vac_info["days"],    # toujours disponible pour info
+            "reliquat":      reliquat,
+            "total":         vac_droit_eff + reliquat,
+            "utilise":       vac_used,
+            "solde":         vac_droit_eff + reliquat - vac_used,
             "epargnable_an": vac_info["annual_save"],
+            "manual":        vac_droit_manual is not None,
         },
         "conges_detail": conges_detail,
     }
-    if sick_info:
+    # Capital maladie: manuel si saisi, sinon calcul auto par anciennete
+    if sick_cap_manual is not None:
+        effective_capital = sick_cap_manual
         result["maladie"] = {
-            "capital":       sick_info["capital"],
-            "utilise":       sick_all_years,
-            "solde":         sick_info["capital"] - sick_all_years,
-            "is_advance":    sick_info["is_advance"],
+            "capital":        effective_capital,
+            "utilise":        sick_all_years,
+            "solde":          effective_capital - sick_all_years,
+            "is_advance":     False,
+            "service_months": sick_info["service_months"] if sick_info else None,
+            "manual":         True,
+        }
+    elif sick_info:
+        result["maladie"] = {
+            "capital":        sick_info["capital"],
+            "utilise":        sick_all_years,
+            "solde":          sick_info["capital"] - sick_all_years,
+            "is_advance":     sick_info["is_advance"],
             "service_months": sick_info["service_months"],
+            "manual":         False,
         }
     return jsonify(result)
 
@@ -388,6 +485,36 @@ def api_reliquat(aid, year):
     data["reliquats"][aid][str(year)] = val
     save(data)
     return jsonify({"ok": True, "reliquat": val})
+
+
+@app.route("/api/capitals/<aid>/<int:year>", methods=["GET", "PUT"])
+def api_capitals(aid, year):
+    """Capitals manuels (vacances droit + maladie) saisies par l'utilisateur."""
+    data = load()
+    if aid not in data["agents"]:
+        return jsonify({"error": "Agent inconnu"}), 404
+    if request.method == "GET":
+        caps = data.get("capitals", {}).get(aid, {}).get(str(year), {})
+        return jsonify(caps)
+    # PUT — chaque cle est optionnelle; None/vide = supprimer l'override
+    body = request.json or {}
+    if "capitals" not in data:
+        data["capitals"] = {}
+    if aid not in data["capitals"]:
+        data["capitals"][aid] = {}
+    if str(year) not in data["capitals"][aid]:
+        data["capitals"][aid][str(year)] = {}
+    caps = data["capitals"][aid][str(year)]
+    for key in ("maladie", "vacances"):
+        if key in body:
+            v = body[key]
+            if v is None or v == "":
+                caps.pop(key, None)
+            else:
+                caps[key] = max(0, int(v))
+    data["capitals"][aid][str(year)] = caps
+    save(data)
+    return jsonify({"ok": True, "capitals": caps})
 
 
 @app.route("/api/leaves_catalog")
@@ -1255,8 +1382,9 @@ function renderEntitlements(ent) {
   const vC   = v.solde<=5?'var(--red)':v.solde<=8?'var(--orange)':'var(--green)';
 
   // ── Pill vacances ──
+  const vManualTag = v.manual ? `<span style="color:var(--orange);font-weight:900"> ✎</span>` : '';
   let html = `<div style="flex:1;min-width:170px;padding:10px 14px;border-right:1px solid var(--border)">
-    <div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">🏖️ VACANCES ${ent.year}</div>
+    <div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">🏖️ VACANCES ${ent.year}${vManualTag}</div>
     <div style="display:flex;align-items:baseline;gap:4px">
       <span style="font-size:24px;font-weight:900;color:${vC}">${v.solde}</span>
       <span style="font-size:11px;color:var(--muted)">j restants</span>
@@ -1264,11 +1392,11 @@ function renderEntitlements(ent) {
     <div style="height:3px;background:var(--border);border-radius:2px;margin:4px 0;overflow:hidden">
       <div style="width:${vPct}%;height:100%;background:${vC};border-radius:2px"></div>
     </div>
-    <div style="font-size:10px;color:var(--muted)">${v.droit}j droit ${v.reliquat>0?`<span style="color:var(--accent)">+${v.reliquat}j reliquat</span> = ${v.total}j total · `:``}${v.utilise}j pris
+    <div style="font-size:10px;color:var(--muted)">${v.droit}j droit${v.reliquat>0?` + <span style="color:var(--accent)">${v.reliquat}j reliquat</span> = ${v.total}j total`:''} · ${v.utilise}j pris
     </div>
-    <div style="font-size:10px;margin-top:4px">
-      <span onclick="editReliquat()" style="cursor:pointer;color:var(--accent);text-decoration:underline">✏ Reliquat N-1: ${v.reliquat}j</span>
-      <span style="color:var(--muted)"> · éparg. max ${v.epargnable_an}j/an</span>
+    <div style="font-size:10px;margin-top:4px;display:flex;gap:8px;flex-wrap:wrap">
+      <span onclick="editReliquat()" style="cursor:pointer;color:var(--accent);text-decoration:underline">✏ Reliquat: ${v.reliquat}j</span>
+      <span onclick="editCapitalVacances()" style="cursor:pointer;color:${v.manual?'var(--orange)':'var(--accent)'};text-decoration:underline">${v.manual?'🔧':'✏'} Quota: ${v.droit}j</span>
     </div>
   </div>`;
 
@@ -1276,8 +1404,9 @@ function renderEntitlements(ent) {
   if(m){
     const mPct = m.capital>0 ? Math.min(Math.round(m.utilise/m.capital*100),100) : 0;
     const mC   = m.solde < 21?'var(--red)':m.solde < 63?'var(--orange)':'var(--green)';
+    const mTag = m.manual ? `<span style="color:var(--orange);font-weight:900"> ✎</span>` : '';
     html += `<div style="flex:1;min-width:170px;padding:10px 14px;border-right:1px solid var(--border)">
-      <div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">🤒 CAP. MALADIE${m.is_advance?' <span style="color:var(--orange)">(avance)</span>':''}</div>
+      <div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">🤒 CAP. MALADIE${m.manual?mTag:(m.is_advance?' <span style="color:var(--orange)">(avance)</span>':'')}</div>
       <div style="display:flex;align-items:baseline;gap:4px">
         <span style="font-size:24px;font-weight:900;color:${mC}">${m.solde}</span>
         <span style="font-size:11px;color:var(--muted)">j restants / ${m.capital}j</span>
@@ -1285,23 +1414,29 @@ function renderEntitlements(ent) {
       <div style="height:3px;background:var(--border);border-radius:2px;margin:4px 0;overflow:hidden">
         <div style="width:${mPct}%;height:100%;background:${mC};border-radius:2px"></div>
       </div>
-      <div style="font-size:10px;color:var(--muted)">${m.utilise}j pris (toutes années)${m.is_advance?' · avance garantie &lt;3 ans svc':''}</div>
+      <div style="font-size:10px;color:var(--muted)">${m.utilise}j pris (toutes années)${(!m.manual && m.is_advance)?' · avance &lt;3 ans svc':''}</div>
+      <div style="font-size:10px;margin-top:4px">
+        <span onclick="editCapitalMaladie()" style="cursor:pointer;color:${m.manual?'var(--orange)':'var(--accent)'};text-decoration:underline">${m.manual?'🔧':'✏'} Capital: ${m.capital}j</span>
+      </div>
     </div>`;
   } else {
     html += `<div style="flex:1;min-width:150px;padding:10px 14px;border-right:1px solid var(--border)">
       <div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">🤒 CAP. MALADIE</div>
-      <div style="font-size:12px;color:var(--orange);margin-top:10px">⚠ Ajouter date début carrière</div>
+      <div style="font-size:11px;color:var(--orange);margin-top:6px">⚠ Non défini</div>
+      <div style="font-size:10px;margin-top:6px">
+        <span onclick="editCapitalMaladie()" style="cursor:pointer;color:var(--accent);text-decoration:underline">✏ Saisir capital</span>
+      </div>
     </div>`;
   }
 
   // ── Pill ancienneté ──
-  if(m && m.service_months !== undefined){
+  if(m && m.service_months != null){
     const sy = Math.floor(m.service_months/12), smo = m.service_months%12;
     const nextCap = (Math.floor(m.service_months/12)+1)*21;
     html += `<div style="flex:0 0 auto;min-width:120px;padding:10px 14px;border-right:1px solid var(--border)">
       <div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">📅 ANCIENNETÉ</div>
       <div style="font-size:22px;font-weight:900;color:var(--text)">${sy}<span style="font-size:12px;color:var(--muted)">a</span> ${smo}<span style="font-size:12px;color:var(--muted)">m</span></div>
-      <div style="font-size:10px;color:var(--muted);margin-top:4px">Prochain cap: ${nextCap}j</div>
+      <div style="font-size:10px;color:var(--muted);margin-top:4px">Prochain cap auto: ${nextCap}j</div>
     </div>`;
   }
 
@@ -1416,6 +1551,62 @@ async function editReliquat() {
     body: JSON.stringify({reliquat: num})
   });
   if(r.ok){ toast(`Reliquat ${curYear}: ${num}j enregistré`); renderCalendar(); }
+  else toast('Erreur','error');
+}
+
+async function editCapitalVacances() {
+  if(!curAgent) return;
+  const v = _lastEnt?.vacances;
+  const isManual = v?.manual ?? false;
+  const curVal   = isManual ? v.droit : '';
+  const autoVal  = v?.droit_auto ?? v?.droit ?? '?';
+  const msg = `Quota vacances annuel ${curYear}\n`
+    + `Calcul BOSA automatique : ${autoVal}j\n`
+    + (isManual ? `Valeur manuelle actuelle : ${v.droit}j\n` : '')
+    + `\nEntrez votre quota officiel RH, ou laissez vide pour revenir au calcul BOSA :`;
+  const val = prompt(msg, curVal);
+  if(val === null) return;
+  let body;
+  if(val.trim() === '') {
+    body = {vacances: null};   // supprimer override → retour auto
+  } else {
+    const num = parseInt(val);
+    if(isNaN(num) || num < 0){ toast('Valeur invalide','error'); return; }
+    body = {vacances: num};
+  }
+  const r = await fetch(`/api/capitals/${curAgent}/${curYear}`,{
+    method:'PUT', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(body)
+  });
+  if(r.ok){ toast(body.vacances===null ? `Quota vacances : calcul BOSA rétabli` : `Quota vacances ${curYear}: ${body.vacances}j`); renderCalendar(); }
+  else toast('Erreur','error');
+}
+
+async function editCapitalMaladie() {
+  if(!curAgent) return;
+  const m = _lastEnt?.maladie;
+  const isManual = m?.manual ?? false;
+  const curVal   = isManual ? m.capital : '';
+  const autoTxt  = (m && !isManual) ? `Calcul automatique (ancienneté) : ${m.capital}j\n` : '';
+  const msg = `Capital maladie total ${curYear}\n`
+    + autoTxt
+    + (isManual ? `Valeur manuelle actuelle : ${m.capital}j\n` : '')
+    + `\nEntrez votre capital officiel (jours restants selon RH/Medex),\nou laissez vide pour revenir au calcul automatique :`;
+  const val = prompt(msg, curVal);
+  if(val === null) return;
+  let body;
+  if(val.trim() === '') {
+    body = {maladie: null};  // supprimer override
+  } else {
+    const num = parseInt(val);
+    if(isNaN(num) || num < 0){ toast('Valeur invalide','error'); return; }
+    body = {maladie: num};
+  }
+  const r = await fetch(`/api/capitals/${curAgent}/${curYear}`,{
+    method:'PUT', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(body)
+  });
+  if(r.ok){ toast(body.maladie===null ? `Capital maladie : calcul automatique rétabli` : `Capital maladie: ${body.maladie}j`); renderCalendar(); }
   else toast('Erreur','error');
 }
 
