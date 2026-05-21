@@ -7,9 +7,7 @@ Lancement: python app_horaire.py  -> http://localhost:5050
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'lib'))
 
-import json, base64, threading, uuid as _uuid
-import urllib.request as _urllib
-import urllib.error as _urlerr
+import json, uuid as _uuid
 from datetime import date, timedelta
 from calendar import monthrange, isleap
 from pathlib import Path
@@ -22,67 +20,6 @@ from conges_bosa import LEAVE_CATALOG, get_public_holidays, get_vac_entitlement,
 app = Flask(__name__)
 _data_dir = Path(os.environ.get("DATA_DIR", str(Path(__file__).parent)))
 DATA_FILE  = _data_dir / "agenda_data.json"
-
-# ── GitHub persistence (Render free tier) ──────────────────────
-GITHUB_TOKEN  = os.environ.get("GITHUB_TOKEN", "")
-GITHUB_REPO   = os.environ.get("GITHUB_REPO",  "Tseli485/horaire-namur")
-GITHUB_BRANCH = "master"
-_GH_FILE      = "agenda_data.json"
-_gh_sha: str | None = None
-_gh_lock = threading.Lock()
-
-def _gh_api(method: str, path: str, payload: dict | None = None):
-    url  = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
-    hdrs = {"Authorization": f"token {GITHUB_TOKEN}",
-            "Accept": "application/vnd.github.v3+json",
-            "Content-Type": "application/json"}
-    body = json.dumps(payload).encode() if payload else None
-    req  = _urllib.Request(url, data=body, headers=hdrs, method=method)
-    with _urllib.urlopen(req, timeout=10) as r:
-        return json.loads(r.read())
-
-def _gh_load():
-    """Fetch agenda_data.json from GitHub; returns (data, sha) or (None, None)."""
-    global _gh_sha
-    if not GITHUB_TOKEN:
-        return None, None
-    try:
-        res     = _gh_api("GET", _GH_FILE)
-        content = base64.b64decode(res["content"].replace("\n","")).decode("utf-8")
-        _gh_sha = res["sha"]
-        return json.loads(content), _gh_sha
-    except Exception as e:
-        print(f"[GH] load error: {e}", flush=True)
-        return None, None
-
-def _gh_save_bg(data: dict):
-    """Push agenda_data.json to GitHub in background thread."""
-    global _gh_sha
-    if not GITHUB_TOKEN:
-        return
-    with _gh_lock:
-        try:
-            content = base64.b64encode(
-                json.dumps(data, ensure_ascii=False, indent=2, default=str).encode()
-            ).decode()
-            payload: dict = {"message": "data: agenda_data update",
-                             "content": content, "branch": GITHUB_BRANCH}
-            # Fetch current SHA if not cached
-            if not _gh_sha:
-                try:
-                    r = _gh_api("GET", _GH_FILE)
-                    _gh_sha = r["sha"]
-                except _urlerr.HTTPError as e:
-                    if e.code != 404:
-                        raise  # file genuinely missing → create without sha
-            if _gh_sha:
-                payload["sha"] = _gh_sha
-            res    = _gh_api("PUT", _GH_FILE, payload)
-            _gh_sha = res["content"]["sha"]
-            print(f"[GH] saved sha={_gh_sha[:7]}", flush=True)
-        except Exception as e:
-            print(f"[GH] save error: {e}", flush=True)
-            _gh_sha = None  # reset so next save fetches fresh sha
 
 # ─────────────────────── ROOT + PWA ──────────────────────────
 @app.route("/")
@@ -126,24 +63,11 @@ def pwa_icon():
 def load():
     if DATA_FILE.exists():
         return json.loads(DATA_FILE.read_text(encoding="utf-8"))
-    # Fichier absent (redémarrage Render) → récupérer depuis GitHub
-    if GITHUB_TOKEN:
-        data, _ = _gh_load()
-        if data:
-            _data_dir.mkdir(parents=True, exist_ok=True)
-            DATA_FILE.write_text(
-                json.dumps(data, ensure_ascii=False, indent=2, default=str),
-                encoding="utf-8")
-            print("[GH] data restored from GitHub", flush=True)
-            return data
-    return {"agents": {}, "events": [], "reliquats": {}, "capitals": {}}
+    return {"agents": {}, "events": [], "reliquats": {}, "capitals": {}, "exchanges": []}
 
 def save(data):
     _data_dir.mkdir(parents=True, exist_ok=True)
     DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    # Push vers GitHub en arrière-plan (persistance gratuite)
-    if GITHUB_TOKEN:
-        threading.Thread(target=_gh_save_bg, args=(data,), daemon=True).start()
 
 def _get_4_5_actual_date(d: date, weekday_pref: int, offset: int) -> "date | None":
     """Return the actual 4/5 rest date for the week containing d.
