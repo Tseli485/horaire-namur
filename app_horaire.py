@@ -120,6 +120,13 @@ def get_day_info(d: date, agent_id: str, data: dict) -> dict:
 def api_agents():
     return jsonify(load()["agents"])
 
+@app.route("/api/reset", methods=["POST"])
+def api_reset():
+    """Remet toutes les données à zéro — pour transmettre l'app à un collègue."""
+    empty = {"agents": {}, "events": [], "reliquats": {}, "capitals": {}, "exchanges": [], "remarks": {}}
+    save(empty)
+    return jsonify({"ok": True})
+
 @app.route("/api/agents", methods=["POST"])
 def api_add_agent():
     data = load()
@@ -1155,9 +1162,12 @@ select:focus,input:focus{border-color:var(--accent)}
         <option value="4">Vendredi</option>
       </select>
     </div>
-    <div class="modal-footer">
-      <button class="btn" onclick="closeModal('agent-modal')" style="background:var(--card2)">Fermer</button>
-      <button class="btn btn-primary" onclick="addAgent()">Ajouter</button>
+    <div class="modal-footer" style="justify-content:space-between">
+      <button class="btn btn-danger btn-sm" onclick="resetAllData()" title="Remet tout à zéro pour transmettre à un collègue">🗑 Remettre à zéro</button>
+      <div style="display:flex;gap:8px">
+        <button class="btn" onclick="closeModal('agent-modal')" style="background:var(--card2)">Fermer</button>
+        <button class="btn btn-primary" onclick="addAgent()">Ajouter</button>
+      </div>
     </div>
   </div>
 </div>
@@ -1468,6 +1478,19 @@ async function deleteAgent(id) {
   await fetch(`/api/agents/${id}`,{method:'DELETE'});
   toast('Agent supprimé');
   await loadAgents();
+}
+
+async function resetAllData() {
+  if(!confirm('⚠️ ATTENTION : Cela supprime TOUTES les données (agents, congés, échanges, remarques).\n\nConfirmer pour remettre à zéro ?')) return;
+  if(!confirm('Dernière confirmation : remettre vraiment tout à zéro ?')) return;
+  const r = await fetch('/api/reset', {method:'POST'});
+  if(r.ok){
+    curAgent = '';
+    toast('Toutes les données ont été supprimées', 'ok');
+    closeModal('agent-modal');
+    loadAgents();
+    renderCalendar();
+  } else toast('Erreur','error');
 }
 
 // ── NAVIGATION ──
