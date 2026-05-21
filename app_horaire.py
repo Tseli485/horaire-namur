@@ -63,7 +63,7 @@ def pwa_icon():
 def load():
     if DATA_FILE.exists():
         return json.loads(DATA_FILE.read_text(encoding="utf-8"))
-    return {"agents": {}, "events": [], "reliquats": {}, "capitals": {}, "exchanges": []}
+    return {"agents": {}, "events": [], "reliquats": {}, "capitals": {}, "exchanges": [], "remarks": {}}
 
 def save(data):
     _data_dir.mkdir(parents=True, exist_ok=True)
@@ -113,7 +113,7 @@ def get_day_info(d: date, agent_id: str, data: dict) -> dict:
     return {"date": d.isoformat(), "day_num": d.day, "day_name": DAY_NAMES_FR[d.weekday()],
             "weekday": d.weekday(), "base": base, "effective": eff,
             "code": code, "label": label, "color": color,
-            "is_today": d == date.today(), "events": events}
+            "is_today": d == date.today(), "events": events, "remark": ""}
 
 # ─────────────────────── API ROUTES ──────────────────────────
 @app.route("/api/agents", methods=["GET"])
@@ -167,13 +167,36 @@ def api_calendar(aid, year, month):
         return jsonify({"error": "Agent inconnu"}), 404
     days_in_month = monthrange(year, month)[1]
     first_day_wd  = date(year, month, 1).weekday()   # 0=Lun
+    remarks = data.get("remarks", {}).get(aid, {})
     days = []
     for d in range(1, days_in_month + 1):
-        days.append(get_day_info(date(year, month, d), aid, data))
+        day_info = get_day_info(date(year, month, d), aid, data)
+        day_info["remark"] = remarks.get(day_info["date"], "")
+        days.append(day_info)
     return jsonify({"year": year, "month": month,
                     "month_name": MONTH_NAMES_FR[month-1],
                     "first_weekday": first_day_wd,
                     "days": days})
+
+@app.route("/api/remarks/<aid>/<date_str>", methods=["GET", "PUT"])
+def api_remark(aid, date_str):
+    data = load()
+    if aid not in data["agents"]:
+        return jsonify({"error": "Agent inconnu"}), 404
+    if "remarks" not in data:
+        data["remarks"] = {}
+    if request.method == "GET":
+        txt = data["remarks"].get(aid, {}).get(date_str, "")
+        return jsonify({"remark": txt})
+    txt = (request.json or {}).get("remark", "").strip()
+    if aid not in data["remarks"]:
+        data["remarks"][aid] = {}
+    if txt:
+        data["remarks"][aid][date_str] = txt
+    else:
+        data["remarks"][aid].pop(date_str, None)
+    save(data)
+    return jsonify({"ok": True, "remark": txt})
 
 @app.route("/api/events", methods=["POST"])
 def api_add_event():
@@ -659,6 +682,8 @@ select:focus,input:focus{border-color:var(--accent)}
 }
 .day-reason{font-size:11px;font-weight:600;margin-top:auto;line-height:1.3;
   overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;opacity:.85;}
+.day-remark{font-size:9px;color:var(--accent);opacity:.9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;margin-top:1px}
+.remark-dot{display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--accent);margin-right:2px;vertical-align:middle;flex-shrink:0}
 .n-red    .day-reason{color:#f87171}
 .n-orange .day-reason{color:#fb923c}
 .n-green  .day-reason{color:#4ade80}
@@ -827,17 +852,27 @@ select:focus,input:focus{border-color:var(--accent)}
   #mobile-agent-bar{display:flex!important}
 
   /* Grille calendrier */
-  #content{grid-template-columns:1fr;padding:8px;gap:8px}
+  #content{grid-template-columns:1fr;padding:6px;gap:8px}
   #right-panel{display:none}
   #right-panel.panel-open{display:flex!important;flex-direction:column}
-  .cal-grid{gap:2px}
-  .cal-header{font-size:9px;padding:5px 0}
-  .cal-day{min-height:54px;padding:4px 4px 4px 7px;gap:1px}
-  .cal-day.today .day-num{width:28px;height:28px;font-size:15px}
-  .day-num{font-size:18px}
-  .shift-pill{font-size:8px;padding:1px 5px}
-  .day-abbr{font-size:8px}
-  .day-reason{font-size:8px}
+  .cal-grid{gap:3px}
+  .cal-header{font-size:10px;padding:6px 0;font-weight:800}
+  .cal-day{min-height:68px;padding:5px 5px 5px 9px;gap:2px}
+  .cal-day.today .day-num{width:32px;height:32px;font-size:18px}
+  .day-num{font-size:22px;font-weight:900}
+  .shift-pill{font-size:9px;padding:2px 5px}
+  .day-abbr{font-size:9px}
+  .day-reason{font-size:9px;-webkit-line-clamp:1}
+  .day-remark{font-size:8px}
+  /* Topbar mobile amélioré */
+  #topbar{padding:8px 10px;gap:4px}
+  #topbar h2{font-size:14px;font-weight:800}
+  .month-nav button{padding:7px 12px;font-size:14px;min-width:40px;border-radius:8px}
+  .month-nav span{font-size:14px;min-width:100px}
+  /* Entitlements scrollable */
+  #entitlements-bar{padding:6px 8px}
+  /* Soldes congés bouton flottant */
+  #btn-panel-mobile{font-size:10px;padding:6px 8px}
 
   /* Modals → tiroir du bas */
   .modal-overlay{align-items:flex-end;padding:0}
@@ -894,10 +929,18 @@ select:focus,input:focus{border-color:var(--accent)}
 
 /* ══════ Très petits écrans (≤ 380px) ══════ */
 @media(max-width:380px){
-  .cal-day{min-height:46px;padding:3px 3px 3px 5px}
-  .day-num{font-size:15px}
-  .shift-pill{display:none}
+  .cal-day{min-height:58px;padding:4px 3px 4px 6px}
+  .day-num{font-size:18px}
+  .shift-pill{font-size:8px;padding:1px 4px}
+  .day-abbr{display:none}
 }
+/* Textarea remarque dans modal jour */
+#dm-remark-area{width:100%;padding:10px;background:var(--card2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;resize:none;min-height:70px;font-family:inherit;outline:none;margin-top:6px}
+#dm-remark-area:focus{border-color:var(--accent)}
+.dm-remark-section{padding:12px 16px;border-top:1px solid var(--border)}
+.dm-remark-label{font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:4px;display:flex;align-items:center;justify-content:space-between}
+.dm-remark-save{font-size:11px;padding:4px 12px;border-radius:6px;border:none;background:var(--accent);color:#fff;cursor:pointer;font-weight:600}
+.dm-remark-save:hover{background:#2563eb}
 </style>
 </head>
 <body>
@@ -1140,9 +1183,16 @@ select:focus,input:focus{border-color:var(--accent)}
       </div>
       <div class="dm-events-section" id="dm-events"></div>
     </div>
+    <div class="dm-remark-section">
+      <div class="dm-remark-label">
+        <span>📝 Remarque personnelle</span>
+        <button class="dm-remark-save" onclick="saveDayRemark()">Enregistrer</button>
+      </div>
+      <textarea id="dm-remark-area" placeholder="Ajouter une note pour ce jour..."></textarea>
+    </div>
     <div class="dm-footer">
       <button class="btn" onclick="closeModal('day-modal')" style="background:var(--card2)">Fermer</button>
-      <button class="btn btn-primary" onclick="openLeaveFromDay()">+ Ajouter congé ce jour</button>
+      <button class="btn btn-primary" onclick="openLeaveFromDay()">+ Ajouter congé</button>
     </div>
   </div>
 </div>
@@ -1780,18 +1830,23 @@ function renderGrid(cal) {
 
     const todayCls = day.is_today?'today':'';
     const weCls    = (day.weekday>=5)?'weekend':'';
+    const hasRemark = day.remark && day.remark.trim() !== '';
     const dataStr  = JSON.stringify(day).replace(/"/g,'&quot;');
+    const remarkHtml = hasRemark
+      ? '<div class="day-remark"><span class="remark-dot"></span>' + day.remark + '</div>'
+      : '';
 
-    html+=`<div class="cal-day ${bCls} ${cCls} ${nCls} ${todayCls} ${weCls}"
-      onclick="openDayModal(${dataStr})"
-      title="${day.day_name} ${day.day_num} — ${pillTxt}${reasonTxt?' : '+reasonTxt:''}">
-      <div class="day-top">
-        <span class="day-abbr">${day.day_name}</span>
-        <span class="shift-pill ${pCls}">${pillTxt}</span>
-      </div>
-      <div class="day-num">${day.day_num}</div>
-      ${reasonTxt?`<div class="day-reason">${reasonTxt}</div>`:''}
-    </div>`;
+    html+='<div class="cal-day '+bCls+' '+cCls+' '+nCls+' '+todayCls+' '+weCls+'"'
+        +' onclick="openDayModal('+dataStr+')"'
+        +' title="'+day.day_name+' '+day.day_num+' — '+pillTxt+(reasonTxt?' : '+reasonTxt:'')+(hasRemark?' | Note: '+day.remark:'')+'">'
+        +'<div class="day-top">'
+        +'<span class="day-abbr">'+day.day_name+'</span>'
+        +'<span class="shift-pill '+pCls+'">'+pillTxt+'</span>'
+        +'</div>'
+        +'<div class="day-num">'+day.day_num+'</div>'
+        +(reasonTxt?'<div class="day-reason">'+reasonTxt+'</div>':'')
+        +remarkHtml
+        +'</div>';
   });
   grid.innerHTML=html;
 }
@@ -1961,6 +2016,23 @@ async function renderDayModal(dateStr) {
     evHTML+=`<div style="color:var(--muted);font-size:12px;padding:10px 0">Aucun congé enregistré pour ce jour.</div>`;
   }
   document.getElementById('dm-events').innerHTML=evHTML;
+
+  // Remarque
+  const remEl = document.getElementById('dm-remark-area');
+  if(remEl) remEl.value = d.remark || '';
+}
+
+async function saveDayRemark() {
+  if(!curAgent || !_dayDate) return;
+  const txt = (document.getElementById('dm-remark-area').value || '').trim();
+  const r = await fetch('/api/remarks/'+curAgent+'/'+_dayDate, {
+    method:'PUT', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({remark: txt})
+  });
+  if(r.ok){
+    toast(txt ? 'Remarque enregistrée' : 'Remarque supprimée', 'ok');
+    renderCalendar();
+  } else toast('Erreur','error');
 }
 
 function openLeaveFromDay() {
