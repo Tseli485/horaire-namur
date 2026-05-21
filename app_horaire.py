@@ -279,10 +279,10 @@ def api_entitlements(aid, year):
     reliquat = data.get("reliquats", {}).get(aid, {}).get(str(year), 0)
     # Capitals manuels saisis par l'utilisateur (overrides calcul auto)
     manual_caps = data.get("capitals", {}).get(aid, {}).get(str(year), {})
-    vac_droit_manual = manual_caps.get("vacances")   # None = calcul auto
-    sick_cap_manual  = manual_caps.get("maladie")    # None = calcul auto
-    # Droit vacances effectif
-    vac_droit_eff = vac_droit_manual if vac_droit_manual is not None else vac_info["days"]
+    vac_droit_manual = manual_caps.get("vacances")   # None = non saisi = 0
+    sick_cap_manual  = manual_caps.get("maladie")    # None = non saisi = 0
+    # Droit vacances effectif : 0 par défaut, l'utilisateur saisit son quota réel
+    vac_droit_eff = vac_droit_manual if vac_droit_manual is not None else 0
     # Detecter si l'anniversaire de cette annee change la tranche vacances
     next_bracket_info = None
     if bd_str and bday_this_year:
@@ -368,26 +368,16 @@ def api_entitlements(aid, year):
         },
         "conges_detail": conges_detail,
     }
-    # Capital maladie: manuel si saisi, sinon calcul auto par anciennete
-    if sick_cap_manual is not None:
-        effective_capital = sick_cap_manual
-        result["maladie"] = {
-            "capital":        effective_capital,
-            "utilise":        sick_all_years,
-            "solde":          effective_capital - sick_all_years,
-            "is_advance":     False,
-            "service_months": sick_info["service_months"] if sick_info else None,
-            "manual":         True,
-        }
-    elif sick_info:
-        result["maladie"] = {
-            "capital":        sick_info["capital"],
-            "utilise":        sick_all_years,
-            "solde":          sick_info["capital"] - sick_all_years,
-            "is_advance":     sick_info["is_advance"],
-            "service_months": sick_info["service_months"],
-            "manual":         False,
-        }
+    # Capital maladie : toujours affiché, 0 par défaut jusqu'à saisie manuelle
+    effective_capital = sick_cap_manual if sick_cap_manual is not None else 0
+    result["maladie"] = {
+        "capital":        effective_capital,
+        "utilise":        sick_all_years,
+        "solde":          effective_capital - sick_all_years,
+        "is_advance":     False,
+        "service_months": sick_info["service_months"] if sick_info else None,
+        "manual":         sick_cap_manual is not None,
+    }
     return jsonify(result)
 
 
@@ -1516,20 +1506,24 @@ function renderEntitlements(ent) {
 
   // ── Pill vacances ──
   const vManualTag = v.manual ? `<span style="color:var(--orange);font-weight:900"> ✎</span>` : '';
+  const vNotSet = !v.manual && v.droit === 0;
   let html = `<div style="flex:1;min-width:170px;padding:10px 14px;border-right:1px solid var(--border)">
     <div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">🏖️ VACANCES ${ent.year}${vManualTag}</div>
-    <div style="display:flex;align-items:baseline;gap:4px">
-      <span style="font-size:24px;font-weight:900;color:${vC}">${v.solde}</span>
-      <span style="font-size:11px;color:var(--muted)">j restants</span>
-    </div>
-    <div style="height:3px;background:var(--border);border-radius:2px;margin:4px 0;overflow:hidden">
-      <div style="width:${vPct}%;height:100%;background:${vC};border-radius:2px"></div>
-    </div>
-    <div style="font-size:10px;color:var(--muted)">${v.droit}j droit${v.reliquat>0?` + <span style="color:var(--accent)">${v.reliquat}j reliquat</span> = ${v.total}j total`:''} · ${v.utilise}j pris
-    </div>
+    ${vNotSet
+      ? `<div style="font-size:13px;color:var(--orange);font-weight:700;margin:4px 0">⚠ À définir</div>
+         <div style="font-size:10px;color:var(--muted)">${v.utilise}j déjà pris</div>`
+      : `<div style="display:flex;align-items:baseline;gap:4px">
+           <span style="font-size:24px;font-weight:900;color:${vC}">${v.solde}</span>
+           <span style="font-size:11px;color:var(--muted)">j restants</span>
+         </div>
+         <div style="height:3px;background:var(--border);border-radius:2px;margin:4px 0;overflow:hidden">
+           <div style="width:${vPct}%;height:100%;background:${vC};border-radius:2px"></div>
+         </div>
+         <div style="font-size:10px;color:var(--muted)">${v.droit}j droit${v.reliquat>0?` + <span style="color:var(--accent)">${v.reliquat}j reliquat</span> = ${v.total}j total`:''} · ${v.utilise}j pris</div>`
+    }
     <div style="font-size:10px;margin-top:4px;display:flex;gap:8px;flex-wrap:wrap">
       <span onclick="editReliquat()" style="cursor:pointer;color:var(--accent);text-decoration:underline">✏ Reliquat: ${v.reliquat}j</span>
-      <span onclick="editCapitalVacances()" style="cursor:pointer;color:${v.manual?'var(--orange)':'var(--accent)'};text-decoration:underline">${v.manual?'🔧':'✏'} Quota: ${v.droit}j</span>
+      <span onclick="editCapitalVacances()" style="cursor:pointer;color:${vNotSet?'var(--orange)':v.manual?'var(--orange)':'var(--accent)'};font-weight:${vNotSet?'700':'400'};text-decoration:underline">${v.manual?'🔧':'✏'} ${vNotSet?'⚡ Saisir quota':'Quota: '+v.droit+'j'}</span>
     </div>
   </div>`;
 
@@ -1538,29 +1532,25 @@ function renderEntitlements(ent) {
     const mPct = m.capital>0 ? Math.min(Math.round(m.utilise/m.capital*100),100) : 0;
     const mC   = m.solde < 21?'var(--red)':m.solde < 63?'var(--orange)':'var(--green)';
     const mTag = m.manual ? `<span style="color:var(--orange);font-weight:900"> ✎</span>` : '';
+    const mNotSet = !m.manual && m.capital === 0;
     html += `<div style="flex:1;min-width:170px;padding:10px 14px;border-right:1px solid var(--border)">
-      <div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">🤒 CAP. MALADIE${m.manual?mTag:(m.is_advance?' <span style="color:var(--orange)">(avance)</span>':'')}</div>
-      <div style="display:flex;align-items:baseline;gap:4px">
-        <span style="font-size:24px;font-weight:900;color:${mC}">${m.solde}</span>
-        <span style="font-size:11px;color:var(--muted)">j restants / ${m.capital}j</span>
-      </div>
-      <div style="height:3px;background:var(--border);border-radius:2px;margin:4px 0;overflow:hidden">
-        <div style="width:${mPct}%;height:100%;background:${mC};border-radius:2px"></div>
-      </div>
-      <div style="font-size:10px;color:var(--muted)">${m.utilise}j pris (toutes années)${(!m.manual && m.is_advance)?' · avance &lt;3 ans svc':''}</div>
+      <div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">🤒 CAP. MALADIE${m.manual?mTag:''}</div>
+      ${mNotSet
+        ? `<div style="font-size:13px;color:var(--orange);font-weight:700;margin:4px 0">⚠ À définir</div>
+           <div style="font-size:10px;color:var(--muted)">${m.utilise}j déjà pris</div>`
+        : `<div style="display:flex;align-items:baseline;gap:4px">
+             <span style="font-size:24px;font-weight:900;color:${mC}">${m.solde}</span>
+             <span style="font-size:11px;color:var(--muted)">j restants / ${m.capital}j</span>
+           </div>
+           <div style="height:3px;background:var(--border);border-radius:2px;margin:4px 0;overflow:hidden">
+             <div style="width:${mPct}%;height:100%;background:${mC};border-radius:2px"></div>
+           </div>
+           <div style="font-size:10px;color:var(--muted)">${m.utilise}j pris (toutes années)</div>`
+      }
       <div style="font-size:10px;margin-top:4px">
-        <span onclick="editCapitalMaladie()" style="cursor:pointer;color:${m.manual?'var(--orange)':'var(--accent)'};text-decoration:underline">${m.manual?'🔧':'✏'} Capital: ${m.capital}j</span>
+        <span onclick="editCapitalMaladie()" style="cursor:pointer;color:${mNotSet?'var(--orange)':m.manual?'var(--orange)':'var(--accent)'};font-weight:${mNotSet?'700':'400'};text-decoration:underline">${m.manual?'🔧':'✏'} ${mNotSet?'⚡ Saisir capital':'Capital: '+m.capital+'j'}</span>
       </div>
     </div>`;
-  } else {
-    html += `<div style="flex:1;min-width:150px;padding:10px 14px;border-right:1px solid var(--border)">
-      <div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">🤒 CAP. MALADIE</div>
-      <div style="font-size:11px;color:var(--orange);margin-top:6px">⚠ Non défini</div>
-      <div style="font-size:10px;margin-top:6px">
-        <span onclick="editCapitalMaladie()" style="cursor:pointer;color:var(--accent);text-decoration:underline">✏ Saisir capital</span>
-      </div>
-    </div>`;
-  }
 
   // ── Pill ancienneté ──
   if(m && m.service_months != null){
@@ -1691,17 +1681,16 @@ async function editCapitalVacances() {
   if(!curAgent) return;
   const v = _lastEnt?.vacances;
   const isManual = v?.manual ?? false;
-  const curVal   = isManual ? v.droit : '';
-  const autoVal  = v?.droit_auto ?? v?.droit ?? '?';
+  const curVal   = isManual ? String(v.droit) : '';
   const msg = `Quota vacances annuel ${curYear}\n`
-    + `Calcul BOSA automatique : ${autoVal}j\n`
-    + (isManual ? `Valeur manuelle actuelle : ${v.droit}j\n` : '')
-    + `\nEntrez votre quota officiel RH, ou laissez vide pour revenir au calcul BOSA :`;
+    + (isManual ? `Valeur actuelle : ${v.droit}j\n` : `Aucun quota défini (compteur à 0)\n`)
+    + `\nEntrez le nombre de jours de vacances accordés par votre RH :`
+    + (isManual ? `\n(Laissez vide pour remettre à 0)` : '');
   const val = prompt(msg, curVal);
   if(val === null) return;
   let body;
   if(val.trim() === '') {
-    body = {vacances: null};   // supprimer override → retour auto
+    body = {vacances: null};   // remettre à 0
   } else {
     const num = parseInt(val);
     if(isNaN(num) || num < 0){ toast('Valeur invalide','error'); return; }
@@ -1711,7 +1700,7 @@ async function editCapitalVacances() {
     method:'PUT', headers:{'Content-Type':'application/json'},
     body: JSON.stringify(body)
   });
-  if(r.ok){ toast(body.vacances===null ? `Quota vacances : calcul BOSA rétabli` : `Quota vacances ${curYear}: ${body.vacances}j`); renderCalendar(); }
+  if(r.ok){ toast(body.vacances===null ? `Quota vacances remis à 0` : `Quota vacances ${curYear} : ${body.vacances}j`,'ok'); renderCalendar(); }
   else toast('Erreur','error');
 }
 
@@ -1719,12 +1708,11 @@ async function editCapitalMaladie() {
   if(!curAgent) return;
   const m = _lastEnt?.maladie;
   const isManual = m?.manual ?? false;
-  const curVal   = isManual ? m.capital : '';
-  const autoTxt  = (m && !isManual) ? `Calcul automatique (ancienneté) : ${m.capital}j\n` : '';
-  const msg = `Capital maladie total ${curYear}\n`
-    + autoTxt
-    + (isManual ? `Valeur manuelle actuelle : ${m.capital}j\n` : '')
-    + `\nEntrez votre capital officiel (jours restants selon RH/Medex),\nou laissez vide pour revenir au calcul automatique :`;
+  const curVal   = isManual ? String(m.capital) : '';
+  const msg = `Capital maladie ${curYear}\n`
+    + (isManual ? `Valeur actuelle : ${m.capital}j\n` : `Aucun capital défini (compteur à 0)\n`)
+    + `\nEntrez votre capital maladie (jours restants selon RH/Medex) :`
+    + (isManual ? `\n(Laissez vide pour remettre à 0)` : '');
   const val = prompt(msg, curVal);
   if(val === null) return;
   let body;
@@ -1739,7 +1727,7 @@ async function editCapitalMaladie() {
     method:'PUT', headers:{'Content-Type':'application/json'},
     body: JSON.stringify(body)
   });
-  if(r.ok){ toast(body.maladie===null ? `Capital maladie : calcul automatique rétabli` : `Capital maladie: ${body.maladie}j`); renderCalendar(); }
+  if(r.ok){ toast(body.maladie===null ? `Capital maladie remis à 0` : `Capital maladie : ${body.maladie}j`,'ok'); renderCalendar(); }
   else toast('Erreur','error');
 }
 
