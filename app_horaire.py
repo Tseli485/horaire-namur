@@ -12,7 +12,7 @@ from datetime import date, timedelta
 from calendar import monthrange, isleap
 from pathlib import Path
 
-from flask import Flask, jsonify, request, render_template_string
+from flask import Flask, jsonify, request, render_template_string, Response
 
 from horaire_agent import get_shift, MONTH_NAMES_FR, DAY_NAMES_FR, CYCLE_LEN, ANCHOR
 from conges_bosa import LEAVE_CATALOG, get_public_holidays, get_vac_entitlement, get_sick_capital
@@ -24,7 +24,7 @@ DATA_FILE  = _data_dir / "agenda_data.json"
 # ─────────────────────── ROOT + PWA ──────────────────────────
 @app.route("/")
 def index():
-    return render_template_string(HTML)
+    return Response(HTML, mimetype='text/html; charset=utf-8')
 
 @app.route("/manifest.json")
 def pwa_manifest():
