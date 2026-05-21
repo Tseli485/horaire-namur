@@ -1558,6 +1558,7 @@ function renderEntitlements(ent) {
       + '<div style="font-size:10px;margin-top:4px">'
       + '<span onclick="editCapitalMaladie()" style="cursor:pointer;color:' + mBtnColor + ';font-weight:' + (mNotSet?'700':'400') + ';text-decoration:underline">' + mBtnText + '</span>'
       + '</div></div>';
+  }
 
   // ── Pill ancienneté ──
   if(m && m.service_months != null){
