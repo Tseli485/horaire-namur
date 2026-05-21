@@ -1,0 +1,19 @@
+{
+  "agents": {
+    "TSELI": {
+      "name": "tseli",
+      "birth_date": "1961-09-24",
+      "career_start": "1999-12-31",
+      "team_offset": 0,
+      "regime_4_5": 0
+    }
+  },
+  "events": [],
+  "reliquats": {
+    "TSELI": {
+      "2026": 0
+    }
+  },
+  "capitals": {},
+  "exchanges": []
+}
