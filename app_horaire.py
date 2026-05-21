@@ -1505,52 +1505,59 @@ function renderEntitlements(ent) {
   const vC   = v.solde<=5?'var(--red)':v.solde<=8?'var(--orange)':'var(--green)';
 
   // ── Pill vacances ──
-  const vManualTag = v.manual ? `<span style="color:var(--orange);font-weight:900"> ✎</span>` : '';
+  const vManualTag = v.manual ? ' <span style="color:var(--orange);font-weight:900">✎</span>' : '';
   const vNotSet = !v.manual && v.droit === 0;
-  let html = `<div style="flex:1;min-width:170px;padding:10px 14px;border-right:1px solid var(--border)">
-    <div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">🏖️ VACANCES ${ent.year}${vManualTag}</div>
-    ${vNotSet
-      ? `<div style="font-size:13px;color:var(--orange);font-weight:700;margin:4px 0">⚠ À définir</div>
-         <div style="font-size:10px;color:var(--muted)">${v.utilise}j déjà pris</div>`
-      : `<div style="display:flex;align-items:baseline;gap:4px">
-           <span style="font-size:24px;font-weight:900;color:${vC}">${v.solde}</span>
-           <span style="font-size:11px;color:var(--muted)">j restants</span>
-         </div>
-         <div style="height:3px;background:var(--border);border-radius:2px;margin:4px 0;overflow:hidden">
-           <div style="width:${vPct}%;height:100%;background:${vC};border-radius:2px"></div>
-         </div>
-         <div style="font-size:10px;color:var(--muted)">${v.droit}j droit${v.reliquat>0?` + <span style="color:var(--accent)">${v.reliquat}j reliquat</span> = ${v.total}j total`:''} · ${v.utilise}j pris</div>`
-    }
-    <div style="font-size:10px;margin-top:4px;display:flex;gap:8px;flex-wrap:wrap">
-      <span onclick="editReliquat()" style="cursor:pointer;color:var(--accent);text-decoration:underline">✏ Reliquat: ${v.reliquat}j</span>
-      <span onclick="editCapitalVacances()" style="cursor:pointer;color:${vNotSet?'var(--orange)':v.manual?'var(--orange)':'var(--accent)'};font-weight:${vNotSet?'700':'400'};text-decoration:underline">${v.manual?'🔧':'✏'} ${vNotSet?'⚡ Saisir quota':'Quota: '+v.droit+'j'}</span>
-    </div>
-  </div>`;
+  let vBody = '';
+  if(vNotSet) {
+    vBody = '<div style="font-size:13px;color:var(--orange);font-weight:700;margin:4px 0">⚠ À définir</div>'
+          + '<div style="font-size:10px;color:var(--muted)">' + v.utilise + 'j déjà pris</div>';
+  } else {
+    const reliqHtml = v.reliquat > 0
+      ? ' + <span style="color:var(--accent)">' + v.reliquat + 'j reliquat</span> = ' + v.total + 'j total'
+      : '';
+    vBody = '<div style="display:flex;align-items:baseline;gap:4px">'
+          + '<span style="font-size:24px;font-weight:900;color:' + vC + '">' + v.solde + '</span>'
+          + '<span style="font-size:11px;color:var(--muted)">j restants</span></div>'
+          + '<div style="height:3px;background:var(--border);border-radius:2px;margin:4px 0;overflow:hidden">'
+          + '<div style="width:' + vPct + '%;height:100%;background:' + vC + ';border-radius:2px"></div></div>'
+          + '<div style="font-size:10px;color:var(--muted)">' + v.droit + 'j droit' + reliqHtml + ' · ' + v.utilise + 'j pris</div>';
+  }
+  const vBtnColor = (vNotSet || v.manual) ? 'var(--orange)' : 'var(--accent)';
+  const vBtnText  = vNotSet ? '⚡ Saisir quota' : (v.manual ? '🔧 Quota: ' + v.droit + 'j' : '✏ Quota: ' + v.droit + 'j');
+  let html = '<div style="flex:1;min-width:170px;padding:10px 14px;border-right:1px solid var(--border)">'
+    + '<div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">🏖️ VACANCES ' + ent.year + vManualTag + '</div>'
+    + vBody
+    + '<div style="font-size:10px;margin-top:4px;display:flex;gap:8px;flex-wrap:wrap">'
+    + '<span onclick="editReliquat()" style="cursor:pointer;color:var(--accent);text-decoration:underline">✏ Reliquat: ' + v.reliquat + 'j</span>'
+    + '<span onclick="editCapitalVacances()" style="cursor:pointer;color:' + vBtnColor + ';font-weight:' + (vNotSet?'700':'400') + ';text-decoration:underline">' + vBtnText + '</span>'
+    + '</div></div>';
 
   // ── Pill maladie capital ──
   if(m){
     const mPct = m.capital>0 ? Math.min(Math.round(m.utilise/m.capital*100),100) : 0;
     const mC   = m.solde < 21?'var(--red)':m.solde < 63?'var(--orange)':'var(--green)';
-    const mTag = m.manual ? `<span style="color:var(--orange);font-weight:900"> ✎</span>` : '';
     const mNotSet = !m.manual && m.capital === 0;
-    html += `<div style="flex:1;min-width:170px;padding:10px 14px;border-right:1px solid var(--border)">
-      <div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">🤒 CAP. MALADIE${m.manual?mTag:''}</div>
-      ${mNotSet
-        ? `<div style="font-size:13px;color:var(--orange);font-weight:700;margin:4px 0">⚠ À définir</div>
-           <div style="font-size:10px;color:var(--muted)">${m.utilise}j déjà pris</div>`
-        : `<div style="display:flex;align-items:baseline;gap:4px">
-             <span style="font-size:24px;font-weight:900;color:${mC}">${m.solde}</span>
-             <span style="font-size:11px;color:var(--muted)">j restants / ${m.capital}j</span>
-           </div>
-           <div style="height:3px;background:var(--border);border-radius:2px;margin:4px 0;overflow:hidden">
-             <div style="width:${mPct}%;height:100%;background:${mC};border-radius:2px"></div>
-           </div>
-           <div style="font-size:10px;color:var(--muted)">${m.utilise}j pris (toutes années)</div>`
-      }
-      <div style="font-size:10px;margin-top:4px">
-        <span onclick="editCapitalMaladie()" style="cursor:pointer;color:${mNotSet?'var(--orange)':m.manual?'var(--orange)':'var(--accent)'};font-weight:${mNotSet?'700':'400'};text-decoration:underline">${m.manual?'🔧':'✏'} ${mNotSet?'⚡ Saisir capital':'Capital: '+m.capital+'j'}</span>
-      </div>
-    </div>`;
+    const mManTag = m.manual ? ' <span style="color:var(--orange);font-weight:900">✎</span>' : '';
+    let mBody = '';
+    if(mNotSet) {
+      mBody = '<div style="font-size:13px;color:var(--orange);font-weight:700;margin:4px 0">⚠ À définir</div>'
+            + '<div style="font-size:10px;color:var(--muted)">' + m.utilise + 'j déjà pris</div>';
+    } else {
+      mBody = '<div style="display:flex;align-items:baseline;gap:4px">'
+            + '<span style="font-size:24px;font-weight:900;color:' + mC + '">' + m.solde + '</span>'
+            + '<span style="font-size:11px;color:var(--muted)">j restants / ' + m.capital + 'j</span></div>'
+            + '<div style="height:3px;background:var(--border);border-radius:2px;margin:4px 0;overflow:hidden">'
+            + '<div style="width:' + mPct + '%;height:100%;background:' + mC + ';border-radius:2px"></div></div>'
+            + '<div style="font-size:10px;color:var(--muted)">' + m.utilise + 'j pris (toutes années)</div>';
+    }
+    const mBtnColor = (mNotSet || m.manual) ? 'var(--orange)' : 'var(--accent)';
+    const mBtnText  = mNotSet ? '⚡ Saisir capital' : (m.manual ? '🔧 Capital: ' + m.capital + 'j' : '✏ Capital: ' + m.capital + 'j');
+    html += '<div style="flex:1;min-width:170px;padding:10px 14px;border-right:1px solid var(--border)">'
+      + '<div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">🤒 CAP. MALADIE' + mManTag + '</div>'
+      + mBody
+      + '<div style="font-size:10px;margin-top:4px">'
+      + '<span onclick="editCapitalMaladie()" style="cursor:pointer;color:' + mBtnColor + ';font-weight:' + (mNotSet?'700':'400') + ';text-decoration:underline">' + mBtnText + '</span>'
+      + '</div></div>';
 
   // ── Pill ancienneté ──
   if(m && m.service_months != null){
