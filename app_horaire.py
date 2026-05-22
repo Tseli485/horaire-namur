@@ -205,6 +205,101 @@ def api_remark(aid, date_str):
     save(data)
     return jsonify({"ok": True, "remark": txt})
 
+@app.route("/print/<aid>/<int:year>/<int:month>")
+def print_month(aid, year, month):
+    """Page A4 imprimable : jours prestés (MATIN/SOIR) du mois."""
+    data = load()
+    if aid not in data["agents"]:
+        return "Agent inconnu", 404
+    agent = data["agents"][aid]
+    days_in_month = monthrange(year, month)[1]
+    remarks = data.get("remarks", {}).get(aid, {})
+    worked_days = []
+    for d in range(1, days_in_month + 1):
+        day_info = get_day_info(date(year, month, d), aid, data)
+        day_info["remark"] = remarks.get(day_info["date"], "")
+        # Jour presté = poste de base M ou S, sans congé/événement posé
+        if day_info["base"] in ("M", "S") and day_info["code"] is None:
+            worked_days.append(day_info)
+    month_name = MONTH_NAMES_FR[month - 1]
+    matin_count = sum(1 for d in worked_days if d["base"] == "M")
+    soir_count  = sum(1 for d in worked_days if d["base"] == "S")
+    day_names_full = {"Lun": "Lundi", "Mar": "Mardi", "Mer": "Mercredi",
+                      "Jeu": "Jeudi", "Ven": "Vendredi", "Sam": "Samedi", "Dim": "Dimanche"}
+    rows_html = ""
+    for i, day in enumerate(worked_days, 1):
+        is_matin = day["base"] == "M"
+        pill_label = "MATIN" if is_matin else "SOIR"
+        pill_bg    = "#dbeafe" if is_matin else "#ffedd5"
+        pill_color = "#1e40af" if is_matin else "#9a3412"
+        remark_txt = day.get("remark", "")
+        full_name  = day_names_full.get(day["day_name"], day["day_name"])
+        rows_html += (
+            '<tr>'
+            '<td class="num">' + str(i) + '</td>'
+            '<td class="date-cell">' + full_name + ' <strong>' + str(day["day_num"]).zfill(2) + '</strong></td>'
+            '<td><span class="pill" style="background:' + pill_bg + ';color:' + pill_color + '">' + pill_label + '</span></td>'
+            '<td class="remark-cell">' + (remark_txt or '') + '</td>'
+            '</tr>'
+        )
+    if not rows_html:
+        rows_html = '<tr><td colspan="4" style="text-align:center;color:#94a3b8;padding:20px">Aucun jour presté ce mois</td></tr>'
+    today_str = date.today().strftime("%d/%m/%Y")
+    page_html = (
+        '<!DOCTYPE html>'
+        '<html lang="fr"><head>'
+        '<meta charset="utf-8">'
+        '<title>Prestations ' + month_name + ' ' + str(year) + ' — ' + agent["name"] + '</title>'
+        '<style>'
+        '@page{size:A4 portrait;margin:15mm 15mm 20mm 15mm}'
+        '*{box-sizing:border-box;margin:0;padding:0}'
+        'body{font-family:"Segoe UI",Arial,sans-serif;font-size:11pt;color:#1e293b;background:#fff}'
+        '.header{border-bottom:3px solid #1e40af;padding-bottom:10px;margin-bottom:16px;display:flex;justify-content:space-between;align-items:flex-end}'
+        '.header h1{font-size:19pt;color:#1e40af;font-weight:700}'
+        '.header .sub{font-size:10.5pt;color:#64748b;margin-top:3px}'
+        '.header-right{text-align:right;font-size:8.5pt;color:#94a3b8}'
+        '.summary{display:flex;gap:14px;margin-bottom:16px}'
+        '.sbox{flex:1;border:1.5px solid #e2e8f0;border-radius:8px;padding:9px 12px;text-align:center}'
+        '.sbox .val{font-size:24pt;font-weight:800;color:#1e40af}'
+        '.sbox .lbl{font-size:8.5pt;color:#64748b;margin-top:2px;text-transform:uppercase;letter-spacing:.5px}'
+        '.sbox.soir .val{color:#9a3412}'
+        'table{width:100%;border-collapse:collapse;margin-bottom:14px}'
+        'th{background:#1e40af;color:#fff;padding:8px 10px;text-align:left;font-size:9.5pt;font-weight:600;text-transform:uppercase;letter-spacing:.4px}'
+        'td{padding:7px 10px;border-bottom:1px solid #e2e8f0;vertical-align:middle;font-size:10.5pt}'
+        'tr:nth-child(even) td{background:#f8fafc}'
+        'tr:last-child td{border-bottom:2px solid #1e40af}'
+        '.num{width:32px;text-align:center;color:#94a3b8;font-size:9pt}'
+        '.date-cell{width:160px}'
+        '.pill{display:inline-block;padding:3px 12px;border-radius:20px;font-weight:700;font-size:9.5pt;letter-spacing:.6px}'
+        '.remark-cell{color:#64748b;font-size:9pt;font-style:italic}'
+        '.footer{position:fixed;bottom:8mm;left:15mm;right:15mm;font-size:7.5pt;color:#94a3b8;border-top:1px solid #e2e8f0;padding-top:4px;display:flex;justify-content:space-between}'
+        '@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}'
+        '</style></head><body>'
+        '<div class="header">'
+        '  <div>'
+        '    <h1>Prestations — ' + month_name + ' ' + str(year) + '</h1>'
+        '    <div class="sub">Agent&nbsp;: <strong>' + agent["name"] + '</strong>&nbsp;&nbsp;|&nbsp;&nbsp;Prison de Namur / SPF Justice</div>'
+        '  </div>'
+        '  <div class="header-right">Généré le ' + today_str + '</div>'
+        '</div>'
+        '<div class="summary">'
+        '  <div class="sbox"><div class="val">' + str(len(worked_days)) + '</div><div class="lbl">Jours prestés</div></div>'
+        '  <div class="sbox"><div class="val">' + str(matin_count) + '</div><div class="lbl">Postes Matin</div></div>'
+        '  <div class="sbox soir"><div class="val">' + str(soir_count) + '</div><div class="lbl">Postes Soir</div></div>'
+        '</div>'
+        '<table>'
+        '  <thead><tr><th>#</th><th>Date</th><th>Poste</th><th>Remarque</th></tr></thead>'
+        '  <tbody>' + rows_html + '</tbody>'
+        '</table>'
+        '<div class="footer">'
+        '  <span>HoraireManager — Prison de Namur / SPF Justice</span>'
+        '  <span>' + agent["name"] + '&nbsp;|&nbsp;' + month_name + ' ' + str(year) + '</span>'
+        '</div>'
+        '<script>window.print();</script>'
+        '</body></html>'
+    )
+    return Response(page_html, mimetype='text/html; charset=utf-8')
+
 @app.route("/api/events", methods=["POST"])
 def api_add_event():
     data = load()
@@ -1000,6 +1095,7 @@ select:focus,input:focus{border-color:var(--accent)}
       <span id="period-label"></span>
       <button onclick="nextPeriod()">▶</button>
       <button onclick="gotoToday()" style="margin-left:4px">Auj.</button>
+      <button onclick="printMonth()" title="Imprimer les jours prestés (A4 PDF)" style="margin-left:8px;background:#1e40af;color:#fff;border:none;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:13px">🖨️ Imprimer</button>
     </div>
   </div>
   <!-- Barre agent — visible seulement sur tablette/mobile -->
@@ -1478,6 +1574,11 @@ async function deleteAgent(id) {
   await fetch(`/api/agents/${id}`,{method:'DELETE'});
   toast('Agent supprimé');
   await loadAgents();
+}
+
+function printMonth() {
+  if(!curAgent){ toast('Sélectionnez un agent avant d\'imprimer','error'); return; }
+  window.open('/print/'+curAgent+'/'+curYear+'/'+curMonth, '_blank');
 }
 
 async function resetAllData() {
