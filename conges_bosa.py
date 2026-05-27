@@ -290,6 +290,17 @@ LEAVE_CATALOG = {
         "requires_approval": True,
         "impacts_sick_balance": False,
     },
+    "TP": {
+        "label": "Conge temps partiel / mi-temps medical",
+        "category": "SPECIAL",
+        "color": "#8b5cf6",
+        "base_ref": "AR 19/11/1998 - Loi 10/04/1995",
+        "days": None,
+        "note": "Travail a temps partiel accorde par l'administration",
+        "fractional": True,
+        "requires_approval": True,
+        "impacts_sick_balance": False,
+    },
 }
 
 # ============================================================

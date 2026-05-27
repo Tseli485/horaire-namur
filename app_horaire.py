@@ -63,7 +63,7 @@ def pwa_icon():
 def load():
     if DATA_FILE.exists():
         return json.loads(DATA_FILE.read_text(encoding="utf-8"))
-    return {"agents": {}, "events": [], "reliquats": {}, "capitals": {}, "exchanges": [], "remarks": {}}
+    return {"agents": {}, "events": [], "reliquats": {}, "capitals": {}, "exchanges": [], "remarks": {}, "shift_overrides": {}}
 
 def save(data):
     _data_dir.mkdir(parents=True, exist_ok=True)
@@ -87,6 +87,10 @@ def get_day_info(d: date, agent_id: str, data: dict) -> dict:
     agent   = data["agents"][agent_id]
     offset  = agent["team_offset"]
     base    = get_shift(d, offset)
+    # Remplacement manuel de poste (override utilisateur)
+    shift_ov = data.get("shift_overrides", {}).get(agent_id, {}).get(d.isoformat())
+    if shift_ov in ("M", "S", "R"):
+        base = shift_ov
     hols    = {h[0]: (h[1], h[2]) for h in get_public_holidays(d.year)}
     events  = [e for e in data["events"]
                 if e["agent_id"] == agent_id
@@ -123,7 +127,7 @@ def api_agents():
 @app.route("/api/reset", methods=["POST"])
 def api_reset():
     """Remet toutes les données à zéro — pour transmettre l'app à un collègue."""
-    empty = {"agents": {}, "events": [], "reliquats": {}, "capitals": {}, "exchanges": [], "remarks": {}}
+    empty = {"agents": {}, "events": [], "reliquats": {}, "capitals": {}, "exchanges": [], "remarks": {}, "shift_overrides": {}}
     save(empty)
     return jsonify({"ok": True})
 
@@ -204,6 +208,24 @@ def api_remark(aid, date_str):
         data["remarks"][aid].pop(date_str, None)
     save(data)
     return jsonify({"ok": True, "remark": txt})
+
+@app.route("/api/shift_override/<aid>/<date_str>", methods=["PUT", "DELETE"])
+def api_shift_override(aid, date_str):
+    """Remplace ou supprime le poste manuellement pour un jour donné."""
+    data = load()
+    if aid not in data["agents"]:
+        return jsonify({"error": "Agent inconnu"}), 404
+    data.setdefault("shift_overrides", {})
+    if request.method == "DELETE":
+        data["shift_overrides"].get(aid, {}).pop(date_str, None)
+        save(data)
+        return jsonify({"ok": True})
+    shift = (request.json or {}).get("shift", "").upper()
+    if shift not in ("M", "S", "R"):
+        return jsonify({"error": "Shift invalide (M/S/R)"}), 400
+    data["shift_overrides"].setdefault(aid, {})[date_str] = shift
+    save(data)
+    return jsonify({"ok": True, "shift": shift})
 
 @app.route("/print/<aid>/<int:year>/<int:month>")
 def print_month(aid, year, month):
@@ -661,11 +683,13 @@ def api_day(aid, date_str):
     mon = d - timedelta(days=d.weekday())
     week = [get_day_info(mon + timedelta(i), aid, data) for i in range(7)]
     shift_hours = {"M": "06:00 – 14:00", "S": "14:00 – 22:00"}.get(info["base"], "Hors service")
+    shift_overridden = date_str in data.get("shift_overrides", {}).get(aid, {})
     return jsonify({**info,
         "week": week,
         "cycle_pos": cycle_pos + 1,
         "cycle_len": CYCLE_LEN,
         "shift_hours": shift_hours,
+        "shift_overridden": shift_overridden,
         "prev_date": (d - timedelta(1)).isoformat(),
         "next_date": (d + timedelta(1)).isoformat(),
     })
@@ -1039,6 +1063,17 @@ select:focus,input:focus{border-color:var(--accent)}
 /* Textarea remarque dans modal jour */
 #dm-remark-area{width:100%;padding:10px;background:var(--card2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;resize:none;min-height:70px;font-family:inherit;outline:none;margin-top:6px}
 #dm-remark-area:focus{border-color:var(--accent)}
+.dm-shift-override{padding:12px 16px;border-top:1px solid var(--border)}
+.dm-shift-override .dm-sec-label{font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px}
+.shift-btn-group{display:flex;gap:8px;flex-wrap:wrap}
+.shift-btn{flex:1;min-width:80px;padding:8px 4px;border:2px solid var(--border);border-radius:8px;background:var(--card2);color:var(--text);cursor:pointer;font-weight:700;font-size:13px;transition:.15s;text-align:center}
+.shift-btn:hover{border-color:var(--accent)}
+.shift-btn.sb-matin{border-color:#ef4444;color:#fca5a5}
+.shift-btn.sb-soir{border-color:#f97316;color:#fdba74}
+.shift-btn.sb-repos{border-color:#22c55e;color:#86efac}
+.shift-btn.sb-reset{border-color:var(--muted);color:var(--muted);font-size:11px}
+.shift-btn.sb-active{opacity:1;font-size:14px}
+.shift-btn:not(.sb-active){opacity:.55}
 .dm-remark-section{padding:12px 16px;border-top:1px solid var(--border)}
 .dm-remark-label{font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:4px;display:flex;align-items:center;justify-content:space-between}
 .dm-remark-save{font-size:11px;padding:4px 12px;border-radius:6px;border:none;background:var(--accent);color:#fff;cursor:pointer;font-weight:600}
@@ -1288,6 +1323,15 @@ select:focus,input:focus{border-color:var(--accent)}
         <div class="dm-week-strip" id="dm-week-strip"></div>
       </div>
       <div class="dm-events-section" id="dm-events"></div>
+    </div>
+    <div class="dm-shift-override">
+      <div class="dm-sec-label">🔄 Changer le poste</div>
+      <div class="shift-btn-group" id="dm-shift-btns">
+        <button class="shift-btn sb-matin" id="sb-M" onclick="setShiftOverride('M')">🌅 MATIN</button>
+        <button class="shift-btn sb-soir" id="sb-S" onclick="setShiftOverride('S')">🌆 SOIR</button>
+        <button class="shift-btn sb-repos" id="sb-R" onclick="setShiftOverride('R')">🛌 REPOS</button>
+        <button class="shift-btn sb-reset" id="sb-reset" onclick="resetShiftOverride()" title="Restaurer le poste original du cycle">↩ Original</button>
+      </div>
     </div>
     <div class="dm-remark-section">
       <div class="dm-remark-label">
@@ -2144,6 +2188,40 @@ async function renderDayModal(dateStr) {
   // Remarque
   const remEl = document.getElementById('dm-remark-area');
   if(remEl) remEl.value = d.remark || '';
+
+  // Shift override buttons — surligner le poste actuel
+  const curBase = d.base; // poste effectif (peut être override)
+  ['M','S','R'].forEach(s=>{
+    const btn=document.getElementById('sb-'+s);
+    if(btn) btn.classList.toggle('sb-active', curBase===s);
+  });
+  // Bouton reset : visible seulement si override actif
+  const resetBtn=document.getElementById('sb-reset');
+  if(resetBtn) resetBtn.style.display = d.shift_overridden ? 'block' : 'none';
+}
+
+async function setShiftOverride(shift) {
+  if(!curAgent||!_dayDate) return;
+  const r=await fetch('/api/shift_override/'+curAgent+'/'+_dayDate,{
+    method:'PUT',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({shift:shift})
+  });
+  if(r.ok){
+    const labels={M:'MATIN 🌅',S:'SOIR 🌆',R:'REPOS 🛌'};
+    toast('Poste changé : '+labels[shift],'ok');
+    await renderDayModal(_dayDate);
+    renderCalendar();
+  } else toast('Erreur','error');
+}
+
+async function resetShiftOverride() {
+  if(!curAgent||!_dayDate) return;
+  const r=await fetch('/api/shift_override/'+curAgent+'/'+_dayDate,{method:'DELETE'});
+  if(r.ok){
+    toast('Poste original restauré','ok');
+    await renderDayModal(_dayDate);
+    renderCalendar();
+  } else toast('Erreur','error');
 }
 
 async function saveDayRemark() {
