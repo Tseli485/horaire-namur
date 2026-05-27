@@ -81,24 +81,37 @@ def _get_week_shift(d: date, offset: int) -> str:
     return 'S' if counts['S'] > counts['M'] else 'M'
 
 def _get_4_5_actual_date(d: date, weekday_pref: int, offset: int) -> "date | None":
-    """Return the actual 4/5 rest date for the week containing d.
-    Glisse depuis weekday_pref. Saute R, 36, 38 (déjà repos ou reconverti).
-    S'arrête au premier jour de travail réel (M ou S)."""
+    """4/5 rest date pour la semaine contenant d.
+    Glisse depuis weekday_pref. Saute R et 36 (36 = jour travaillé en 4/5).
+    S'arrête au premier M, S ou 38 (38 absorbe le 4/5 et se décale ailleurs)."""
     monday = d - timedelta(days=d.weekday())
     for slide in range(5):
         candidate = monday + timedelta(weekday_pref + slide)
         if candidate.weekday() >= 5:
             return None
-        if get_shift(candidate, offset) in ('M', 'S'):
-            return candidate   # premier jour presté → c'est le jour 4/5
+        sh = get_shift(candidate, offset)
+        if sh not in ('R', '36'):   # R → glisse ; 36 → travaillé → glisse
+            return candidate        # M, S, 38 → jour 4/5
+    return None
+
+def _get_38_target(d38_orig: date, offset: int) -> "date | None":
+    """Trouve où le repos-38 se déplace après collision avec le jour 4/5.
+    Avance d'un jour à la fois en sautant les R simples.
+    S'arrête au premier jour qui n'est pas un R (peut être M, S, 36, 38)."""
+    cand = d38_orig + timedelta(1)
+    for _ in range(7):
+        if get_shift(cand, offset) != 'R':
+            return cand
+        cand += timedelta(1)
     return None
 
 def get_day_info(d: date, agent_id: str, data: dict) -> dict:
     agent   = data["agents"][agent_id]
     offset  = agent["team_offset"]
     base    = get_shift(d, offset)
-    # Régime 4/5 : les jours 36h/38h deviennent la pose de la semaine
-    if agent.get("regime_4_5") is not None and base in ('36', '38'):
+    regime  = agent.get("regime_4_5")
+    # Régime 4/5 : 36h → pose de la semaine (travaillé) ; 38h → reste repos
+    if regime is not None and base == '36':
         base = _get_week_shift(d, offset)
     # Remplacement manuel de poste (override utilisateur)
     shift_ov = data.get("shift_overrides", {}).get(agent_id, {}).get(d.isoformat())
@@ -115,11 +128,25 @@ def get_day_info(d: date, agent_id: str, data: dict) -> dict:
         ev = events[0]
         eff, code, label = ev["code"], ev["code"], ev["label"]
     # Régime 4/5 — seulement si pas de férié/congé déjà posé
-    regime = agent.get("regime_4_5")
     if regime is not None and d.weekday() < 5 and code is None:
         actual = _get_4_5_actual_date(d, regime, offset)
         if actual == d:
             eff, code, label = 'R', '4/5', 'Régime 4/5'
+    # Repos 38h décalé : si le 38 du cycle tombe sur le jour 4/5, il se déplace
+    # au prochain jour non-R. Ce jour affiche repos-38 (sans override manuel).
+    if regime is not None and code is None and shift_ov is None:
+        monday = d - timedelta(days=d.weekday())
+        d38_orig = next(
+            (monday + timedelta(i) for i in range(7)
+             if get_shift(monday + timedelta(i), offset) == '38'),
+            None
+        )
+        if d38_orig is not None:
+            actual_45 = _get_4_5_actual_date(d, regime, offset)
+            if actual_45 == d38_orig:                    # collision 38 ↔ 4/5
+                d38_disp = _get_38_target(d38_orig, offset)
+                if d38_disp == d:
+                    eff, code, label = 'R', 'REPOS-38', 'Repos 38h (décalé)'
     # Couleur
     if code is None:
         color = "red" if base == "M" else ("orange" if base == "S" else "green")
