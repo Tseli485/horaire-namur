@@ -132,21 +132,29 @@ def get_day_info(d: date, agent_id: str, data: dict) -> dict:
         actual = _get_4_5_actual_date(d, regime, offset)
         if actual == d:
             eff, code, label = 'R', '4/5', 'Régime 4/5'
-    # Repos 38h décalé : si le 38 du cycle tombe sur le jour 4/5, il se déplace
-    # au prochain jour non-R. Ce jour affiche repos-38 (sans override manuel).
+    # Repos 38h décalé : vérifie sur la semaine courante ET la semaine précédente
+    # (un 38 du vendredi peut se décaler au lundi de la semaine suivante).
+    # Utilise d38_orig comme référence de semaine pour _get_4_5_actual_date.
+    decale_38 = False
     if regime is not None and code is None and shift_ov is None:
-        monday = d - timedelta(days=d.weekday())
-        d38_orig = next(
-            (monday + timedelta(i) for i in range(7)
-             if get_shift(monday + timedelta(i), offset) == '38'),
-            None
-        )
-        if d38_orig is not None:
-            actual_45 = _get_4_5_actual_date(d, regime, offset)
-            if actual_45 == d38_orig:                    # collision 38 ↔ 4/5
+        for week_delta in (0, -7):
+            ref = d + timedelta(week_delta)
+            mon_ref = ref - timedelta(days=ref.weekday())
+            d38_orig = next(
+                (mon_ref + timedelta(i) for i in range(7)
+                 if get_shift(mon_ref + timedelta(i), offset) == '38'),
+                None
+            )
+            if d38_orig is None:
+                continue
+            # utilise d38_orig pour trouver le jour 4/5 de SA semaine
+            actual_45 = _get_4_5_actual_date(d38_orig, regime, offset)
+            if actual_45 == d38_orig:                 # collision 38 ↔ 4/5
                 d38_disp = _get_38_target(d38_orig, offset)
                 if d38_disp == d:
                     eff, code, label = 'R', 'REPOS-38', 'Repos 38h (décalé)'
+                    decale_38 = True
+                    break
     # Couleur
     if code is None:
         color = "red" if base == "M" else ("orange" if base == "S" else "green")
@@ -157,7 +165,8 @@ def get_day_info(d: date, agent_id: str, data: dict) -> dict:
     return {"date": d.isoformat(), "day_num": d.day, "day_name": DAY_NAMES_FR[d.weekday()],
             "weekday": d.weekday(), "base": base, "effective": eff,
             "code": code, "label": label, "color": color,
-            "is_today": d == date.today(), "events": events, "remark": ""}
+            "is_today": d == date.today(), "events": events, "remark": "",
+            "decale_38": decale_38}
 
 # ─────────────────────── API ROUTES ──────────────────────────
 @app.route("/api/agents", methods=["GET"])
@@ -849,6 +858,7 @@ select:focus,input:focus{border-color:var(--accent)}
 .day-reason{font-size:11px;font-weight:600;margin-top:auto;line-height:1.3;
   overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;opacity:.85;}
 .day-remark{font-size:9px;color:var(--accent);opacity:.9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;margin-top:1px}
+.badge-decale{display:inline-block;font-size:8px;font-weight:800;background:#374151;color:#fbbf24;border-radius:4px;padding:1px 4px;margin-top:2px;letter-spacing:.3px}
 .remark-dot{display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--accent);margin-right:2px;vertical-align:middle;flex-shrink:0}
 .n-red    .day-reason{color:#f87171}
 .n-orange .day-reason{color:#fb923c}
@@ -2038,10 +2048,13 @@ function renderGrid(cal) {
 
     const todayCls = day.is_today?'today':'';
     const weCls    = (day.weekday>=5)?'weekend':'';
-    const hasRemark = day.remark && day.remark.trim() !== '';
-    const dataStr  = JSON.stringify(day).replace(/"/g,'&quot;');
+    const hasRemark  = day.remark && day.remark.trim() !== '';
+    const dataStr    = JSON.stringify(day).replace(/"/g,'&quot;');
     const remarkHtml = hasRemark
       ? '<div class="day-remark"><span class="remark-dot"></span>' + day.remark + '</div>'
+      : '';
+    const decaleHtml = day.decale_38
+      ? '<div class="badge-decale">38h &rarr; ici</div>'
       : '';
 
     html+='<div class="cal-day '+bCls+' '+cCls+' '+nCls+' '+todayCls+' '+weCls+'"'
@@ -2053,6 +2066,7 @@ function renderGrid(cal) {
         +'</div>'
         +'<div class="day-num">'+day.day_num+'</div>'
         +(reasonTxt?'<div class="day-reason">'+reasonTxt+'</div>':'')
+        +decaleHtml
         +remarkHtml
         +'</div>';
   });
