@@ -69,24 +69,37 @@ def save(data):
     _data_dir.mkdir(parents=True, exist_ok=True)
     DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
+def _get_week_shift(d: date, offset: int) -> str:
+    """Poste dominant (M ou S) de la semaine contenant d.
+    Parcourt lun-ven, ignore R/36/38, retourne M si égalité."""
+    monday = d - timedelta(days=d.weekday())
+    counts = {'M': 0, 'S': 0}
+    for i in range(5):
+        sh = get_shift(monday + timedelta(i), offset)
+        if sh in ('M', 'S'):
+            counts[sh] += 1
+    return 'S' if counts['S'] > counts['M'] else 'M'
+
 def _get_4_5_actual_date(d: date, weekday_pref: int, offset: int) -> "date | None":
     """Return the actual 4/5 rest date for the week containing d.
-    Démarre au jour préféré, glisse à droite sur les R simples seulement.
-    S'arrête dès le premier jour non-R : M/S → jour de repos 4/5,
-    36/38 → absorbé (le 36/38 disparaît, remplacé par 4/5)."""
+    Glisse depuis weekday_pref. Saute R, 36, 38 (déjà repos ou reconverti).
+    S'arrête au premier jour de travail réel (M ou S)."""
     monday = d - timedelta(days=d.weekday())
     for slide in range(5):
         candidate = monday + timedelta(weekday_pref + slide)
         if candidate.weekday() >= 5:
             return None
-        if get_shift(candidate, offset) != 'R':
-            return candidate   # M, S, 36 ou 38 → c'est le jour 4/5
+        if get_shift(candidate, offset) in ('M', 'S'):
+            return candidate   # premier jour presté → c'est le jour 4/5
     return None
 
 def get_day_info(d: date, agent_id: str, data: dict) -> dict:
     agent   = data["agents"][agent_id]
     offset  = agent["team_offset"]
     base    = get_shift(d, offset)
+    # Régime 4/5 : les jours 36h/38h deviennent la pose de la semaine
+    if agent.get("regime_4_5") is not None and base in ('36', '38'):
+        base = _get_week_shift(d, offset)
     # Remplacement manuel de poste (override utilisateur)
     shift_ov = data.get("shift_overrides", {}).get(agent_id, {}).get(d.isoformat())
     if shift_ov in ("M", "S", "R"):
