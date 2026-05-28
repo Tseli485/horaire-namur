@@ -163,8 +163,10 @@ def get_day_info(d: date, agent_id: str, data: dict) -> dict:
         ev = events[0]
         eff, code, label = ev["code"], ev["code"], ev["label"]
 
-    # ── JOUR 4/5 (priorité sous férié/congé) ─────────────────────────────────
-    if regime is not None and code is None and shift_ov is None:
+    # ── JOUR 4/5 (priorité SUR fériés/ponts, sous congés explicites/overrides) ──
+    # Un jour 4/5 reste affiché 4/5 même si c'est un jour férié.
+    # Seuls les congés encodés manuellement (events) gardent la priorité.
+    if regime is not None and shift_ov is None and not events:
         monday   = d - timedelta(days=d.weekday())
         rest_day = monday + timedelta(regime)
         if d == rest_day and d.weekday() < 5:
