@@ -2049,8 +2049,9 @@ function renderGrid(cal) {
 
     if(code==='FERIE'||code==='PONT'){
       bCls='b-blue'; cCls='c-blue'; nCls='n-blue'; pCls='p-blue';
-      pillTxt=code==='PONT'?'PONT':'FÉRIÉ';
-      reasonTxt=day.label||'';
+      const _sp={M:'MATIN',S:'SOIR',R:'REPOS','36':'REPOS-36','38':'REPOS-38'};
+      pillTxt=_sp[base]||'REPOS';
+      reasonTxt=(code==='PONT'?'[Pont] ':'[Ferie] ')+(day.label||'');
     } else if(code==='4/5'){
       bCls='b-green'; cCls='c-green'; nCls='n-green'; pCls='p-green';
       pillTxt='4/5'; reasonTxt='Régime 4/5';
