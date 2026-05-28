@@ -2054,6 +2054,10 @@ function renderGrid(cal) {
     } else if(code==='4/5'){
       bCls='b-green'; cCls='c-green'; nCls='n-green'; pCls='p-green';
       pillTxt='4/5'; reasonTxt='Régime 4/5';
+    } else if(code==='REPOS-R'||code==='REPOS-38'){
+      bCls='b-green'; cCls='c-green'; nCls='n-green'; pCls='p-green';
+      pillTxt='REPOS';
+      reasonTxt=code==='REPOS-38'?'38h decale':'R decale';
     } else if(code){
       bCls='b-green'; cCls='c-green'; nCls='n-green'; pCls='p-green';
       pillTxt='CONGÉ';
