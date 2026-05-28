@@ -80,93 +80,116 @@ def _get_week_shift(d: date, offset: int) -> str:
             counts[sh] += 1
     return 'S' if counts['S'] > counts['M'] else 'M'
 
-def _get_4_5_actual_date(d: date, weekday_pref: int, offset: int) -> "date | None":
-    """4/5 rest date pour la semaine contenant d.
-    Glisse depuis weekday_pref. Saute R et 36 (36 = jour travaillé en 4/5).
-    S'arrête au premier M, S ou 38 (38 absorbe le 4/5 et se décale ailleurs)."""
-    monday = d - timedelta(days=d.weekday())
-    for slide in range(5):
-        candidate = monday + timedelta(weekday_pref + slide)
-        if candidate.weekday() >= 5:
-            return None
-        sh = get_shift(candidate, offset)
-        if sh not in ('R', '36'):   # R → glisse ; 36 → travaillé → glisse
-            return candidate        # M, S, 38 → jour 4/5
-    return None
-
-def _get_38_target(d38_orig: date, offset: int) -> "date | None":
-    """Trouve où le repos-38 se déplace après collision avec le jour 4/5.
-    Avance d'un jour à la fois en sautant les R simples.
-    S'arrête au premier jour qui n'est pas un R (peut être M, S, 36, 38)."""
-    cand = d38_orig + timedelta(1)
+def _get_displaced_target(d_orig: date, offset: int) -> "date | None":
+    """Où atterrit un R ou 38h déplacé par le jour 4/5.
+    Avance depuis d_orig+1 en sautant R et 38h (qui restent en place).
+    S'arrête au premier M, S ou 36h (la pose qui sera remplacée)."""
+    cand = d_orig + timedelta(1)
     for _ in range(7):
-        if get_shift(cand, offset) != 'R':
-            return cand
+        sh = get_shift(cand, offset)
+        if sh not in ('R', '38'):
+            return cand   # M, S ou 36h → destination du déplacé
         cand += timedelta(1)
     return None
 
 def get_day_info(d: date, agent_id: str, data: dict) -> dict:
     agent   = data["agents"][agent_id]
     offset  = agent["team_offset"]
-    base    = get_shift(d, offset)
     regime  = agent.get("regime_4_5")
-    # Régime 4/5 : 36h → pose de la semaine (travaillé) ; 38h → reste repos
-    if regime is not None and base == '36':
-        base = _get_week_shift(d, offset)
-    # Remplacement manuel de poste (override utilisateur)
+    raw_base = get_shift(d, offset)
+    base     = raw_base
+
+    # ── RÉGIME 4/5 ────────────────────────────────────────────────────────────
+    # Règles :
+    #  1. Le jour désigné (lun-ven) est TOUJOURS vert "4/5".
+    #  2. Si ce jour avait R ou 38h dans le cycle → glisse à droite (en sautant
+    #     R et 38h) jusqu'au 1er M/S/36h qui reçoit le repos déplacé.
+    #  3. Si ce jour avait 36h → 4/5 prend ce jour, pas de déplacement
+    #     (36h hors 4/5 est converti en pose de la semaine).
+    #  4. Tous les autres 36h de la semaine → convertis en M ou S.
+    # ──────────────────────────────────────────────────────────────────────────
+    decale_38 = False     # badge "38h → ici"
+    decale_r  = False     # label "Repos décalé"
+
+    if regime is not None:
+        # Jour de repos 4/5 de CETTE semaine
+        monday   = d - timedelta(days=d.weekday())
+        rest_day = monday + timedelta(regime)
+
+        if d == rest_day:
+            # Ce jour EST le 4/5 — base R (repos), code géré plus bas
+            base = 'R'
+        else:
+            # Vérifier si un déplacement (R ou 38h) arrive sur ce jour
+            # depuis la semaine courante OU la semaine précédente
+            # (ex: 38h vendredi → déplacé au lundi suivant)
+            displaced = False
+            for wdelta in (0, -7):
+                ref      = d + timedelta(wdelta)
+                mon_ref  = ref - timedelta(days=ref.weekday())
+                rest_ref = mon_ref + timedelta(regime)
+                raw_rest = get_shift(rest_ref, offset)
+                if raw_rest in ('R', '38'):
+                    disp = _get_displaced_target(rest_ref, offset)
+                    if disp == d:
+                        base = raw_rest   # R ou 38h s'installe ici
+                        if raw_rest == '38':
+                            decale_38 = True
+                        else:
+                            decale_r = True
+                        displaced = True
+                        break
+            # Si pas de déplacement : convertir 36h en pose de la semaine
+            if not displaced and base == '36':
+                base = _get_week_shift(d, offset)
+
+    # ── OVERRIDE MANUEL ───────────────────────────────────────────────────────
     shift_ov = data.get("shift_overrides", {}).get(agent_id, {}).get(d.isoformat())
     if shift_ov in ("M", "S", "R"):
         base = shift_ov
-    hols    = {h[0]: (h[1], h[2]) for h in get_public_holidays(d.year)}
-    events  = [e for e in data["events"]
-                if e["agent_id"] == agent_id
-                and date.fromisoformat(e["date_start"]) <= d <= date.fromisoformat(e["date_end"])]
+        decale_38 = False
+        decale_r  = False
+
+    # ── FÉRIÉS, CONGÉS ────────────────────────────────────────────────────────
+    hols   = {h[0]: (h[1], h[2]) for h in get_public_holidays(d.year)}
+    events = [e for e in data["events"]
+               if e["agent_id"] == agent_id
+               and date.fromisoformat(e["date_start"]) <= d
+               <= date.fromisoformat(e["date_end"])]
     eff, code, label = base, None, None
     if d in hols:
         eff, code, label = hols[d][0], hols[d][0], hols[d][1]
     if events:
         ev = events[0]
         eff, code, label = ev["code"], ev["code"], ev["label"]
-    # Régime 4/5 — seulement si pas de férié/congé déjà posé
-    if regime is not None and d.weekday() < 5 and code is None:
-        actual = _get_4_5_actual_date(d, regime, offset)
-        if actual == d:
-            eff, code, label = 'R', '4/5', 'Régime 4/5'
-    # Repos 38h décalé : vérifie sur la semaine courante ET la semaine précédente
-    # (un 38 du vendredi peut se décaler au lundi de la semaine suivante).
-    # Utilise d38_orig comme référence de semaine pour _get_4_5_actual_date.
-    decale_38 = False
+
+    # ── JOUR 4/5 (priorité sous férié/congé) ─────────────────────────────────
     if regime is not None and code is None and shift_ov is None:
-        for week_delta in (0, -7):
-            ref = d + timedelta(week_delta)
-            mon_ref = ref - timedelta(days=ref.weekday())
-            d38_orig = next(
-                (mon_ref + timedelta(i) for i in range(7)
-                 if get_shift(mon_ref + timedelta(i), offset) == '38'),
-                None
-            )
-            if d38_orig is None:
-                continue
-            # utilise d38_orig pour trouver le jour 4/5 de SA semaine
-            actual_45 = _get_4_5_actual_date(d38_orig, regime, offset)
-            if actual_45 == d38_orig:                 # collision 38 ↔ 4/5
-                d38_disp = _get_38_target(d38_orig, offset)
-                if d38_disp == d:
-                    eff, code, label = 'R', 'REPOS-38', 'Repos 38h (décalé)'
-                    decale_38 = True
-                    break
-    # Couleur
+        monday   = d - timedelta(days=d.weekday())
+        rest_day = monday + timedelta(regime)
+        if d == rest_day and d.weekday() < 5:
+            eff, code, label = 'R', '4/5', 'Régime 4/5'
+
+    # ── REPOS DÉPLACÉ ─────────────────────────────────────────────────────────
+    if code is None and shift_ov is None and (decale_38 or decale_r):
+        if decale_38:
+            eff, code, label = 'R', 'REPOS-38', 'Repos 38h (décalé ↓)'
+        else:
+            eff, code, label = 'R', 'REPOS-R',  'Repos (décalé ↓)'
+
+    # ── COULEUR ───────────────────────────────────────────────────────────────
     if code is None:
         color = "red" if base == "M" else ("orange" if base == "S" else "green")
     elif code in ("FERIE", "PONT"):
         color = "blue"
     else:
         color = "green"
+
     return {"date": d.isoformat(), "day_num": d.day, "day_name": DAY_NAMES_FR[d.weekday()],
             "weekday": d.weekday(), "base": base, "effective": eff,
             "code": code, "label": label, "color": color,
             "is_today": d == date.today(), "events": events, "remark": "",
-            "decale_38": decale_38}
+            "decale_38": decale_38, "decale_r": decale_r}
 
 # ─────────────────────── API ROUTES ──────────────────────────
 @app.route("/api/agents", methods=["GET"])
@@ -2054,8 +2077,8 @@ function renderGrid(cal) {
       ? '<div class="day-remark"><span class="remark-dot"></span>' + day.remark + '</div>'
       : '';
     const decaleHtml = day.decale_38
-      ? '<div class="badge-decale">38h &rarr; ici</div>'
-      : '';
+      ? '<div class="badge-decale">38h &#8595;</div>'
+      : (day.decale_r ? '<div class="badge-decale">R &#8595;</div>' : '');
 
     html+='<div class="cal-day '+bCls+' '+cCls+' '+nCls+' '+todayCls+' '+weCls+'"'
         +' onclick="openDayModal('+dataStr+')"'
