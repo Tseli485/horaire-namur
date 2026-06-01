@@ -12,14 +12,51 @@ from datetime import date, timedelta
 from calendar import monthrange, isleap
 from pathlib import Path
 
-from flask import Flask, jsonify, request, render_template_string, Response
+from flask import Flask, jsonify, request, Response, session
 
 from horaire_agent import get_shift, MONTH_NAMES_FR, DAY_NAMES_FR, CYCLE_LEN, ANCHOR
 from conges_bosa import LEAVE_CATALOG, get_public_holidays, get_vac_entitlement, get_sick_capital
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24))
+_APP_PIN = os.environ.get("APP_PIN", "")   # vide = pas d'auth (dev local)
 _data_dir = Path(os.environ.get("DATA_DIR", str(Path(__file__).parent)))
 DATA_FILE  = _data_dir / "agenda_data.json"
+
+# ── Auth ──────────────────────────────────────────────────────
+def _auth_required():
+    """Retourne True si l'auth est active et l'utilisateur non connecté."""
+    if not _APP_PIN:
+        return False
+    return not session.get("auth")
+
+@app.before_request
+def check_auth():
+    pub = {"/", "/manifest.json", "/icon.svg", "/dev-version", "/api/login", "/api/logout"}
+    if request.path in pub or request.path.startswith("/static"):
+        return
+    # iCal public (accès Google Agenda sans session)
+    if request.path.startswith("/ical/"):
+        return
+    if _auth_required():
+        return jsonify({"error": "Non autorisé", "login_required": True}), 401
+
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    if not _APP_PIN:
+        session["auth"] = True
+        return jsonify({"ok": True})
+    pin = (request.json or {}).get("pin", "")
+    import hmac
+    if hmac.compare_digest(str(pin), _APP_PIN):
+        session["auth"] = True
+        return jsonify({"ok": True})
+    return jsonify({"error": "PIN incorrect"}), 403
+
+@app.route("/api/logout", methods=["POST"])
+def api_logout():
+    session.clear()
+    return jsonify({"ok": True})
 
 # ─────────────────────── ROOT + PWA ──────────────────────────
 @app.route("/")
@@ -205,7 +242,9 @@ def api_agents():
 
 @app.route("/api/reset", methods=["POST"])
 def api_reset():
-    """Remet toutes les données à zéro — pour transmettre l'app à un collègue."""
+    """Remet toutes les données à zéro — confirmation explicite requise."""
+    if (request.json or {}).get("confirm") != "RESET":
+        return jsonify({"error": 'Envoyer {"confirm":"RESET"} pour confirmer'}), 400
     empty = {"agents": {}, "events": [], "reliquats": {}, "capitals": {}, "exchanges": [], "remarks": {}, "shift_overrides": {}}
     save(empty)
     return jsonify({"ok": True})
@@ -1316,6 +1355,23 @@ select:focus,input:focus{border-color:var(--accent)}
 </style>
 </head>
 <body>
+
+<!-- LOGIN MODAL -->
+<div id="login-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:9999;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:16px">
+  <div style="background:#1e293b;border:1px solid #334155;border-radius:16px;padding:36px 40px;max-width:340px;width:90%;text-align:center">
+    <div style="font-size:2rem;margin-bottom:8px">🏛</div>
+    <h2 style="color:#f1f5f9;margin:0 0 4px">HoraireManager</h2>
+    <p style="color:#94a3b8;font-size:.85rem;margin:0 0 24px">Prison de Namur — SPF Justice</p>
+    <input id="pin-input" type="password" inputmode="numeric" placeholder="Code PIN" maxlength="20"
+      style="width:100%;padding:12px;border-radius:8px;border:1px solid #475569;background:#0f172a;color:#f1f5f9;font-size:1.1rem;text-align:center;box-sizing:border-box"
+      onkeydown="if(event.key==='Enter')doLogin()">
+    <button onclick="doLogin()"
+      style="margin-top:14px;width:100%;padding:12px;border-radius:8px;background:#3b82f6;color:#fff;font-weight:700;font-size:1rem;border:none;cursor:pointer">
+      Connexion
+    </button>
+    <p id="pin-error" style="color:#ef4444;font-size:.85rem;margin:10px 0 0;display:none">PIN incorrect</p>
+  </div>
+</div>
 
 <!-- SIDEBAR -->
 <div id="sidebar">
@@ -2741,6 +2797,22 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape'){
 }});
 
 init();
+
+// ── AUTH ──────────────────────────────────────────────────────
+async function doLogin(){
+  const pin = document.getElementById('pin-input').value;
+  const r = await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pin})});
+  if(r.ok){ document.getElementById('login-overlay').style.display='none'; init(); }
+  else { const err=document.getElementById('pin-error'); err.style.display='block'; document.getElementById('pin-input').value=''; }
+}
+
+(async function checkAuth(){
+  const r = await fetch('/api/agents');
+  if(r.status===401){
+    document.getElementById('login-overlay').style.display='flex';
+    document.getElementById('pin-input').focus();
+  }
+})();
 </script>
 <script>
 /* ── Live-reload : rafraîchit le browser quand le serveur redémarre ── */
