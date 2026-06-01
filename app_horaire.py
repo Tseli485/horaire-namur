@@ -210,11 +210,16 @@ def api_reset():
     save(empty)
     return jsonify({"ok": True})
 
+import re as _re
+_AID_RE = _re.compile(r'^[a-zA-Z0-9_\-]{1,64}$')
+
 @app.route("/api/agents", methods=["POST"])
 def api_add_agent():
     data = load()
     body = request.json
     aid  = body["id"]
+    if not _AID_RE.match(str(aid)):
+        return jsonify({"error": "ID agent invalide"}), 400
     r45  = body.get("regime_4_5")
     data["agents"][aid] = {
         "name":         body["name"],
@@ -1739,12 +1744,20 @@ function syncGoogleCal() {
   const gcalUrl = 'https://calendar.google.com/calendar/r?cid=' + encodeURIComponent(icalUrl);
   const info = document.getElementById('gcal-info');
   info.style.display = 'block';
-  info.innerHTML = '<b>Lien iCal :</b><br>'
-    + '<a href="' + icalUrl + '" style="color:var(--accent);word-break:break-all">' + icalUrl + '</a><br><br>'
-    + '<b>Méthode 1 — Bouton automatique :</b><br>'
-    + '<a href="' + gcalUrl + '" target="_blank" style="color:#4285f4;font-weight:700">▶ Ouvrir dans Google Agenda</a><br><br>'
-    + '<b>Méthode 2 — Manuel :</b><br>'
-    + 'Google Agenda → Autres agendas (+) → Via URL → coller le lien iCal';
+  info.innerHTML = '';
+  const safeIcal = document.createTextNode(icalUrl);
+  const aIcal = document.createElement('a');
+  aIcal.href = icalUrl; aIcal.style.cssText = 'color:var(--accent);word-break:break-all';
+  aIcal.appendChild(safeIcal);
+  const aGcal = document.createElement('a');
+  aGcal.href = gcalUrl; aGcal.target = '_blank';
+  aGcal.style.cssText = 'color:#4285f4;font-weight:700';
+  aGcal.textContent = '▶ Ouvrir dans Google Agenda';
+  info.insertAdjacentHTML('beforeend', '<b>Lien iCal :</b><br>');
+  info.appendChild(aIcal);
+  info.insertAdjacentHTML('beforeend', '<br><br><b>Méthode 1 — Bouton automatique :</b><br>');
+  info.appendChild(aGcal);
+  info.insertAdjacentHTML('beforeend', '<br><br><b>Méthode 2 — Manuel :</b><br>Google Agenda → Autres agendas (+) → Via URL → coller le lien iCal');
   // Essayer d\'ouvrir directement
   window.open(gcalUrl, '_blank');
 }
