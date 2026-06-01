@@ -817,7 +817,8 @@ HTML = r"""<!DOCTYPE html>
   --border:#334155; --text:#f1f5f9; --muted:#94a3b8; --accent:#3b82f6;
 }
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex}
+html{overflow-x:hidden;max-width:100vw}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;overflow-x:hidden;max-width:100vw}
 
 /* ── SIDEBAR ── */
 #sidebar{width:260px;background:var(--sidebar);display:flex;flex-direction:column;border-right:1px solid var(--border);flex-shrink:0}
@@ -1075,31 +1076,32 @@ select:focus,input:focus{border-color:var(--accent)}
   /* Zone principale */
   #main{padding-bottom:calc(60px + env(safe-area-inset-bottom,0));overflow:hidden}
 
-  /* Topbar compact */
-  #topbar{padding:8px 10px;gap:4px;flex-wrap:wrap}
-  #topbar h2{font-size:14px;font-weight:800}
-  .month-nav button{padding:7px 12px;font-size:14px;min-width:40px;border-radius:8px}
-  .month-nav span{font-size:14px;min-width:100px}
+  /* Topbar compact — empilé sur 2 lignes */
+  #topbar{padding:6px 8px;gap:4px;flex-direction:column;align-items:stretch}
+  #topbar h2{font-size:13px;font-weight:800;text-align:center}
+  .month-nav{justify-content:center;gap:4px}
+  .month-nav button{padding:5px 10px;font-size:13px;min-width:36px;border-radius:8px}
+  .month-nav span{font-size:13px;min-width:90px;text-align:center}
 
   /* Barre agent (mobile) */
   #mobile-agent-bar{display:flex!important}
 
-  /* Grille calendrier — optimisée pour 7 cols sur ~360px */
-  #content{grid-template-columns:1fr;padding:4px;gap:6px}
+  /* Grille calendrier — forcée dans la largeur du GSM */
+  #content{grid-template-columns:1fr;padding:2px;gap:4px;width:100%;overflow:hidden}
   #right-panel{display:none}
   #right-panel.panel-open{display:flex!important;flex-direction:column}
-  .cal-grid{gap:2px}
-  .cal-header{font-size:9px;padding:5px 0;font-weight:800;letter-spacing:.2px}
-  .cal-day{min-height:62px;padding:4px 3px 4px 7px;gap:1px}
-  .cal-day.today .day-num{width:28px;height:28px;font-size:15px}
-  /* Numéro du jour plus petit = plus d'espace pour le contenu */
-  .day-num{font-size:17px;font-weight:900}
-  /* Abbr jour redondant avec en-tête colonne → masqué */
+  #calendar-wrap{width:100%;overflow:hidden}
+  .cal-grid{gap:1px;width:100%}
+  .cal-header{font-size:8px;padding:4px 0;font-weight:800;letter-spacing:0;overflow:hidden}
+  .cal-day{min-height:58px;padding:3px 2px 3px 5px;gap:1px;overflow:hidden;min-width:0}
+  .cal-day.today .day-num{width:24px;height:24px;font-size:13px}
+  .day-num{font-size:15px;font-weight:900}
   .day-abbr{display:none}
-  .shift-pill{font-size:8px;padding:1px 4px;letter-spacing:.1px}
-  .day-reason{font-size:8px;-webkit-line-clamp:1;margin-top:1px}
-  .day-remark{font-size:7px}
-  .badge-decale{font-size:7px;padding:1px 3px}
+  .day-top{justify-content:flex-end;overflow:hidden}
+  .shift-pill{font-size:7px;padding:1px 3px;letter-spacing:0;white-space:nowrap;max-width:100%;overflow:hidden}
+  .day-reason{font-size:7px;-webkit-line-clamp:1;margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .day-remark{display:none}
+  .badge-decale{font-size:6px;padding:1px 2px}
 
   /* Entitlements scrollable */
   #entitlements-bar{padding:6px 8px}
