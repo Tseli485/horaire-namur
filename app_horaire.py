@@ -26,6 +26,11 @@ DATA_FILE  = _data_dir / "agenda_data.json"
 def index():
     return Response(HTML, mimetype='text/html; charset=utf-8')
 
+@app.route("/dev-version")
+def dev_version():
+    mtime = int(Path(__file__).stat().st_mtime)
+    return jsonify({"v": mtime})
+
 @app.route("/manifest.json")
 def pwa_manifest():
     return jsonify({
@@ -1009,7 +1014,7 @@ select:focus,input:focus{border-color:var(--accent)}
 ::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
 
 /* ══════════════════════════════════════════
-   RESPONSIVE — TABLETTE  (≤ 1024px)
+   RESPONSIVE — TABLETTE PAYSAGE  (≤ 1024px)
 ══════════════════════════════════════════ */
 @media(max-width:1024px){
   #sidebar{width:72px}
@@ -1020,6 +1025,31 @@ select:focus,input:focus{border-color:var(--accent)}
   .nav-btn svg{width:22px;height:22px;opacity:1}
   #mobile-agent-bar{display:flex!important}
   #content{padding:14px;gap:12px}
+}
+
+/* ══════════════════════════════════════════
+   RESPONSIVE — TABLETTE PORTRAIT  (≤ 768px)
+══════════════════════════════════════════ */
+@media(max-width:768px){
+  /* Cellules légèrement plus compactes */
+  .cal-day{min-height:72px;padding:6px 6px 6px 10px}
+  .day-num{font-size:24px}
+  .shift-pill{font-size:9px;padding:2px 6px}
+  .day-abbr{font-size:9px}
+  .day-reason{font-size:10px}
+  /* Topbar */
+  #topbar h2{font-size:15px}
+  .month-nav span{font-size:14px}
+  /* Légende : 2 colonnes sur tablette portrait */
+  .legend{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+  /* Échanges : 2 colonnes */
+  .exch-balance-grid{grid-template-columns:repeat(2,1fr)}
+  .exr-note{display:none}
+  /* Formulaires modals → 1 colonne */
+  .form-row{grid-template-columns:1fr!important}
+  /* Annual : 1 colonne */
+  #annual-content{padding:14px}
+  #annual-grid{grid-template-columns:1fr!important}
 }
 
 /* ══════════════════════════════════════════
@@ -1044,36 +1074,61 @@ select:focus,input:focus{border-color:var(--accent)}
 
   /* Zone principale */
   #main{padding-bottom:calc(60px + env(safe-area-inset-bottom,0));overflow:hidden}
-  #topbar{padding:10px 12px;flex-wrap:wrap;gap:6px}
-  #topbar h2{font-size:13px}
-  .month-nav button{padding:5px 8px;font-size:12px}
-  .month-nav span{font-size:13px;min-width:120px}
+
+  /* Topbar compact */
+  #topbar{padding:8px 10px;gap:4px;flex-wrap:wrap}
+  #topbar h2{font-size:14px;font-weight:800}
+  .month-nav button{padding:7px 12px;font-size:14px;min-width:40px;border-radius:8px}
+  .month-nav span{font-size:14px;min-width:100px}
 
   /* Barre agent (mobile) */
   #mobile-agent-bar{display:flex!important}
 
-  /* Grille calendrier */
-  #content{grid-template-columns:1fr;padding:6px;gap:8px}
+  /* Grille calendrier — optimisée pour 7 cols sur ~360px */
+  #content{grid-template-columns:1fr;padding:4px;gap:6px}
   #right-panel{display:none}
   #right-panel.panel-open{display:flex!important;flex-direction:column}
-  .cal-grid{gap:3px}
-  .cal-header{font-size:10px;padding:6px 0;font-weight:800}
-  .cal-day{min-height:68px;padding:5px 5px 5px 9px;gap:2px}
-  .cal-day.today .day-num{width:32px;height:32px;font-size:18px}
-  .day-num{font-size:22px;font-weight:900}
-  .shift-pill{font-size:9px;padding:2px 5px}
-  .day-abbr{font-size:9px}
-  .day-reason{font-size:9px;-webkit-line-clamp:1}
-  .day-remark{font-size:8px}
-  /* Topbar mobile amélioré */
-  #topbar{padding:8px 10px;gap:4px}
-  #topbar h2{font-size:14px;font-weight:800}
-  .month-nav button{padding:7px 12px;font-size:14px;min-width:40px;border-radius:8px}
-  .month-nav span{font-size:14px;min-width:100px}
+  .cal-grid{gap:2px}
+  .cal-header{font-size:9px;padding:5px 0;font-weight:800;letter-spacing:.2px}
+  .cal-day{min-height:62px;padding:4px 3px 4px 7px;gap:1px}
+  .cal-day.today .day-num{width:28px;height:28px;font-size:15px}
+  /* Numéro du jour plus petit = plus d'espace pour le contenu */
+  .day-num{font-size:17px;font-weight:900}
+  /* Abbr jour redondant avec en-tête colonne → masqué */
+  .day-abbr{display:none}
+  .shift-pill{font-size:8px;padding:1px 4px;letter-spacing:.1px}
+  .day-reason{font-size:8px;-webkit-line-clamp:1;margin-top:1px}
+  .day-remark{font-size:7px}
+  .badge-decale{font-size:7px;padding:1px 3px}
+
   /* Entitlements scrollable */
   #entitlements-bar{padding:6px 8px}
-  /* Soldes congés bouton flottant */
   #btn-panel-mobile{font-size:10px;padding:6px 8px}
+
+  /* Pill du jour → toujours en haut à droite (abbr masqué) */
+  .day-top{justify-content:flex-end}
+
+  /* Légende → scroll horizontal, pas de retour à la ligne */
+  .legend{overflow-x:auto;flex-wrap:nowrap;gap:10px;padding:7px 10px;
+    -webkit-overflow-scrolling:touch;scrollbar-width:none}
+  .legend::-webkit-scrollbar{display:none}
+  .legend-item{flex-shrink:0;font-size:11px;gap:5px}
+
+  /* Bouton Imprimer inutile sur mobile */
+  #btn-print{display:none!important}
+
+  /* Toast — au-dessus de la bottom nav */
+  #toast{bottom:72px;right:12px;left:12px;text-align:center}
+
+  /* Vue annuelle — padding réduit */
+  #annual-content{padding:10px 8px}
+  #annual-grid{grid-template-columns:1fr!important}
+
+  /* Bannière base-planning → empilée */
+  #base-banner{flex-direction:column;gap:6px;text-align:center;font-size:12px}
+
+  /* Formulaires dans modals → 1 colonne */
+  .form-row{grid-template-columns:1fr!important}
 
   /* Modals → tiroir du bas */
   .modal-overlay{align-items:flex-end;padding:0}
@@ -1130,10 +1185,13 @@ select:focus,input:focus{border-color:var(--accent)}
 
 /* ══════ Très petits écrans (≤ 380px) ══════ */
 @media(max-width:380px){
-  .cal-day{min-height:58px;padding:4px 3px 4px 6px}
-  .day-num{font-size:18px}
-  .shift-pill{font-size:8px;padding:1px 4px}
-  .day-abbr{display:none}
+  .cal-day{min-height:50px;padding:3px 2px 3px 5px}
+  .day-num{font-size:15px}
+  .shift-pill{font-size:7px;padding:1px 3px}
+  .cal-header{font-size:8px}
+  /* Sur très petit écran, masquer le texte raison — couleur + pill suffisent */
+  .day-reason{display:none}
+  .day-remark{display:none}
 }
 /* Textarea remarque dans modal jour */
 #dm-remark-area{width:100%;padding:10px;background:var(--card2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;resize:none;min-height:70px;font-family:inherit;outline:none;margin-top:6px}
@@ -1205,7 +1263,7 @@ select:focus,input:focus{border-color:var(--accent)}
       <span id="period-label"></span>
       <button onclick="nextPeriod()">▶</button>
       <button onclick="gotoToday()" style="margin-left:4px">Auj.</button>
-      <button onclick="printMonth()" title="Imprimer les jours prestés (A4 PDF)" style="margin-left:8px;background:#1e40af;color:#fff;border:none;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:13px">🖨️ Imprimer</button>
+      <button id="btn-print" onclick="printMonth()" title="Imprimer les jours prestés (A4 PDF)" style="margin-left:8px;background:#1e40af;color:#fff;border:none;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:13px">🖨️ Imprimer</button>
     </div>
   </div>
   <!-- Barre agent — visible seulement sur tablette/mobile -->
@@ -2551,15 +2609,31 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape'){
 
 init();
 </script>
+<script>
+/* ── Live-reload : rafraîchit le browser quand le serveur redémarre ── */
+(function(){
+  let _v=null;
+  function check(){
+    fetch('/dev-version').then(r=>r.json()).then(d=>{
+      if(_v===null){_v=d.v;return;}
+      if(d.v!==_v){location.reload();}
+    }).catch(()=>{});
+  }
+  setInterval(check,2000);
+})();
+</script>
 </body>
 </html>"""
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5050))
-    host = "0.0.0.0" if os.environ.get("PORT") else "127.0.0.1"
+    host = "0.0.0.0"
+    import socket
+    local_ip = socket.gethostbyname(socket.gethostname())
     print("=" * 55)
     print("  HoraireManager — Prison de Namur / SPF Justice")
-    print(f"  http://localhost:{port}")
+    print(f"  Local  : http://localhost:{port}")
+    print(f"  Reseau : http://{local_ip}:{port}  <-- telephone/tablette")
     print("  Ctrl+C pour arrêter")
     print("=" * 55)
-    app.run(host=host, port=port, debug=False)
+    app.run(host=host, port=port, debug=False, use_reloader=True)
