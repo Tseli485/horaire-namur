@@ -742,6 +742,101 @@ def api_exchanges_delete(eid):
     save(data)
     return jsonify({"removed": before - len(data["exchanges"])})
 
+@app.route("/ical/<aid>.ics")
+def export_ical(aid):
+    """Flux iCal abonnable par Google Agenda / Apple Calendrier."""
+    data = load()
+    if aid not in data["agents"]:
+        return "Agent inconnu", 404
+    agent = data["agents"][aid]
+    name  = agent.get("name", aid)
+
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//HoraireManager Prison de Namur//FR",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        f"X-WR-CALNAME:Horaire {name} – SPF Justice",
+        "X-WR-TIMEZONE:Europe/Brussels",
+        "X-WR-CALDESC:Horaire rotatif Prison de Namur",
+        "REFRESH-INTERVAL;VALUE=DURATION:PT6H",
+        "X-PUBLISHED-TTL:PT6H",
+    ]
+
+    SHIFT_LABELS = {
+        "M":  ("🌅 MATIN",  "06:00", "14:00", "OPAQUE"),
+        "S":  ("🌆 SOIR",   "14:00", "22:00", "OPAQUE"),
+        "R":  ("🛌 REPOS",  None,    None,    "TRANSPARENT"),
+        "38": ("📋 38h",    None,    None,    "TRANSPARENT"),
+        "36": ("📋 36h",    None,    None,    "TRANSPARENT"),
+    }
+
+    # Générer 18 mois : 3 mois passés + 15 mois futurs
+    today = date.today()
+    start = date(today.year, today.month, 1) - timedelta(days=92)
+    end   = date(today.year + 1, today.month, 1) + timedelta(days=31*3)
+    cur   = start
+
+    import hashlib
+    while cur < end:
+        info = get_day_info(cur, aid, data)
+        eff  = info["effective"]
+        code = info["code"]
+        label = info["label"] or ""
+
+        # Titre de l'événement
+        if code and code not in ("REPOS-38", "REPOS-R"):
+            title = f"🗓 {label}"
+            transp = "TRANSPARENT"
+            color  = "7"   # cyan = congé/férié
+        elif eff in SHIFT_LABELS:
+            s = SHIFT_LABELS[eff]
+            title = s[0]
+            transp = s[3]
+            color  = "11" if eff == "M" else ("6" if eff == "S" else "8")
+        else:
+            cur += timedelta(1)
+            continue
+
+        uid = hashlib.md5(f"{aid}-{cur.isoformat()}".encode()).hexdigest()
+        dt  = cur.strftime("%Y%m%d")
+        now = date.today().strftime("%Y%m%dT%H%M%SZ")
+
+        if eff in ("M", "S") and not code:
+            s = SHIFT_LABELS[eff]
+            lines += [
+                "BEGIN:VEVENT",
+                f"UID:{uid}@horaire-namur",
+                f"DTSTAMP:{now}",
+                f"DTSTART;TZID=Europe/Brussels:{dt}T{s[1].replace(':','')}00",
+                f"DTEND;TZID=Europe/Brussels:{dt}T{s[2].replace(':','')}00",
+                f"SUMMARY:{title}",
+                f"COLOR:{color}",
+                f"TRANSP:{transp}",
+                "END:VEVENT",
+            ]
+        else:
+            # Journée entière
+            next_dt = (cur + timedelta(1)).strftime("%Y%m%d")
+            lines += [
+                "BEGIN:VEVENT",
+                f"UID:{uid}@horaire-namur",
+                f"DTSTAMP:{now}",
+                f"DTSTART;VALUE=DATE:{dt}",
+                f"DTEND;VALUE=DATE:{next_dt}",
+                f"SUMMARY:{title}",
+                f"TRANSP:{transp}",
+                "END:VEVENT",
+            ]
+        cur += timedelta(1)
+
+    lines.append("END:VCALENDAR")
+    ical_text = "\r\n".join(lines) + "\r\n"
+    return Response(ical_text, mimetype="text/calendar; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{aid}_horaire.ics"'})
+
+
 @app.route("/api/leaves_catalog")
 def api_catalog():
     return jsonify({k: {"label": v["label"], "category": v["category"],
@@ -1332,7 +1427,9 @@ select:focus,input:focus{border-color:var(--accent)}
         <div style="display:flex;flex-direction:column;gap:8px">
           <button class="btn btn-primary" onclick="openLeaveModal()">+ Ajouter un congé</button>
           <button class="btn btn-green btn-sm" onclick="showView('annuel')">Vue annuelle →</button>
+          <button class="btn btn-sm" id="btn-gcal" style="background:#4285f4;color:#fff;display:none" onclick="syncGoogleCal()">📅 Synchroniser Google Agenda</button>
         </div>
+        <div id="gcal-info" style="display:none;margin-top:10px;font-size:11px;color:var(--muted);line-height:1.5"></div>
       </div>
     </div>
   </div>
@@ -1616,7 +1713,11 @@ async function loadAgents() {
   curAgent = sel.value || selM.value;
   updateAgentInfo(agents);
   renderAgentList(agents);
-  if(curAgent) refresh();
+  if(curAgent) {
+    refresh();
+    const btnGcal = document.getElementById('btn-gcal');
+    if(btnGcal) btnGcal.style.display = '';
+  }
 }
 
 function onAgentChangeMobile() {
@@ -1629,6 +1730,23 @@ function toggleMobilePanel() {
   const rp = document.getElementById('right-panel');
   rp.classList.toggle('panel-open');
   document.getElementById('btn-panel-mobile').classList.toggle('active', rp.classList.contains('panel-open'));
+}
+
+function syncGoogleCal() {
+  if(!curAgent) return;
+  const base = window.location.origin;
+  const icalUrl = base + '/ical/' + curAgent + '.ics';
+  const gcalUrl = 'https://calendar.google.com/calendar/r?cid=' + encodeURIComponent(icalUrl);
+  const info = document.getElementById('gcal-info');
+  info.style.display = 'block';
+  info.innerHTML = '<b>Lien iCal :</b><br>'
+    + '<a href="' + icalUrl + '" style="color:var(--accent);word-break:break-all">' + icalUrl + '</a><br><br>'
+    + '<b>Méthode 1 — Bouton automatique :</b><br>'
+    + '<a href="' + gcalUrl + '" target="_blank" style="color:#4285f4;font-weight:700">▶ Ouvrir dans Google Agenda</a><br><br>'
+    + '<b>Méthode 2 — Manuel :</b><br>'
+    + 'Google Agenda → Autres agendas (+) → Via URL → coller le lien iCal';
+  // Essayer d\'ouvrir directement
+  window.open(gcalUrl, '_blank');
 }
 
 const WD_FR=['Lundi','Mardi','Mercredi','Jeudi','Vendredi'];
