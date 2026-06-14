@@ -304,18 +304,19 @@ def _hols_dict(year):
     """Construit {date: nom} depuis get_public_holidays (liste de tuples)."""
     return {d: name for d, _, name in get_public_holidays(year)}
 
+_DAY_NAMES = {0:'Lun',1:'Mar',2:'Mer',3:'Jeu',4:'Ven',5:'Sam',6:'Dim'}
+
 def _team_day(dt, offset, hols):
     """Construit le dict jour pour la route team, identique au format get_day_info."""
     sh  = get_shift(dt, offset)
     hol = hols.get(dt)
-    code = sh
-    label = SHIFT_LABELS.get(sh, sh)
-    if hol:
-        code  = 'FERIE'
-        label = hol
+    # code vide pour les jours normaux — sinon renderGrid affiche le badge CONGÉ
+    code  = 'FERIE' if hol else ''
+    label = hol if hol else SHIFT_LABELS.get(sh, sh)
     return {
         "date":         dt.isoformat(),
         "weekday":      dt.weekday(),
+        "day_name":     _DAY_NAMES[dt.weekday()],
         "day_num":      dt.day,
         "base":         sh,
         "code":         code,
@@ -324,8 +325,11 @@ def _team_day(dt, offset, hols):
         "is_holiday":   bool(hol),
         "holiday_name": hol or "",
         "shift_hours":  SHIFT_HOURS.get(sh, ""),
+        "is_today":     dt == date.today(),
         "remark":       "",
         "events":       [],
+        "decale_38":    False,
+        "decale_r":     False,
     }
 
 @app.route("/api/calendar/team/<int:offset>/<int:year>/<int:month>")
@@ -2111,6 +2115,8 @@ function onAgentChange() {
 
 function selectTeam(offset) {
   curTeamOffset = offset;
+  viewBase = false;
+  _applyBaseToggleUI();
   // Mettre à jour visuels boutons équipe (sidebar + mobile)
   document.querySelectorAll('.team-btn').forEach(b => {
     b.classList.toggle('active', parseInt(b.dataset.offset) === offset);
