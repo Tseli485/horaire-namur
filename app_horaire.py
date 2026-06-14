@@ -1899,6 +1899,7 @@ let curYear  = new Date().getFullYear();
 let curMonth = new Date().getMonth() + 1;
 let curAgent = '';
 let curTeamOffset = null;  // offset actif (0-49) — null = aucune équipe sélectionnée
+let _allAgents = {};  // cache de tous les agents (toutes équipes)
 let curView  = 'calendar';
 let catalog  = {};
 let selDay   = null;
@@ -1965,26 +1966,37 @@ function onLeaveCodeChange() {
 }
 
 // ── AGENTS ──
-async function loadAgents() {
-  const agents = await fetch('/api/agents').then(r=>r.json());
+function _applyTeamFilter(offset) {
+  // Filtre le dropdown agent sur l'équipe (offset) ou tous si offset=null
   const sel  = document.getElementById('agent-select');
   const selM = document.getElementById('agent-select-mobile');
-  const prev = sel.value || selM.value;
-  [sel, selM].forEach(s=>{
+  const prev = curAgent || sel.value || '';
+  const agents = offset !== null
+    ? Object.fromEntries(Object.entries(_allAgents).filter(([,a]) => a.team_offset === offset))
+    : _allAgents;
+  [sel, selM].forEach(s => {
     s.innerHTML = '<option value="">— Sélectionner —</option>';
-    Object.entries(agents).forEach(([id,a])=>{
+    Object.entries(agents).forEach(([id,a]) => {
       const o = document.createElement('option');
-      o.value=id; o.textContent=a.name; s.appendChild(o);
+      o.value = id; o.textContent = a.name; s.appendChild(o);
     });
     if(prev && agents[prev]) s.value = prev;
-    else if(Object.keys(agents).length>0) s.value = Object.keys(agents)[0];
+    else if(Object.keys(agents).length > 0) s.value = Object.keys(agents)[0];
+    else s.value = '';
   });
-  curAgent = sel.value || selM.value;
-  updateAgentInfo(agents);
-  renderAgentList(agents);
-  if(curAgent && agents[curAgent]) {
+  curAgent = sel.value;
+}
+
+async function loadAgents() {
+  _allAgents = await fetch('/api/agents').then(r=>r.json());
+  // Remplir le dropdown filtré par équipe si une équipe est déjà active
+  _applyTeamFilter(curTeamOffset);
+  curAgent = document.getElementById('agent-select').value;
+  updateAgentInfo(_allAgents);
+  renderAgentList(_allAgents);
+  if(curAgent && _allAgents[curAgent]) {
     // Synchroniser le bouton équipe avec l'agent actif
-    const agentOffset = agents[curAgent].team_offset;
+    const agentOffset = _allAgents[curAgent].team_offset;
     curTeamOffset = agentOffset;
     document.querySelectorAll('.team-btn').forEach(b => {
       b.classList.toggle('active', parseInt(b.dataset.offset) === agentOffset);
@@ -2117,24 +2129,21 @@ function selectTeam(offset) {
   curTeamOffset = offset;
   viewBase = false;
   _applyBaseToggleUI();
-  // Mettre à jour visuels boutons équipe (sidebar + mobile)
   document.querySelectorAll('.team-btn').forEach(b => {
     b.classList.toggle('active', parseInt(b.dataset.offset) === offset);
   });
-  // Mettre à jour le titre
   const t = OFFSET_TO_TEAM[offset];
   document.getElementById('view-title').textContent = `Équipe ${t} — Calendrier`;
-  // Vider la sélection agent (on affiche le planning de l'équipe sans agent)
-  curAgent = '';
-  document.getElementById('agent-select').value = '';
-  const selM = document.getElementById('agent-select-mobile');
-  if(selM) selM.value = '';
-  document.getElementById('agent-info').textContent = '';
-  const aim = document.getElementById('agent-info-mobile');
-  if(aim) aim.textContent = '';
-  // Cacher la barre droits légaux (pas d'agent = pas de droits personnels)
-  const ebar = document.getElementById('entitlements-bar');
-  if(ebar) ebar.style.display = 'none';
+  // Filtrer le dropdown sur l'équipe et auto-sélectionner le 1er agent de l'équipe
+  _applyTeamFilter(offset);
+  updateAgentInfo(_allAgents);
+  if(!curAgent) {
+    document.getElementById('agent-info').textContent = '';
+    const aim = document.getElementById('agent-info-mobile');
+    if(aim) aim.textContent = '';
+    const ebar = document.getElementById('entitlements-bar');
+    if(ebar) ebar.style.display = 'none';
+  }
   refresh();
 }
 
