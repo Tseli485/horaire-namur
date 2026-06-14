@@ -298,6 +298,35 @@ def api_del_agent(aid):
 
 VALID_OFFSETS = {0, 7, 14, 21, 28, 35, 42, 49}
 SHIFT_LABELS = {'M':'Matin','S':'Soir','R':'Repos','36':'Repos 36h','38':'Repos 38h'}
+SHIFT_HOURS  = {'M':'06:00 – 14:00', 'S':'14:00 – 22:00'}
+
+def _hols_dict(year):
+    """Construit {date: nom} depuis get_public_holidays (liste de tuples)."""
+    return {d: name for d, _, name in get_public_holidays(year)}
+
+def _team_day(dt, offset, hols):
+    """Construit le dict jour pour la route team, identique au format get_day_info."""
+    sh  = get_shift(dt, offset)
+    hol = hols.get(dt)
+    code = sh
+    label = SHIFT_LABELS.get(sh, sh)
+    if hol:
+        code  = 'FERIE'
+        label = hol
+    return {
+        "date":         dt.isoformat(),
+        "weekday":      dt.weekday(),
+        "day_num":      dt.day,
+        "base":         sh,
+        "code":         code,
+        "shift":        sh,
+        "label":        label,
+        "is_holiday":   bool(hol),
+        "holiday_name": hol or "",
+        "shift_hours":  SHIFT_HOURS.get(sh, ""),
+        "remark":       "",
+        "events":       [],
+    }
 
 @app.route("/api/calendar/team/<int:offset>/<int:year>/<int:month>")
 def api_calendar_team(offset, year, month):
@@ -306,20 +335,8 @@ def api_calendar_team(offset, year, month):
         return jsonify({"error": "Offset invalide"}), 400
     days_in_month = monthrange(year, month)[1]
     first_day_wd  = date(year, month, 1).weekday()
-    holidays = get_public_holidays(year)
-    days = []
-    for d in range(1, days_in_month + 1):
-        dt = date(year, month, d)
-        sh = get_shift(dt, offset)
-        is_hol = dt in holidays
-        days.append({
-            "date": dt.isoformat(), "weekday": dt.weekday(), "day_num": d,
-            "base": sh, "code": sh, "shift": sh,
-            "label": SHIFT_LABELS.get(sh, sh),
-            "is_holiday": is_hol,
-            "holiday_name": holidays.get(dt, "") if is_hol else "",
-            "remark": "", "events": [], "shift_hours": "",
-        })
+    hols = _hols_dict(year)
+    days = [_team_day(date(year, month, d), offset, hols) for d in range(1, days_in_month + 1)]
     return jsonify({"year": year, "month": month,
                     "month_name": MONTH_NAMES_FR[month-1],
                     "first_weekday": first_day_wd, "days": days})
@@ -333,17 +350,8 @@ def api_day_team(offset, date_str):
         dt = date.fromisoformat(date_str)
     except ValueError:
         return jsonify({"error": "Date invalide"}), 400
-    holidays = get_public_holidays(dt.year)
-    sh = get_shift(dt, offset)
-    is_hol = dt in holidays
-    return jsonify({
-        "date": date_str, "weekday": dt.weekday(), "day_num": dt.day,
-        "base": sh, "code": sh, "shift": sh,
-        "label": SHIFT_LABELS.get(sh, sh),
-        "is_holiday": is_hol,
-        "holiday_name": holidays.get(dt, "") if is_hol else "",
-        "remark": "", "events": [], "shift_hours": "",
-    })
+    hols = _hols_dict(dt.year)
+    return jsonify(_team_day(dt, offset, hols))
 
 @app.route("/api/calendar/<aid>/<int:year>/<int:month>")
 def api_calendar(aid, year, month):
