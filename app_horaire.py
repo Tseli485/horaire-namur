@@ -296,6 +296,55 @@ def api_del_agent(aid):
     save(data)
     return jsonify({"ok": True})
 
+VALID_OFFSETS = {0, 7, 14, 21, 28, 35, 42, 49}
+SHIFT_LABELS = {'M':'Matin','S':'Soir','R':'Repos','36':'Repos 36h','38':'Repos 38h'}
+
+@app.route("/api/calendar/team/<int:offset>/<int:year>/<int:month>")
+def api_calendar_team(offset, year, month):
+    """Calendrier d'une equipe (pas d'agent requis)."""
+    if offset not in VALID_OFFSETS:
+        return jsonify({"error": "Offset invalide"}), 400
+    days_in_month = monthrange(year, month)[1]
+    first_day_wd  = date(year, month, 1).weekday()
+    holidays = get_public_holidays(year)
+    days = []
+    for d in range(1, days_in_month + 1):
+        dt = date(year, month, d)
+        sh = get_shift(dt, offset)
+        is_hol = dt in holidays
+        days.append({
+            "date": dt.isoformat(), "weekday": dt.weekday(), "day_num": d,
+            "base": sh, "code": sh, "shift": sh,
+            "label": SHIFT_LABELS.get(sh, sh),
+            "is_holiday": is_hol,
+            "holiday_name": holidays.get(dt, "") if is_hol else "",
+            "remark": "", "events": [], "shift_hours": "",
+        })
+    return jsonify({"year": year, "month": month,
+                    "month_name": MONTH_NAMES_FR[month-1],
+                    "first_weekday": first_day_wd, "days": days})
+
+@app.route("/api/day/team/<int:offset>/<date_str>")
+def api_day_team(offset, date_str):
+    """Info jour pour une equipe (pas d'agent requis)."""
+    if offset not in VALID_OFFSETS:
+        return jsonify({"error": "Offset invalide"}), 400
+    try:
+        dt = date.fromisoformat(date_str)
+    except ValueError:
+        return jsonify({"error": "Date invalide"}), 400
+    holidays = get_public_holidays(dt.year)
+    sh = get_shift(dt, offset)
+    is_hol = dt in holidays
+    return jsonify({
+        "date": date_str, "weekday": dt.weekday(), "day_num": dt.day,
+        "base": sh, "code": sh, "shift": sh,
+        "label": SHIFT_LABELS.get(sh, sh),
+        "is_holiday": is_hol,
+        "holiday_name": holidays.get(dt, "") if is_hol else "",
+        "remark": "", "events": [], "shift_hours": "",
+    })
+
 @app.route("/api/calendar/<aid>/<int:year>/<int:month>")
 def api_calendar(aid, year, month):
     data  = load()
@@ -971,6 +1020,11 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
 .nav-btn:hover,.nav-btn.active{background:var(--card2);color:var(--text)}
 .nav-btn svg{width:16px;height:16px;opacity:.7}
 
+/* team buttons */
+.team-btn{flex:0 0 calc(25% - 5px);padding:7px 4px;border-radius:8px;border:1px solid var(--border);background:var(--card2);color:var(--muted);font-size:12px;font-weight:700;cursor:pointer;text-align:center;transition:.15s}
+.team-btn:hover{border-color:var(--accent);color:var(--text)}
+.team-btn.active{background:var(--accent);border-color:var(--accent);color:#fff}
+
 /* agent select */
 .agent-section{padding:16px;border-top:1px solid var(--border);margin-top:auto}
 .agent-section label{font-size:11px;color:var(--muted);display:block;margin-bottom:6px}
@@ -1166,6 +1220,8 @@ select:focus,input:focus{border-color:var(--accent)}
   .nav-btn{padding:12px 0;justify-content:center;font-size:0;gap:0}
   .nav-btn svg{width:22px;height:22px;opacity:1}
   #mobile-agent-bar{display:flex!important}
+  #mobile-team-bar{display:flex!important}
+  #team-btns{display:none!important}
   #content{padding:14px;gap:12px}
 }
 
@@ -1225,8 +1281,10 @@ select:focus,input:focus{border-color:var(--accent)}
   .month-nav span{font-size:12px;min-width:80px;text-align:center}
   #btn-week-toggle{padding:4px 8px;font-size:11px}
 
-  /* Barre agent (mobile) */
+  /* Barre agent + équipe (mobile) */
   #mobile-agent-bar{display:flex!important}
+  #mobile-team-bar{display:flex!important}
+  #team-btns{display:none!important}
 
   /* Grille calendrier — forcée dans la largeur du GSM */
   #content{grid-template-columns:1fr;padding:2px;gap:4px;width:100%;overflow:hidden}
@@ -1489,6 +1547,18 @@ select:focus,input:focus{border-color:var(--accent)}
     Réglages
   </button>
 
+  <div class="nav-section">Équipe</div>
+  <div id="team-btns" style="display:flex;flex-wrap:wrap;gap:6px;padding:0 12px 12px">
+    <button class="team-btn" data-offset="14" onclick="selectTeam(14)">Éq 1</button>
+    <button class="team-btn" data-offset="28" onclick="selectTeam(28)">Éq 2</button>
+    <button class="team-btn" data-offset="42" onclick="selectTeam(42)">Éq 3</button>
+    <button class="team-btn" data-offset="0"  onclick="selectTeam(0)">Éq 4</button>
+    <button class="team-btn" data-offset="21" onclick="selectTeam(21)">Éq 5</button>
+    <button class="team-btn" data-offset="35" onclick="selectTeam(35)">Éq 6</button>
+    <button class="team-btn" data-offset="49" onclick="selectTeam(49)">Éq 7</button>
+    <button class="team-btn" data-offset="7"  onclick="selectTeam(7)">Éq 8</button>
+  </div>
+
   <div class="agent-section">
     <label>Agent actif</label>
     <select id="agent-select" onchange="onAgentChange()">
@@ -1520,6 +1590,17 @@ select:focus,input:focus{border-color:var(--accent)}
       <option value="">— Sélectionner —</option>
     </select>
     <div style="font-size:11px;color:var(--muted)" id="agent-info-mobile"></div>
+  </div>
+  <!-- Barre équipe mobile — toujours visible sur mobile -->
+  <div id="mobile-team-bar" style="display:none;padding:8px 10px;border-bottom:1px solid var(--border);background:var(--sidebar);gap:5px;flex-wrap:wrap">
+    <button class="team-btn" data-offset="14" onclick="selectTeam(14)">Éq 1</button>
+    <button class="team-btn" data-offset="28" onclick="selectTeam(28)">Éq 2</button>
+    <button class="team-btn" data-offset="42" onclick="selectTeam(42)">Éq 3</button>
+    <button class="team-btn" data-offset="0"  onclick="selectTeam(0)">Éq 4</button>
+    <button class="team-btn" data-offset="21" onclick="selectTeam(21)">Éq 5</button>
+    <button class="team-btn" data-offset="35" onclick="selectTeam(35)">Éq 6</button>
+    <button class="team-btn" data-offset="49" onclick="selectTeam(49)">Éq 7</button>
+    <button class="team-btn" data-offset="7"  onclick="selectTeam(7)">Éq 8</button>
   </div>
 
   <!-- CALENDAR VIEW -->
@@ -1805,6 +1886,7 @@ select:focus,input:focus{border-color:var(--accent)}
 let curYear  = new Date().getFullYear();
 let curMonth = new Date().getMonth() + 1;
 let curAgent = '';
+let curTeamOffset = null;  // offset actif (0-49) — null = aucune équipe sélectionnée
 let curView  = 'calendar';
 let catalog  = {};
 let selDay   = null;
@@ -1831,6 +1913,8 @@ async function init() {
   catalog = await fetch('/api/leaves_catalog').then(r=>r.json());
   populateCatalog();
   await loadAgents();
+  // Si aucun agent auto-sélectionné, afficher Équipe 4 par défaut
+  if(!curAgent && curTeamOffset === null) selectTeam(0);
   showView('calendar');
   gotoToday();
   initSwipe();
@@ -1886,10 +1970,20 @@ async function loadAgents() {
   curAgent = sel.value || selM.value;
   updateAgentInfo(agents);
   renderAgentList(agents);
-  if(curAgent) {
+  if(curAgent && agents[curAgent]) {
+    // Synchroniser le bouton équipe avec l'agent actif
+    const agentOffset = agents[curAgent].team_offset;
+    curTeamOffset = agentOffset;
+    document.querySelectorAll('.team-btn').forEach(b => {
+      b.classList.toggle('active', parseInt(b.dataset.offset) === agentOffset);
+    });
+    const t = OFFSET_TO_TEAM[agentOffset];
+    document.getElementById('view-title').textContent = t ? `Équipe ${t} — Calendrier` : 'Calendrier';
     refresh();
     const btnGcal = document.getElementById('btn-gcal');
     if(btnGcal) btnGcal.style.display = '';
+  } else if(curTeamOffset !== null) {
+    refresh();
   }
 }
 
@@ -2005,6 +2099,29 @@ function onAgentChange() {
   viewBase = false;
   _applyBaseToggleUI();
   loadAgents();
+}
+
+function selectTeam(offset) {
+  curTeamOffset = offset;
+  // Mettre à jour visuels boutons équipe (sidebar + mobile)
+  document.querySelectorAll('.team-btn').forEach(b => {
+    b.classList.toggle('active', parseInt(b.dataset.offset) === offset);
+  });
+  // Mettre à jour le titre
+  const t = OFFSET_TO_TEAM[offset];
+  document.getElementById('view-title').textContent = `Équipe ${t} — Calendrier`;
+  // Vider la sélection agent (on affiche le planning de l'équipe sans agent)
+  curAgent = '';
+  document.getElementById('agent-select').value = '';
+  const selM = document.getElementById('agent-select-mobile');
+  if(selM) selM.value = '';
+  document.getElementById('agent-info').textContent = '';
+  const aim = document.getElementById('agent-info-mobile');
+  if(aim) aim.textContent = '';
+  // Cacher la barre droits légaux (pas d'agent = pas de droits personnels)
+  const ebar = document.getElementById('entitlements-bar');
+  if(ebar) ebar.style.display = 'none';
+  refresh();
 }
 
 const TEAM_OPTIONS = [{v:14,t:1},{v:28,t:2},{v:42,t:3},{v:0,t:4},{v:21,t:5},{v:35,t:6},{v:49,t:7},{v:7,t:8}];
@@ -2174,8 +2291,8 @@ async function renderWeekView() {
   const eL = `${endDate.getDate()} ${WV_MON[endDate.getMonth()]} ${endDate.getFullYear()}`;
   document.getElementById('period-label').textContent = `${sL} – ${eL}`;
 
-  if(!curAgent){
-    wv.innerHTML='<div class="wv-empty">Sélectionner un agent pour voir la semaine</div>';
+  if(!curAgent && curTeamOffset === null){
+    wv.innerHTML='<div class="wv-empty">Sélectionner une équipe pour voir la semaine</div>';
     return;
   }
 
@@ -2188,11 +2305,14 @@ async function renderWeekView() {
 
   // Fetch jours + soldes en parallèle
   const yr = curWeekStart.getFullYear();
+  const dayUrl = dt => curAgent
+    ? `/api/day/${curAgent}/${dt}`
+    : `/api/day/team/${curTeamOffset}/${dt}`;
   const [days, bal] = await Promise.all([
     Promise.all(dates.map(dt=>
-      fetch(`/api/day/${curAgent}/${dt}`).then(r=>r.json()).catch(()=>null)
+      fetch(dayUrl(dt)).then(r=>r.json()).catch(()=>null)
     )),
-    fetch(`/api/balance/${curAgent}/${yr}`).then(r=>r.json()).catch(()=>null),
+    curAgent ? fetch(`/api/balance/${curAgent}/${yr}`).then(r=>r.json()).catch(()=>null) : Promise.resolve(null),
   ]);
 
   // ── Mini barre de soldes ──
@@ -2290,6 +2410,13 @@ async function renderWeekView() {
 // ── CALENDAR ──
 async function renderCalendar() {
   document.getElementById('period-label').textContent = `${MN[curMonth-1]} ${curYear}`;
+  // Mode équipe sans agent
+  if(!curAgent && curTeamOffset !== null) {
+    const cal = await fetch(`/api/calendar/team/${curTeamOffset}/${curYear}/${curMonth}`).then(r=>r.json());
+    renderGrid(cal);
+    document.getElementById('entitlements-bar').style.display='none';
+    return;
+  }
   if(!curAgent){ clearCalendar(); document.getElementById('entitlements-bar').style.display='none'; return; }
   const [cal,bal,stats,ent] = await Promise.all([
     fetch(`/api/calendar/${curAgent}/${curYear}/${curMonth}`).then(r=>r.json()),
