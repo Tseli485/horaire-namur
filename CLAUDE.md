@@ -69,6 +69,14 @@ pip install -r requirements.txt
 Disk persistant monté en `/data` (variable `DATA_DIR`). Ne jamais écrire
 `agenda_data.json` en dehors de ce dossier en prod.
 
+## Token Management
+
+- Utilise RTK (installé globalement) : toutes les commandes Bash passent par `rtk` automatiquement
+- Préfère `Grep`/`Glob` à `Bash(find/grep)` pour économiser les tokens
+- Ne relis jamais `app_horaire.py` en entier — utilise `Read` avec `offset`+`limit` ou le graph MCP
+- `agenda_data.json` ne doit jamais dépasser 500 KB — si c'est le cas, archiver les événements anciens
+- En prod Render : `DATA_DIR=/data` (disk persistant), jamais en local `/tmp`
+
 ## Code Graph
 
 Ce projet utilise le MCP `code-review-graph`. Toujours faire

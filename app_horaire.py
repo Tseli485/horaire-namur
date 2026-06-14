@@ -1215,12 +1215,13 @@ select:focus,input:focus{border-color:var(--accent)}
   /* Zone principale */
   #main{padding-bottom:calc(60px + env(safe-area-inset-bottom,0));overflow:hidden}
 
-  /* Topbar compact — empilé sur 2 lignes */
-  #topbar{padding:6px 8px;gap:4px;flex-direction:column;align-items:stretch}
-  #topbar h2{font-size:13px;font-weight:800;text-align:center}
-  .month-nav{justify-content:center;gap:4px}
-  .month-nav button{padding:5px 10px;font-size:13px;min-width:36px;border-radius:8px}
-  .month-nav span{font-size:13px;min-width:90px;text-align:center}
+  /* Topbar compact — 1 seule ligne */
+  #topbar{padding:4px 8px;gap:4px;flex-direction:row;align-items:center;flex-wrap:wrap}
+  #topbar h2{font-size:12px;font-weight:800;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .month-nav{justify-content:flex-end;gap:3px;flex:2}
+  .month-nav button{padding:4px 8px;font-size:12px;min-width:30px;border-radius:7px}
+  .month-nav span{font-size:12px;min-width:80px;text-align:center}
+  #btn-week-toggle{padding:4px 8px;font-size:11px}
 
   /* Barre agent (mobile) */
   #mobile-agent-bar{display:flex!important}
@@ -1249,11 +1250,11 @@ select:focus,input:focus{border-color:var(--accent)}
   /* Pill du jour → toujours en haut à droite (abbr masqué) */
   .day-top{justify-content:flex-end}
 
-  /* Légende → scroll horizontal, pas de retour à la ligne */
-  .legend{overflow-x:auto;flex-wrap:nowrap;gap:10px;padding:7px 10px;
+  /* Légende → scroll horizontal compact */
+  .legend{overflow-x:auto;flex-wrap:nowrap;gap:8px;padding:5px 8px;
     -webkit-overflow-scrolling:touch;scrollbar-width:none}
   .legend::-webkit-scrollbar{display:none}
-  .legend-item{flex-shrink:0;font-size:11px;gap:5px}
+  .legend-item{flex-shrink:0;font-size:10px;gap:4px}
 
   /* Bouton Imprimer inutile sur mobile */
   #btn-print{display:none!important}
@@ -1286,10 +1287,9 @@ select:focus,input:focus{border-color:var(--accent)}
   .dm-body{padding:14px}
 }
 
-/* entitlements bar scroll sur petit écran */
+/* entitlements bar — grille 2 colonnes sur mobile */
 @media(max-width:640px){
-  #entitlements-content{overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch;padding-bottom:4px}
-  #entitlements-content > div{min-width:140px!important;flex:0 0 auto!important}
+  #entitlements-content{grid-template-columns:1fr 1fr!important}
   #ent-details .ent-grid{grid-template-columns:1fr!important}
 }
 
@@ -1352,6 +1352,92 @@ select:focus,input:focus{border-color:var(--accent)}
 .dm-remark-label{font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:4px;display:flex;align-items:center;justify-content:space-between}
 .dm-remark-save{font-size:11px;padding:4px 12px;border-radius:6px;border:none;background:var(--accent);color:#fff;cursor:pointer;font-weight:600}
 .dm-remark-save:hover{background:#2563eb}
+
+/* ══════════════════════════════════════════
+   VUE SEMAINE MOBILE
+══════════════════════════════════════════ */
+#week-view{display:none;flex-direction:column;gap:8px;padding:10px 10px 84px;overflow-y:auto;flex:1}
+#week-view.wv-active{display:flex}
+
+/* Barre soldes en haut de la vue semaine */
+#wv-balance{display:flex;gap:0;background:var(--card);border-radius:12px;border:1px solid var(--border);overflow:hidden;flex-shrink:0;margin-bottom:2px}
+.wvb-item{display:flex;flex-direction:column;align-items:center;justify-content:center;flex:1;padding:10px 6px;gap:1px;border-right:1px solid var(--border)}
+.wvb-item:last-child{border-right:none}
+.wvb-lbl{font-size:9px;font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:.6px}
+.wvb-val{font-size:22px;font-weight:900;line-height:1.1}
+.wvb-sub{font-size:9px;color:var(--muted)}
+.wvb-action{background:none;border:none;font-size:9px;color:var(--accent);cursor:pointer;font-weight:700;margin-top:2px;text-decoration:underline}
+
+/* Carte de jour */
+.week-card{
+  display:flex;align-items:stretch;border-radius:14px;
+  border:1px solid var(--border);border-left-width:5px;
+  min-height:82px;cursor:pointer;overflow:hidden;
+  transition:.12s;background:var(--card);
+  -webkit-tap-highlight-color:transparent;user-select:none
+}
+.week-card:active{opacity:.78;transform:scale(.988)}
+.wc-today{outline:2.5px solid var(--accent);outline-offset:0px}
+
+/* Colonne date */
+.wc-date{
+  width:62px;min-width:62px;text-align:center;
+  padding:10px 4px;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;gap:1px;
+  border-right:1px solid rgba(255,255,255,.07)
+}
+.wc-dow{font-size:9px;font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:.6px}
+.wc-num{font-size:28px;font-weight:900;line-height:1.1;color:var(--text)}
+.wc-num.wc-num-today{
+  background:var(--accent);color:#fff;
+  width:36px;height:36px;border-radius:50%;
+  display:inline-flex;align-items:center;justify-content:center;
+  font-size:18px;line-height:1
+}
+.wc-month{font-size:9px;color:var(--muted);margin-top:1px}
+
+/* Colonne poste */
+.wc-shift-col{
+  width:86px;min-width:86px;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;gap:3px;
+  padding:8px 6px;border-right:1px solid rgba(255,255,255,.07)
+}
+.wc-shift{font-size:14px;font-weight:900;letter-spacing:.2px;text-align:center;padding:4px 8px;border-radius:8px}
+.wc-hours{font-size:9px;color:var(--muted);font-weight:600;text-align:center;line-height:1.2}
+
+/* Colonne info */
+.wc-info{
+  flex:1;padding:10px 8px 10px 10px;
+  display:flex;flex-direction:column;justify-content:center;
+  gap:4px;overflow:hidden;min-width:0
+}
+/* Reason : jusqu'à 2 lignes */
+.wc-reason{
+  font-size:12px;color:var(--text);font-weight:600;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;
+  overflow:hidden;white-space:normal;line-height:1.35
+}
+/* Remark visible sur 1 ligne */
+.wc-remark{
+  display:flex;align-items:flex-start;gap:5px;
+  font-size:11px;color:var(--accent);font-style:italic;
+  overflow:hidden;white-space:normal;
+  display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical
+}
+.wc-chevron{font-size:18px;color:var(--muted);padding-right:8px;display:flex;align-items:center;opacity:.4;flex-shrink:0}
+
+.wv-empty{text-align:center;color:var(--muted);padding:40px 20px;font-size:14px;line-height:1.5}
+
+/* Toggle semaine/mois — visible seulement sur mobile */
+#btn-week-toggle{
+  display:none;padding:5px 10px;border-radius:8px;
+  border:1px solid var(--border);background:var(--card2);
+  color:var(--text);font-size:12px;font-weight:700;
+  cursor:pointer;white-space:nowrap;align-items:center;gap:5px
+}
+@media(max-width:640px){
+  #btn-week-toggle{display:inline-flex}
+}
 </style>
 </head>
 <body>
@@ -1421,6 +1507,7 @@ select:focus,input:focus{border-color:var(--accent)}
       <span id="period-label"></span>
       <button onclick="nextPeriod()">▶</button>
       <button onclick="gotoToday()" style="margin-left:4px">Auj.</button>
+      <button id="btn-week-toggle" onclick="toggleWeekMode()">📋 Semaine</button>
       <button id="btn-print" onclick="printMonth()" title="Imprimer les jours prestés (A4 PDF)" style="margin-left:8px;background:#1e40af;color:#fff;border:none;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:13px">🖨️ Imprimer</button>
     </div>
   </div>
@@ -1447,10 +1534,10 @@ select:focus,input:focus{border-color:var(--accent)}
       <div id="entitlements-bar" style="display:none;padding:14px 16px;background:var(--card);border-radius:10px;border:1px solid var(--border)">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
           <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;font-weight:700">Droits légaux — <span id="ent-year-label"></span></div>
-          <button id="btn-ent-details" onclick="toggleEntDetails()" style="background:var(--card2);border:1px solid var(--border);color:var(--muted);border-radius:5px;padding:3px 10px;cursor:pointer;font-size:11px;font-weight:700">Détails ▾</button>
+          <button id="btn-ent-details" onclick="toggleEntDetails()" style="background:var(--card2);border:1px solid var(--border);color:var(--text);border-radius:5px;padding:3px 10px;cursor:pointer;font-size:11px;font-weight:700">Réduire ▴</button>
         </div>
-        <div id="entitlements-content" style="display:flex;gap:0;border-radius:8px;overflow:hidden;border:1px solid var(--border)"></div>
-        <div id="ent-details" style="display:none;margin-top:10px"></div>
+        <div id="entitlements-content" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:0;border-radius:8px;overflow:visible;border:1px solid var(--border)"></div>
+        <div id="ent-details" style="margin-top:10px"></div>
       </div>
       <div id="base-banner" style="display:none;padding:10px 16px;background:rgba(249,115,22,.15);border:1px solid #fb923c;border-radius:10px;color:#fdba74;font-size:13px;font-weight:600;display:flex;align-items:center;justify-content:space-between">
         <span>⚠ Vue planning de base — le régime 4/5 est masqué</span>
@@ -1494,6 +1581,9 @@ select:focus,input:focus{border-color:var(--accent)}
       </div>
     </div>
   </div>
+
+  <!-- WEEK VIEW (mobile) -->
+  <div id="week-view"></div>
 
   <!-- ANNUAL VIEW -->
   <div id="annual-content" style="display:none;padding:24px;overflow-y:auto">
@@ -1717,15 +1807,35 @@ let curView  = 'calendar';
 let catalog  = {};
 let selDay   = null;
 let viewBase = false;   // true = masque le 4/5, affiche le planning de base
+let curWeekStart = null;   // Date (lundi) — semaine affichée en mode mobile
+let mobileWeekMode = false; // true = vue semaine sur mobile
 const MN = ['Janvier','Février','Mars','Avril','Mai','Juin','Juillet','Août','Septembre','Octobre','Novembre','Décembre'];
+
+// ── HELPERS SEMAINE ──
+function isMobile() { return window.innerWidth <= 640; }
+function getMondayOf(d) {
+  const r = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const wd = r.getDay();
+  r.setDate(r.getDate() - (wd === 0 ? 6 : wd - 1));
+  return r;
+}
+function toDateStr(d) {
+  return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+}
 
 // ── INIT ──
 async function init() {
+  mobileWeekMode = isMobile();
   catalog = await fetch('/api/leaves_catalog').then(r=>r.json());
   populateCatalog();
   await loadAgents();
   showView('calendar');
   gotoToday();
+  initSwipe();
+  window.addEventListener('resize', ()=>{
+    if(!isMobile() && mobileWeekMode){ mobileWeekMode=false; showView('calendar'); }
+    updateWeekToggleBtn();
+  });
 }
 
 function populateCatalog() {
@@ -1964,24 +2074,31 @@ async function resetAllData() {
 function gotoToday() {
   const now = new Date();
   curYear=now.getFullYear(); curMonth=now.getMonth()+1;
+  curWeekStart = getMondayOf(now);
   refresh();
 }
 function prevPeriod() {
-  if(curView==='calendar'){ if(--curMonth<1){curMonth=12;curYear--;} }
+  if(curView==='calendar' && isMobile() && mobileWeekMode){
+    curWeekStart = new Date(curWeekStart); curWeekStart.setDate(curWeekStart.getDate()-7);
+  } else if(curView==='calendar'){ if(--curMonth<1){curMonth=12;curYear--;} }
   else curYear--;
   refresh();
 }
 function nextPeriod() {
-  if(curView==='calendar'){ if(++curMonth>12){curMonth=1;curYear++;} }
+  if(curView==='calendar' && isMobile() && mobileWeekMode){
+    curWeekStart = new Date(curWeekStart); curWeekStart.setDate(curWeekStart.getDate()+7);
+  } else if(curView==='calendar'){ if(++curMonth>12){curMonth=1;curYear++;} }
   else curYear++;
   refresh();
 }
 function showView(v) {
   curView=v;
-  document.getElementById('content').style.display          = v==='calendar'  ? 'grid'  : 'none';
-  document.getElementById('annual-content').style.display   = v==='annuel'    ? 'block' : 'none';
-  document.getElementById('exchanges-content').style.display= v==='exchanges' ? 'block' : 'none';
-  const titles={calendar:'Calendrier mensuel',annuel:'Vue annuelle',exchanges:'Échanges de service'};
+  const calMobile = v==='calendar' && isMobile() && mobileWeekMode;
+  document.getElementById('content').style.display           = (v==='calendar' && !calMobile) ? 'grid' : 'none';
+  document.getElementById('week-view').classList.toggle('wv-active', calMobile);
+  document.getElementById('annual-content').style.display    = v==='annuel'    ? 'block' : 'none';
+  document.getElementById('exchanges-content').style.display = v==='exchanges' ? 'block' : 'none';
+  const titles={calendar:'Calendrier',annuel:'Vue annuelle',exchanges:'Échanges de service'};
   document.getElementById('view-title').textContent = titles[v]||v;
   document.querySelectorAll('.nav-btn').forEach((b,i)=>{
     b.classList.toggle('active',
@@ -1990,9 +2107,166 @@ function showView(v) {
   refresh();
 }
 function refresh() {
-  if(curView==='calendar')  renderCalendar();
-  else if(curView==='annuel') renderAnnual();
+  if(curView==='calendar'){
+    if(isMobile() && mobileWeekMode) renderWeekView();
+    else renderCalendar();
+  } else if(curView==='annuel') renderAnnual();
   else if(curView==='exchanges') renderExchanges();
+  updateWeekToggleBtn();
+}
+
+// ── TOGGLE SEMAINE/MOIS ──
+function toggleWeekMode() {
+  mobileWeekMode = !mobileWeekMode;
+  if(mobileWeekMode && !curWeekStart) curWeekStart = getMondayOf(new Date());
+  showView('calendar');
+}
+function updateWeekToggleBtn() {
+  const btn = document.getElementById('btn-week-toggle');
+  if(!btn) return;
+  btn.textContent = mobileWeekMode ? '📅 Mois' : '📋 Semaine';
+}
+
+// ── SWIPE SEMAINE ──
+function initSwipe() {
+  let sx=0, sy=0;
+  const el = document.getElementById('week-view');
+  el.addEventListener('touchstart', e=>{ sx=e.touches[0].clientX; sy=e.touches[0].clientY; },{passive:true});
+  el.addEventListener('touchend', e=>{
+    const dx = e.changedTouches[0].clientX - sx;
+    const dy = e.changedTouches[0].clientY - sy;
+    if(Math.abs(dx) > 55 && Math.abs(dx) > Math.abs(dy)*1.5){
+      if(dx < 0) nextPeriod(); else prevPeriod();
+    }
+  },{passive:true});
+}
+
+// ── VUE SEMAINE ──
+const WV_DOW  = ['Lun','Mar','Mer','Jeu','Ven','Sam','Dim'];
+const WV_MON  = ['jan','fév','mar','avr','mai','jun','jul','aoû','sep','oct','nov','déc'];
+const WV_MONL = ['Janvier','Février','Mars','Avril','Mai','Juin','Juillet','Août','Septembre','Octobre','Novembre','Décembre'];
+
+async function renderWeekView() {
+  if(!curWeekStart) curWeekStart = getMondayOf(new Date());
+  const wv = document.getElementById('week-view');
+
+  // Label période
+  const endDate = new Date(curWeekStart); endDate.setDate(endDate.getDate()+6);
+  const sL = `${curWeekStart.getDate()} ${WV_MON[curWeekStart.getMonth()]}`;
+  const eL = `${endDate.getDate()} ${WV_MON[endDate.getMonth()]} ${endDate.getFullYear()}`;
+  document.getElementById('period-label').textContent = `${sL} – ${eL}`;
+
+  if(!curAgent){
+    wv.innerHTML='<div class="wv-empty">Sélectionner un agent pour voir la semaine</div>';
+    return;
+  }
+
+  // 7 dates de la semaine
+  const dates = [];
+  for(let i=0;i<7;i++){
+    const d = new Date(curWeekStart); d.setDate(d.getDate()+i);
+    dates.push(toDateStr(d));
+  }
+
+  // Fetch jours + soldes en parallèle
+  const yr = curWeekStart.getFullYear();
+  const [days, bal] = await Promise.all([
+    Promise.all(dates.map(dt=>
+      fetch(`/api/day/${curAgent}/${dt}`).then(r=>r.json()).catch(()=>null)
+    )),
+    fetch(`/api/balance/${curAgent}/${yr}`).then(r=>r.json()).catch(()=>null),
+  ]);
+
+  // ── Mini barre de soldes ──
+  let balHtml = '';
+  if(bal && !bal.error){
+    const v=bal.vacances, m=bal.maladie;
+    const vC=v.solde<=5?'var(--red)':v.solde<=8?'var(--orange)':'var(--green)';
+    const mC=m.solde<21?'var(--red)':m.solde<63?'var(--orange)':'var(--green)';
+    // Compter les postes de la semaine
+    let nM=0,nS=0,nR=0;
+    days.forEach(d=>{ if(!d)return; const b=(viewBase&&d.code==='4/5')?d.base:d.base; if(d.code&&d.code!=='4/5'&&d.code!=='REPOS-R'&&d.code!=='REPOS-38'){nR++;}else if(b==='M')nM++;else if(b==='S')nS++;else nR++;});
+    balHtml = `<div id="wv-balance">
+      <div class="wvb-item">
+        <div class="wvb-lbl">🏖 Vacances</div>
+        <div class="wvb-val" style="color:${vC}">${v.solde}</div>
+        <div class="wvb-sub">j restants / ${v.droit}j</div>
+      </div>
+      <div class="wvb-item">
+        <div class="wvb-lbl">🏥 Maladie</div>
+        <div class="wvb-val" style="color:${mC}">${m.solde}</div>
+        <div class="wvb-sub">j restants</div>
+      </div>
+      <div class="wvb-item">
+        <div class="wvb-lbl">📅 Cette sem.</div>
+        <div class="wvb-val" style="font-size:13px;margin-top:3px;color:var(--text)">
+          ${nM?`<span style="color:#fca5a5">${nM}M</span> `:''}${nS?`<span style="color:#fdba74">${nS}S</span> `:''}${nR?`<span style="color:#86efac">${nR}R</span>`:''}
+        </div>
+        <button class="wvb-action" onclick="openLeaveModal()">+ Congé</button>
+      </div>
+    </div>`;
+  }
+
+  // ── Cartes jours ──
+  const todayStr = toDateStr(new Date());
+  let cardsHtml = '';
+
+  days.forEach((day, i) => {
+    if(!day || day.error) return;
+    const dt = dates[i];
+    const dn = parseInt(dt.slice(8,10),10);
+    const mo = parseInt(dt.slice(5,7),10)-1;
+    const isToday = dt===todayStr;
+
+    const code = (viewBase && day.code==='4/5') ? null : day.code;
+    const base = day.base;
+    let bCls='b-green', cCls='c-green', pCls='p-green', pillTxt='Repos', reasonTxt='', hours='';
+
+    if(code==='FERIE'||code==='PONT'){
+      bCls='b-blue'; cCls='c-blue'; pCls='p-blue';
+      const _sp={M:'Matin',S:'Soir',R:'Repos','36':'36h','38':'38h'};
+      pillTxt=_sp[base]||'Repos';
+      reasonTxt=(code==='PONT'?'Pont — ':'Jour férié — ')+(day.label||'');
+      hours=day.shift_hours||'';
+    } else if(code==='4/5'){
+      bCls='b-green'; cCls='c-green'; pCls='p-green'; pillTxt='4/5'; reasonTxt='Régime 4/5';
+    } else if(code==='REPOS-R'||code==='REPOS-38'){
+      bCls='b-green'; cCls='c-green'; pCls='p-green'; pillTxt='Repos';
+      reasonTxt=code==='REPOS-38'?'38h décalé':'Repos décalé';
+    } else if(code){
+      bCls='b-green'; cCls='c-green'; pCls='p-green'; pillTxt='Congé';
+      reasonTxt=day.label||code;
+    } else if(base==='M'){
+      bCls='b-red'; cCls='c-red'; pCls='p-red'; pillTxt='Matin'; hours=day.shift_hours||'06:00 – 14:00';
+    } else if(base==='S'){
+      bCls='b-orange'; cCls='c-orange'; pCls='p-orange'; pillTxt='Soir'; hours=day.shift_hours||'14:00 – 22:00';
+    } else if(base==='36'||base==='38'){
+      bCls='b-purple'; cCls='c-purple'; pCls='p-purple'; pillTxt='Repos '+base;
+    }
+
+    const todayCls = isToday ? 'wc-today' : '';
+    const remarkHtml = (day.remark && day.remark.trim())
+      ? `<div class="wc-remark"><span class="remark-dot" style="flex-shrink:0"></span>${day.remark}</div>` : '';
+
+    cardsHtml += `<div class="week-card ${bCls} ${cCls} ${todayCls}" onclick="openDayModal('${dt}')">
+      <div class="wc-date">
+        <div class="wc-dow">${WV_DOW[i]}</div>
+        <div class="wc-num${isToday?' wc-num-today':''}">${dn}</div>
+        <div class="wc-month">${WV_MON[mo]}</div>
+      </div>
+      <div class="wc-shift-col">
+        <div class="wc-shift ${pCls}">${pillTxt}</div>
+        ${hours?`<div class="wc-hours">${hours}</div>`:''}
+      </div>
+      <div class="wc-info">
+        ${reasonTxt?`<div class="wc-reason">${reasonTxt}</div>`:''}
+        ${remarkHtml}
+      </div>
+      <div class="wc-chevron">›</div>
+    </div>`;
+  });
+
+  wv.innerHTML = balHtml + (cardsHtml || '<div class="wv-empty">Aucune donnée pour cette semaine</div>');
 }
 
 // ── CALENDAR ──
@@ -2013,7 +2287,7 @@ async function renderCalendar() {
 
 // ── ENTITLEMENTS ──
 let _lastEnt = null;
-let _entDetailsOpen = false;
+let _entDetailsOpen = true;  // détails toujours ouverts par défaut
 
 function toggleEntDetails() {
   _entDetailsOpen = !_entDetailsOpen;
@@ -2064,7 +2338,7 @@ function renderEntitlements(ent) {
   }
   const vBtnColor = (vNotSet || v.manual) ? 'var(--orange)' : 'var(--accent)';
   const vBtnText  = vNotSet ? '⚡ Saisir quota' : (v.manual ? '🔧 Quota: ' + v.droit + 'j' : '✏ Quota: ' + v.droit + 'j');
-  let html = '<div style="flex:1;min-width:170px;padding:10px 14px;border-right:1px solid var(--border)">'
+  let html = '<div style="padding:10px 14px;border-right:1px solid var(--border);border-bottom:1px solid var(--border)">'
     + '<div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">🏖️ VACANCES ' + ent.year + vManualTag + '</div>'
     + vBody
     + '<div style="font-size:10px;margin-top:4px;display:flex;gap:8px;flex-wrap:wrap">'
@@ -2092,7 +2366,7 @@ function renderEntitlements(ent) {
     }
     const mBtnColor = (mNotSet || m.manual) ? 'var(--orange)' : 'var(--accent)';
     const mBtnText  = mNotSet ? '⚡ Saisir capital' : (m.manual ? '🔧 Capital: ' + m.capital + 'j' : '✏ Capital: ' + m.capital + 'j');
-    html += '<div style="flex:1;min-width:170px;padding:10px 14px;border-right:1px solid var(--border)">'
+    html += '<div style="padding:10px 14px;border-right:1px solid var(--border);border-bottom:1px solid var(--border)">'
       + '<div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">🤒 CAP. MALADIE' + mManTag + '</div>'
       + mBody
       + '<div style="font-size:10px;margin-top:4px">'
@@ -2104,7 +2378,7 @@ function renderEntitlements(ent) {
   if(m && m.service_months != null){
     const sy = Math.floor(m.service_months/12), smo = m.service_months%12;
     const nextCap = (Math.floor(m.service_months/12)+1)*21;
-    html += `<div style="flex:0 0 auto;min-width:120px;padding:10px 14px;border-right:1px solid var(--border)">
+    html += `<div style="padding:10px 14px;border-right:1px solid var(--border);border-bottom:1px solid var(--border)">
       <div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">📅 ANCIENNETÉ</div>
       <div style="font-size:22px;font-weight:900;color:var(--text)">${sy}<span style="font-size:12px;color:var(--muted)">a</span> ${smo}<span style="font-size:12px;color:var(--muted)">m</span></div>
       <div style="font-size:10px;color:var(--muted);margin-top:4px">Prochain cap auto: ${nextCap}j</div>
@@ -2121,7 +2395,7 @@ function renderEntitlements(ent) {
     nextBracketHtml = `<div style="font-size:9px;color:var(--accent);margin-top:3px">
       ▶ ${fmt}: ${nb.age} ans → ${nb.days}j (+${nb.delta}j)</div>`;
   }
-  html += `<div style="flex:0 0 auto;min-width:110px;padding:10px 14px">
+  html += `<div style="padding:10px 14px;border-bottom:1px solid var(--border)">
     <div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">👤 ÂGE au 01/01/${ent.year}</div>
     <div style="font-size:22px;font-weight:900;color:var(--text)">${ageTxt}<span style="font-size:12px;color:var(--muted)"> ans</span></div>
     <div style="font-size:10px;color:var(--muted);margin-top:4px">${v.droit}j/an BOSA</div>
