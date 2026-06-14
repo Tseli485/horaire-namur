@@ -104,7 +104,7 @@ def pwa_icon():
 # ─────────────────────── DATA HELPERS ────────────────────────
 def load():
     if DATA_FILE.exists():
-        return json.loads(DATA_FILE.read_text(encoding="utf-8"))
+        return json.loads(DATA_FILE.read_text(encoding="utf-8-sig"))
     return {"agents": {}, "events": [], "reliquats": {}, "capitals": {}, "exchanges": [], "remarks": {}, "shift_overrides": {}}
 
 def save(data):
