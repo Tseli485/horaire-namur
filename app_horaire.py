@@ -283,6 +283,8 @@ def api_patch_agent(aid):
         data["agents"][aid]["birth_date"] = body["birth_date"] or None
     if "career_start" in body:
         data["agents"][aid]["career_start"] = body["career_start"] or None
+    if "team_offset" in body:
+        data["agents"][aid]["team_offset"] = int(body["team_offset"])
     save(data)
     return jsonify({"ok": True, "agent": data["agents"][aid]})
 
@@ -1647,16 +1649,16 @@ select:focus,input:focus{border-color:var(--accent)}
     <div class="form-row">
       <div class="form-group"><label>Date de naissance</label><input type="date" id="na-birth" max="2007-12-31"></div>
       <div class="form-group">
-        <label>Équipe (offset)</label>
+        <label>Équipe</label>
         <select id="na-offset">
-          <option value="0">Équipe 4 (0j)</option>
-          <option value="7">Équipe 5 (7j)</option>
-          <option value="14">Équipe 6 (14j)</option>
-          <option value="21">Équipe 7 (21j)</option>
-          <option value="28">Équipe 8 (28j)</option>
-          <option value="35">Équipe 1 (35j)</option>
-          <option value="42">Équipe 2 (42j)</option>
-          <option value="49">Équipe 3 (49j)</option>
+          <option value="14">Équipe 1</option>
+          <option value="28">Équipe 2</option>
+          <option value="42">Équipe 3</option>
+          <option value="0">Équipe 4</option>
+          <option value="21">Équipe 5</option>
+          <option value="35">Équipe 6</option>
+          <option value="49">Équipe 7</option>
+          <option value="7">Équipe 8</option>
         </select>
       </div>
     </div>
@@ -1930,6 +1932,8 @@ function syncGoogleCal() {
 
 const WD_FR=['Lundi','Mardi','Mercredi','Jeudi','Vendredi'];
 const WD_SHORT=['Lun','Mar','Mer','Jeu','Ven'];
+const OFFSET_TO_TEAM={0:4,7:8,14:1,21:5,28:2,35:6,42:3,49:7};
+function teamLabel(offset){const t=OFFSET_TO_TEAM[offset];return t?`Équipe ${t}`:`Offset ${offset}j`;}
 
 function updateAgentInfo(agents) {
   const el = document.getElementById('agent-info');
@@ -1941,7 +1945,7 @@ function updateAgentInfo(agents) {
     age_str = `${age} ans`;
   } else if(a.age) age_str = `${a.age} ans`;
   let info = age_str ? `${age_str} | ` : '';
-  info += `Offset: ${a.team_offset}j`;
+  info += teamLabel(a.team_offset);
   if(a.regime_4_5 != null) info += ` | 4/5 ${WD_SHORT[a.regime_4_5]}`;
   el.textContent = info;
   refresh45UI(a.regime_4_5);
@@ -2003,6 +2007,8 @@ function onAgentChange() {
   loadAgents();
 }
 
+const TEAM_OPTIONS = [{v:14,t:1},{v:28,t:2},{v:42,t:3},{v:0,t:4},{v:21,t:5},{v:35,t:6},{v:49,t:7},{v:7,t:8}];
+
 function renderAgentList(agents) {
   const el = document.getElementById('agent-list');
   if(Object.keys(agents).length===0){el.innerHTML='<p style="color:var(--muted);font-size:12px">Aucun agent enregistré.</p>';return;}
@@ -2012,17 +2018,29 @@ function renderAgentList(agents) {
       const age = new Date().getFullYear() - parseInt(a.birth_date.split('-')[0]);
       meta += ` · ${age} ans (né ${a.birth_date})`;
     } else if(a.age) meta += ` · ${a.age} ans`;
-    meta += ` · offset ${a.team_offset}j`;
     if(a.career_start) meta += ` · carrière depuis ${a.career_start}`;
     const warn = !a.birth_date ? ' <span style="color:#fb923c;font-size:10px">⚠ Ajouter date naissance</span>' : '';
+    const opts = TEAM_OPTIONS.map(o=>`<option value="${o.v}"${o.v===a.team_offset?' selected':''}>Équipe ${o.t}</option>`).join('');
     return `<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border)">
-      <div>
+      <div style="flex:1;min-width:0">
         <div style="font-size:13px;font-weight:600">${a.name}${warn}</div>
         <div style="font-size:11px;color:var(--muted)">${meta}</div>
+        <div style="margin-top:4px;display:flex;align-items:center;gap:6px">
+          <select style="font-size:11px;padding:2px 4px;background:var(--card2);color:var(--fg);border:1px solid var(--border);border-radius:6px" onchange="changeTeam('${id}',this.value)">${opts}</select>
+        </div>
       </div>
-      <button class="btn btn-danger btn-sm" onclick="deleteAgent('${id}')">Suppr.</button>
+      <button class="btn btn-danger btn-sm" onclick="deleteAgent('${id}')" style="margin-left:8px">Suppr.</button>
     </div>`;
   }).join('');
+}
+
+async function changeTeam(aid, offset) {
+  await fetch(`/api/agents/${aid}`,{method:'PATCH',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({team_offset:parseInt(offset)})});
+  const agents = await fetch('/api/agents').then(r=>r.json());
+  updateAgentInfo(agents);
+  renderAgentList(agents);
+  if(curAgent===aid){ toast(`Équipe mise à jour — ${teamLabel(parseInt(offset))}`); refresh(); }
 }
 
 async function addAgent() {

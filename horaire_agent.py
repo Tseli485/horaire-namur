@@ -27,6 +27,10 @@ CYCLE_LEN = 56
 N_TEAMS = 8
 OFFSET_PER_TEAM = CYCLE_LEN // N_TEAMS  # = 7 jours
 
+# Mapping equipe (1-8) -> offset dans le cycle de 56j
+# Detecte depuis les PDFs reels (Prison de Namur)
+TEAM_OFFSETS = {1: 14, 2: 28, 3: 42, 4: 0, 5: 21, 6: 35, 7: 49, 8: 7}
+
 MONTH_NAMES_FR = [
     'JANVIER','FEVRIER','MARS','AVRIL','MAI','JUIN',
     'JUILLET','AOUT','SEPTEMBRE','OCTOBRE','NOVEMBRE','DECEMBRE'
