@@ -544,10 +544,11 @@ td{border:1px solid #e2e8f0;height:3.7mm;padding:0 3px;vertical-align:middle;
   white-space:nowrap;overflow:hidden}
 td.empty{background:#f8fafc}
 td.d{font-size:7pt;line-height:1}
+/* Largeurs FIXES -> toutes les colonnes alignées (M, S, R, 4/5, 12H, VAC… même gabarit) */
 td.d .dn{display:inline-block;width:22px;color:#94a3b8;font-size:6.5pt}
 td.d .num{display:inline-block;width:15px;text-align:right;font-weight:700;font-size:7pt}
-td.d .pose{display:inline-block;min-width:16px;text-align:center;font-weight:800;
-  border-radius:3px;padding:1px 4px;margin:0 4px;font-size:7pt}
+td.d .pose{display:inline-block;width:24px;text-align:center;font-weight:800;
+  border-radius:3px;padding:1px 0;margin:0 3px;font-size:7pt;box-sizing:border-box}
 /* POSTES TRAVAILLÉS = colorés */
 td.m .pose{background:#fee2e2;color:#b91c1c}
 td.s .pose{background:#ffedd5;color:#c2410c}
@@ -694,8 +695,8 @@ def fiche_agent(aid, year):
         # (FERIE/PONT sont aussi des clés du catalogue -> traités AVANT la branche congé)
         if code in ("FERIE", "PONT"):
             return (base, _poste_kind(base), info.get("label") or "Férié")
-        if code in LEAVE_CATALOG:                 # congé/absence -> grisé + code
-            return (code[:4], 'off', info.get("label") or code)
+        if code in LEAVE_CATALOG:                 # congé/absence -> grisé + code (3 car. max, aligné)
+            return (code[:3], 'off', info.get("label") or code)
         if code == '4/5':                         # jour 4/5 -> grisé, marqué 4/5
             return ('4/5', 'off', 'Régime 4/5')
         # Postes (M/S/12H/08H travaillés -> colorés ; R/36/38 -> grisés)
