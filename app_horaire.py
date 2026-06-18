@@ -508,6 +508,192 @@ def print_month(aid, year, month):
     )
     return Response(page_html, mimetype='text/html; charset=utf-8')
 
+# ── FICHE ANNUELLE INTERACTIVE (12 mois en colonnes, cases C) ──────────────
+_FICHE_TEAM = {0: 4, 7: 8, 14: 1, 21: 5, 28: 2, 35: 6, 42: 3, 49: 7}
+_SHIFT_CLASS = {'M': 'm', 'S': 's', 'R': 'r', '36': 'r', '38': 'r'}
+
+_FICHE_CSS = """
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',Arial,sans-serif;background:#475569;color:#0f172a;padding:14px}
+.sheet{background:#fff;width:297mm;min-height:210mm;margin:0 auto;padding:8mm 7mm;
+  box-shadow:0 4px 24px rgba(0,0,0,.35);border-radius:4px}
+.hdr{display:flex;justify-content:space-between;align-items:flex-end;
+  border-bottom:3px solid #1e40af;padding-bottom:7px;margin-bottom:9px}
+.hdr h1{font-size:18pt;color:#1e40af;font-weight:800;letter-spacing:.3px}
+.hdr .sub{font-size:9pt;color:#64748b;margin-top:2px}
+.legend{display:flex;gap:12px;align-items:center;font-size:8pt;color:#475569}
+.legend .b{display:inline-flex;align-items:center;gap:4px}
+.legend .sw{width:13px;height:13px;border-radius:3px;display:inline-block}
+.sw.m{background:#fecaca}.sw.s{background:#fed7aa}.sw.r{background:#bbf7d0}
+.sw.bl{background:#dbeafe}.sw.cg{background:#9ca3af}
+table{width:100%;border-collapse:collapse;table-layout:fixed}
+th{background:#1e40af;color:#fff;font-size:8.5pt;font-weight:700;padding:4px 2px;
+  text-transform:uppercase;letter-spacing:.3px;border:1px solid #1e3a8a}
+td{border:1px solid #e2e8f0;height:7.0mm;padding:0 2px;vertical-align:middle}
+td.empty{background:#f8fafc}
+td.d{font-size:7pt;line-height:1}
+td.d .dn{display:inline-block;width:20px;color:#94a3b8;font-size:6pt}
+td.d .num{display:inline-block;width:14px;text-align:right;font-weight:700;font-size:7pt}
+td.d .pose{display:inline-block;width:18px;text-align:center;font-weight:800;
+  border-radius:3px;padding:1px 0;margin:0 3px;font-size:7pt}
+td.m .pose{background:#fee2e2;color:#b91c1c}
+td.s .pose{background:#ffedd5;color:#c2410c}
+td.r .pose{background:#dcfce7;color:#15803d}
+td.b .pose{background:#dbeafe;color:#1d4ed8}
+td.d.we{background:#f1f5f9}
+/* CONGÉ RÉEL (depuis l'horaire de l'agent) -> case grisée avec code */
+td.d.leave{background:#9ca3af}
+td.d.leave .pose{background:#4b5563;color:#fff;width:auto;min-width:18px;padding:1px 3px}
+td.d.leave .dn,td.d.leave .num{color:#e5e7eb}
+td.d .c{vertical-align:middle;cursor:pointer;width:11px;height:11px;accent-color:#1e40af}
+/* CASE C MANUELLE COCHÉE -> grise UNIQUEMENT cette case du mois */
+td.d.on{background:#9ca3af!important}
+td.d.on .pose{background:transparent!important;color:#374151!important}
+td.d.on .dn,td.d.on .num{color:#4b5563}
+.bar{max-width:297mm;margin:0 auto 12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.bar button{background:#1e40af;color:#fff;border:none;border-radius:7px;
+  padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer}
+.bar button.ghost{background:#fff;color:#1e40af;border:1px solid #1e40af}
+.bar .yr{margin-left:auto;font-size:13px;color:#e2e8f0}
+@page{size:A4 landscape;margin:6mm}
+@media print{
+  body{background:#fff;padding:0}
+  .bar{display:none}
+  .sheet{box-shadow:none;width:auto;min-height:auto;padding:0;border-radius:0}
+  *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+}
+"""
+
+_FICHE_JS = """
+const KEY='STORAGEKEY';
+function tog(cb){cb.closest('td').classList.toggle('on', cb.checked);save();}
+function save(){
+  const on=[...document.querySelectorAll('input.c:checked')].map(c=>c.dataset.k);
+  localStorage.setItem(KEY, JSON.stringify(on));
+}
+function load(){
+  let on=[]; try{on=JSON.parse(localStorage.getItem(KEY)||'[]')}catch(e){}
+  const set=new Set(on);
+  document.querySelectorAll('input.c').forEach(cb=>{
+    if(set.has(cb.dataset.k)){cb.checked=true;cb.closest('td').classList.add('on');}
+  });
+}
+function clearAll(){
+  if(!confirm('Décocher toutes les cases C manuelles ?'))return;
+  document.querySelectorAll('input.c').forEach(cb=>{cb.checked=false;cb.closest('td').classList.remove('on');});
+  save();
+}
+document.addEventListener('DOMContentLoaded', load);
+"""
+
+def _fiche_body(year, day_fn):
+    """Construit le corps 31 lignes x 12 mois. day_fn(d) -> (badge, cls, leave, title)."""
+    rows = []
+    for day in range(1, 32):
+        tds = []
+        for m in range(1, 13):
+            try:
+                d = date(year, m, day)
+            except ValueError:
+                tds.append('<td class="empty"></td>')
+                continue
+            badge, cls, leave, title = day_fn(d)
+            dn = DAY_NAMES_FR[d.weekday()]
+            we = ' we' if d.weekday() >= 5 else ''
+            lv = ' leave' if leave else ''
+            key = f'{m}-{day}'
+            t = f' title="{title}"' if title else ''
+            tds.append(
+                f'<td class="d {cls}{we}{lv}" data-k="{key}"{t}>'
+                f'<span class="dn">{dn}</span>'
+                f'<span class="num">{day}</span>'
+                f'<span class="pose">{badge}</span>'
+                f'<input type="checkbox" class="c" data-k="{key}" '
+                f'onchange="tog(this)" title="Congé (marquage manuel)">'
+                f'</td>'
+            )
+        rows.append(f'<tr>{"".join(tds)}</tr>')
+    return "".join(rows)
+
+def _fiche_page(year, title_html, subtitle, body_html, storage_key):
+    """Assemble la page complète (présentation identique pour vierge et agent)."""
+    head_cells = "".join(
+        f'<th>{MONTH_NAMES_FR[m].capitalize()}</th>' for m in range(12)
+    )
+    js = _FICHE_JS.replace("STORAGEKEY", storage_key)
+    html = (
+        '<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f'<title>{title_html} — {year}</title>'
+        f'<style>{_FICHE_CSS}</style></head><body>'
+        '<div class="bar">'
+        '<button onclick="window.print()">🖨️ Imprimer / PDF</button>'
+        '<button class="ghost" onclick="clearAll()">Tout décocher</button>'
+        f'<span class="yr">{title_html} · {year}</span>'
+        '</div>'
+        '<div class="sheet">'
+        '<div class="hdr">'
+        f'<div><h1>Prison de Namur — {year}</h1>'
+        f'<div class="sub">{subtitle}</div></div>'
+        '<div class="legend">'
+        '<span class="b"><span class="sw m"></span>Matin</span>'
+        '<span class="b"><span class="sw s"></span>Soir</span>'
+        '<span class="b"><span class="sw r"></span>Repos</span>'
+        '<span class="b"><span class="sw bl"></span>Férié</span>'
+        '<span class="b"><span class="sw cg"></span>Congé</span>'
+        '</div></div>'
+        '<table><thead><tr>'
+        + head_cells +
+        '</tr></thead><tbody>'
+        + body_html +
+        '</tbody></table>'
+        '</div>'
+        f'<script>{js}</script>'
+        '</body></html>'
+    )
+    return Response(html, mimetype='text/html; charset=utf-8')
+
+@app.route("/fiche/<int:offset>/<int:year>")
+def fiche_blank(offset, year):
+    """Fiche annuelle VIERGE : cycle brut de l'équipe (sans 4/5 ni congés)."""
+    if offset not in VALID_OFFSETS:
+        return "Offset invalide", 400
+    team = _FICHE_TEAM.get(offset, "?")
+
+    def day_fn(d):
+        sh = get_shift(d, offset)
+        return (sh, _SHIFT_CLASS.get(sh, 'r'), False, '')
+
+    body = _fiche_body(year, day_fn)
+    return _fiche_page(year, f"Équipe {team}",
+                       f"Horaire annuel vierge · Équipe {team} · SPF Justice",
+                       body, f"fiche_{offset}_{year}")
+
+@app.route("/fiche/agent/<aid>/<int:year>")
+def fiche_agent(aid, year):
+    """Fiche annuelle PERSONNELLE : horaire réel de l'agent avec ses
+    modifications (régime 4/5, congés, surcharges de poste, fériés)."""
+    data = load()
+    if aid not in data["agents"]:
+        return "Agent inconnu", 404
+    agent = data["agents"][aid]
+    team  = _FICHE_TEAM.get(agent.get("team_offset", 0), "?")
+
+    def day_fn(d):
+        info = get_day_info(d, aid, data)
+        base = info["base"]
+        code = info["code"]
+        if code in ("FERIE", "PONT"):                   # férié = poste réel affiché en bleu
+            return (base, 'b', False, info.get("label") or "Férié")
+        if code in LEAVE_CATALOG:                        # congé/absence réel = case grisée + code
+            return (code[:4], 'r', True, info.get("label") or code)
+        return (base, _SHIFT_CLASS.get(base, 'r'), False, info.get("label") or '')
+
+    body = _fiche_body(year, day_fn)
+    return _fiche_page(year, agent["name"],
+                       f"Horaire personnel · {agent['name']} · Équipe {team} · SPF Justice",
+                       body, f"fiche_agent_{aid}_{year}")
+
 @app.route("/api/events", methods=["POST"])
 def api_add_event():
     data = load()
@@ -1593,6 +1779,8 @@ select:focus,input:focus{border-color:var(--accent)}
       <button onclick="gotoToday()" style="margin-left:4px">Auj.</button>
       <button id="btn-week-toggle" onclick="toggleWeekMode()">📋 Semaine</button>
       <button id="btn-print" onclick="printMonth()" title="Imprimer les jours prestés (A4 PDF)" style="margin-left:8px;background:#1e40af;color:#fff;border:none;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:13px">🖨️ Imprimer</button>
+      <button id="btn-fiche-me" onclick="openFicheAgent()" title="Fiche annuelle de l'agent (avec ses congés, 4/5, modifications)" style="margin-left:4px;background:#0f766e;color:#fff;border:none;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:13px">📄 Ma fiche</button>
+      <button id="btn-fiche-blank" onclick="openFicheBlank()" title="Fiche annuelle vierge de l'équipe (cycle brut)" style="margin-left:4px;background:#64748b;color:#fff;border:none;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:13px">📄 Vierge</button>
     </div>
   </div>
   <!-- Barre agent — visible seulement sur tablette/mobile -->
@@ -1966,8 +2154,10 @@ function onLeaveCodeChange() {
 }
 
 // ── AGENTS ──
-function _applyTeamFilter(offset) {
+function _applyTeamFilter(offset, autoSelect = true) {
   // Filtre le dropdown agent sur l'équipe (offset) ou tous si offset=null
+  // autoSelect=true : sélectionne le 1er agent si aucun agent courant n'est dans l'équipe
+  // autoSelect=false : vide la sélection (bouton équipe = vue planning brut)
   const sel  = document.getElementById('agent-select');
   const selM = document.getElementById('agent-select-mobile');
   const prev = curAgent || sel.value || '';
@@ -1980,8 +2170,8 @@ function _applyTeamFilter(offset) {
       const o = document.createElement('option');
       o.value = id; o.textContent = a.name; s.appendChild(o);
     });
-    if(prev && agents[prev]) s.value = prev;
-    else if(Object.keys(agents).length > 0) s.value = Object.keys(agents)[0];
+    if(prev && agents[prev]) s.value = autoSelect ? prev : '';
+    else if(autoSelect && Object.keys(agents).length > 0) s.value = Object.keys(agents)[0];
     else s.value = '';
   });
   curAgent = sel.value;
@@ -2134,16 +2324,19 @@ function selectTeam(offset) {
   });
   const t = OFFSET_TO_TEAM[offset];
   document.getElementById('view-title').textContent = `Équipe ${t} — Calendrier`;
-  // Filtrer le dropdown sur l'équipe et auto-sélectionner le 1er agent de l'équipe
-  _applyTeamFilter(offset);
+  // Filtrer le dropdown sur l'équipe SANS auto-sélectionner un agent
+  // (le bouton équipe affiche le planning brut du PDF sans 4/5)
+  _applyTeamFilter(offset, false);
   updateAgentInfo(_allAgents);
-  if(!curAgent) {
-    document.getElementById('agent-info').textContent = '';
-    const aim = document.getElementById('agent-info-mobile');
-    if(aim) aim.textContent = '';
-    const ebar = document.getElementById('entitlements-bar');
-    if(ebar) ebar.style.display = 'none';
-  }
+  curAgent = '';
+  document.getElementById('agent-select').value = '';
+  const selM = document.getElementById('agent-select-mobile');
+  if(selM) selM.value = '';
+  document.getElementById('agent-info').textContent = '';
+  const aim = document.getElementById('agent-info-mobile');
+  if(aim) aim.textContent = '';
+  const ebar = document.getElementById('entitlements-bar');
+  if(ebar) ebar.style.display = 'none';
   refresh();
 }
 
@@ -2213,6 +2406,15 @@ async function deleteAgent(id) {
 function printMonth() {
   if(!curAgent){ toast('Sélectionnez un agent avant d\'imprimer','error'); return; }
   window.open('/print/'+curAgent+'/'+curYear+'/'+curMonth, '_blank');
+}
+
+function openFicheAgent() {
+  if(!curAgent){ toast('Sélectionnez un agent pour sa fiche personnelle','error'); return; }
+  window.open('/fiche/agent/'+curAgent+'/'+curYear, '_blank');
+}
+function openFicheBlank() {
+  const off = (curTeamOffset !== null) ? curTeamOffset : 0;
+  window.open('/fiche/'+off+'/'+curYear, '_blank');
 }
 
 async function resetAllData() {
