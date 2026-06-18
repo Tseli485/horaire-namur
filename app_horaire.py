@@ -187,7 +187,7 @@ def get_day_info(d: date, agent_id: str, data: dict) -> dict:
 
     # ── OVERRIDE MANUEL ───────────────────────────────────────────────────────
     shift_ov = data.get("shift_overrides", {}).get(agent_id, {}).get(d.isoformat())
-    if shift_ov in ("M", "S", "R"):
+    if shift_ov in ("M", "S", "R", "12H", "08H"):
         base = shift_ov
         decale_38 = False
         decale_r  = False
@@ -222,8 +222,9 @@ def get_day_info(d: date, agent_id: str, data: dict) -> dict:
             eff, code, label = 'R', 'REPOS-R',  'Repos (décalé ↓)'
 
     # ── COULEUR ───────────────────────────────────────────────────────────────
+    _BASE_COLOR = {"M": "red", "S": "orange", "12H": "purple", "08H": "teal"}
     if code is None:
-        color = "red" if base == "M" else ("orange" if base == "S" else "green")
+        color = _BASE_COLOR.get(base, "green")
     elif code in ("FERIE", "PONT"):
         color = "blue"
     else:
@@ -407,8 +408,8 @@ def api_shift_override(aid, date_str):
         save(data)
         return jsonify({"ok": True})
     shift = (request.json or {}).get("shift", "").upper()
-    if shift not in ("M", "S", "R"):
-        return jsonify({"error": "Shift invalide (M/S/R)"}), 400
+    if shift not in ("M", "S", "R", "12H", "08H"):
+        return jsonify({"error": "Shift invalide (M/S/R/12H/08H)"}), 400
     data["shift_overrides"].setdefault(aid, {})[date_str] = shift
     save(data)
     return jsonify({"ok": True, "shift": shift})
@@ -426,8 +427,8 @@ def print_month(aid, year, month):
     for d in range(1, days_in_month + 1):
         day_info = get_day_info(date(year, month, d), aid, data)
         day_info["remark"] = remarks.get(day_info["date"], "")
-        # Jour presté = poste de base M ou S, sans congé/événement posé
-        if day_info["base"] in ("M", "S") and day_info["code"] is None:
+        # Jour presté = poste travaillé (M/S/12H/08H), sans congé/événement posé
+        if day_info["base"] in ("M", "S", "12H", "08H") and day_info["code"] is None:
             worked_days.append(day_info)
     month_name = MONTH_NAMES_FR[month - 1]
     matin_count = sum(1 for d in worked_days if d["base"] == "M")
@@ -436,10 +437,11 @@ def print_month(aid, year, month):
                       "Jeu": "Jeudi", "Ven": "Vendredi", "Sam": "Samedi", "Dim": "Dimanche"}
     rows_html = ""
     for i, day in enumerate(worked_days, 1):
-        is_matin = day["base"] == "M"
-        pill_label = "MATIN" if is_matin else "SOIR"
-        pill_bg    = "#dbeafe" if is_matin else "#ffedd5"
-        pill_color = "#1e40af" if is_matin else "#9a3412"
+        _pill = {"M": ("MATIN", "#dbeafe", "#1e40af"),
+                 "S": ("SOIR",  "#ffedd5", "#9a3412"),
+                 "12H": ("12H", "#ede9fe", "#6d28d9"),
+                 "08H": ("08H", "#ccfbf1", "#0f766e")}
+        pill_label, pill_bg, pill_color = _pill.get(day["base"], ("SOIR", "#ffedd5", "#9a3412"))
         remark_txt = day.get("remark", "")
         full_name  = day_names_full.get(day["day_name"], day["day_name"])
         rows_html += (
@@ -508,54 +510,64 @@ def print_month(aid, year, month):
     )
     return Response(page_html, mimetype='text/html; charset=utf-8')
 
-# ── FICHE ANNUELLE INTERACTIVE (12 mois en colonnes, cases C) ──────────────
+# ── FICHE ANNUELLE INTERACTIVE (6 mois en haut + 6 en bas, A4 portrait) ─────
 _FICHE_TEAM = {0: 4, 7: 8, 14: 1, 21: 5, 28: 2, 35: 6, 42: 3, 49: 7}
-_SHIFT_CLASS = {'M': 'm', 'S': 's', 'R': 'r', '36': 'r', '38': 'r'}
+
+# Postes TRAVAILLÉS (colorés) ; tout le reste (R/36/38/congé) = grisé
+def _poste_kind(p):
+    """Classe CSS du poste : m/s/w12/w08 = travaillé (coloré), off = grisé."""
+    if p == 'M':   return 'm'
+    if p == 'S':   return 's'
+    if p == '12H': return 'w12'
+    if p == '08H': return 'w08'
+    return 'off'   # R, 36, 38, congés, 4/5… -> grisé
 
 _FICHE_CSS = """
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Segoe UI',Arial,sans-serif;background:#475569;color:#0f172a;padding:14px}
-.sheet{background:#fff;width:297mm;min-height:210mm;margin:0 auto;padding:8mm 7mm;
+.sheet{background:#fff;width:210mm;min-height:297mm;margin:0 auto;padding:8mm 7mm;
   box-shadow:0 4px 24px rgba(0,0,0,.35);border-radius:4px}
 .hdr{display:flex;justify-content:space-between;align-items:flex-end;
-  border-bottom:3px solid #1e40af;padding-bottom:7px;margin-bottom:9px}
-.hdr h1{font-size:18pt;color:#1e40af;font-weight:800;letter-spacing:.3px}
-.hdr .sub{font-size:9pt;color:#64748b;margin-top:2px}
-.legend{display:flex;gap:12px;align-items:center;font-size:8pt;color:#475569}
-.legend .b{display:inline-flex;align-items:center;gap:4px}
-.legend .sw{width:13px;height:13px;border-radius:3px;display:inline-block}
-.sw.m{background:#fecaca}.sw.s{background:#fed7aa}.sw.r{background:#bbf7d0}
-.sw.bl{background:#dbeafe}.sw.cg{background:#9ca3af}
-table{width:100%;border-collapse:collapse;table-layout:fixed}
-th{background:#1e40af;color:#fff;font-size:8.5pt;font-weight:700;padding:4px 2px;
-  text-transform:uppercase;letter-spacing:.3px;border:1px solid #1e3a8a}
-td{border:1px solid #e2e8f0;height:7.0mm;padding:0 2px;vertical-align:middle}
+  border-bottom:3px solid #1e40af;padding-bottom:6px;margin-bottom:7px}
+.hdr h1{font-size:15pt;color:#1e40af;font-weight:800;letter-spacing:.3px}
+.hdr .sub{font-size:8pt;color:#64748b;margin-top:2px}
+.legend{display:flex;gap:9px;align-items:center;font-size:7.5pt;color:#475569;flex-wrap:wrap;justify-content:flex-end}
+.legend .b{display:inline-flex;align-items:center;gap:3px}
+.legend .sw{width:11px;height:11px;border-radius:3px;display:inline-block}
+.sw.m{background:#fecaca}.sw.s{background:#fed7aa}
+.sw.w12{background:#ddd6fe}.sw.w08{background:#99f6e4}.sw.off{background:#cbd5e1}
+table{width:100%;border-collapse:collapse;table-layout:fixed;margin-bottom:5mm}
+table.b2{margin-bottom:0}
+th{background:#1e40af;color:#fff;font-size:8pt;font-weight:700;padding:3px 2px;
+  text-transform:uppercase;letter-spacing:.2px;border:1px solid #1e3a8a}
+td{border:1px solid #e2e8f0;height:3.7mm;padding:0 3px;vertical-align:middle;
+  white-space:nowrap;overflow:hidden}
 td.empty{background:#f8fafc}
 td.d{font-size:7pt;line-height:1}
-td.d .dn{display:inline-block;width:20px;color:#94a3b8;font-size:6pt}
-td.d .num{display:inline-block;width:14px;text-align:right;font-weight:700;font-size:7pt}
-td.d .pose{display:inline-block;width:18px;text-align:center;font-weight:800;
-  border-radius:3px;padding:1px 0;margin:0 3px;font-size:7pt}
+td.d .dn{display:inline-block;width:22px;color:#94a3b8;font-size:6.5pt}
+td.d .num{display:inline-block;width:15px;text-align:right;font-weight:700;font-size:7pt}
+td.d .pose{display:inline-block;min-width:16px;text-align:center;font-weight:800;
+  border-radius:3px;padding:1px 4px;margin:0 4px;font-size:7pt}
+/* POSTES TRAVAILLÉS = colorés */
 td.m .pose{background:#fee2e2;color:#b91c1c}
 td.s .pose{background:#ffedd5;color:#c2410c}
-td.r .pose{background:#dcfce7;color:#15803d}
-td.b .pose{background:#dbeafe;color:#1d4ed8}
-td.d.we{background:#f1f5f9}
-/* CONGÉ RÉEL (depuis l'horaire de l'agent) -> case grisée avec code */
-td.d.leave{background:#9ca3af}
-td.d.leave .pose{background:#4b5563;color:#fff;width:auto;min-width:18px;padding:1px 3px}
-td.d.leave .dn,td.d.leave .num{color:#e5e7eb}
-td.d .c{vertical-align:middle;cursor:pointer;width:11px;height:11px;accent-color:#1e40af}
-/* CASE C MANUELLE COCHÉE -> grise UNIQUEMENT cette case du mois */
-td.d.on{background:#9ca3af!important}
-td.d.on .pose{background:transparent!important;color:#374151!important}
-td.d.on .dn,td.d.on .num{color:#4b5563}
-.bar{max-width:297mm;margin:0 auto 12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+td.w12 .pose{background:#ede9fe;color:#6d28d9}
+td.w08 .pose{background:#ccfbf1;color:#0f766e}
+/* TOUT LE RESTE (R/36/38/congé/4-5) = case grisée */
+td.off{background:#cbd5e1}
+td.off .pose{background:transparent;color:#334155}
+td.off .dn,td.off .num{color:#64748b}
+td.d .c{vertical-align:middle;cursor:pointer;width:11px;height:11px;accent-color:#1e40af;margin-left:2px}
+/* CASE C MANUELLE COCHÉE -> grise cette case */
+td.d.on{background:#cbd5e1!important}
+td.d.on .pose{background:transparent!important;color:#334155!important}
+td.d.on .dn,td.d.on .num{color:#64748b}
+.bar{max-width:210mm;margin:0 auto 12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .bar button{background:#1e40af;color:#fff;border:none;border-radius:7px;
   padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer}
 .bar button.ghost{background:#fff;color:#1e40af;border:1px solid #1e40af}
 .bar .yr{margin-left:auto;font-size:13px;color:#e2e8f0}
-@page{size:A4 landscape;margin:6mm}
+@page{size:A4 portrait;margin:8mm}
 @media print{
   body{background:#fff;padding:0}
   .bar{display:none}
@@ -586,25 +598,24 @@ function clearAll(){
 document.addEventListener('DOMContentLoaded', load);
 """
 
-def _fiche_body(year, day_fn):
-    """Construit le corps 31 lignes x 12 mois. day_fn(d) -> (badge, cls, leave, title)."""
+def _fiche_block(year, months, day_fn, css_cls=''):
+    """Un bloc de 6 mois (6 colonnes x 31 lignes). day_fn(d)->(badge,kind,title)."""
+    head = "".join(f'<th>{MONTH_NAMES_FR[m-1].capitalize()}</th>' for m in months)
     rows = []
     for day in range(1, 32):
         tds = []
-        for m in range(1, 13):
+        for m in months:
             try:
                 d = date(year, m, day)
             except ValueError:
                 tds.append('<td class="empty"></td>')
                 continue
-            badge, cls, leave, title = day_fn(d)
-            dn = DAY_NAMES_FR[d.weekday()]
-            we = ' we' if d.weekday() >= 5 else ''
-            lv = ' leave' if leave else ''
+            badge, kind, title = day_fn(d)
+            dn  = DAY_NAMES_FR[d.weekday()]
             key = f'{m}-{day}'
-            t = f' title="{title}"' if title else ''
+            t   = f' title="{title}"' if title else ''
             tds.append(
-                f'<td class="d {cls}{we}{lv}" data-k="{key}"{t}>'
+                f'<td class="d {kind}" data-k="{key}"{t}>'
                 f'<span class="dn">{dn}</span>'
                 f'<span class="num">{day}</span>'
                 f'<span class="pose">{badge}</span>'
@@ -613,13 +624,13 @@ def _fiche_body(year, day_fn):
                 f'</td>'
             )
         rows.append(f'<tr>{"".join(tds)}</tr>')
-    return "".join(rows)
+    return (f'<table class="{css_cls}"><thead><tr>{head}</tr></thead>'
+            f'<tbody>{"".join(rows)}</tbody></table>')
 
-def _fiche_page(year, title_html, subtitle, body_html, storage_key):
-    """Assemble la page complète (présentation identique pour vierge et agent)."""
-    head_cells = "".join(
-        f'<th>{MONTH_NAMES_FR[m].capitalize()}</th>' for m in range(12)
-    )
+def _fiche_page(year, title_html, subtitle, day_fn, storage_key):
+    """Page complète : 6 premiers mois en haut, 6 derniers en bas (A4 portrait)."""
+    block_top = _fiche_block(year, [1, 2, 3, 4, 5, 6],  day_fn, 'b1')
+    block_bot = _fiche_block(year, [7, 8, 9, 10, 11, 12], day_fn, 'b2')
     js = _FICHE_JS.replace("STORAGEKEY", storage_key)
     html = (
         '<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8">'
@@ -638,15 +649,11 @@ def _fiche_page(year, title_html, subtitle, body_html, storage_key):
         '<div class="legend">'
         '<span class="b"><span class="sw m"></span>Matin</span>'
         '<span class="b"><span class="sw s"></span>Soir</span>'
-        '<span class="b"><span class="sw r"></span>Repos</span>'
-        '<span class="b"><span class="sw bl"></span>Férié</span>'
-        '<span class="b"><span class="sw cg"></span>Congé</span>'
+        '<span class="b"><span class="sw w12"></span>12H</span>'
+        '<span class="b"><span class="sw w08"></span>08H</span>'
+        '<span class="b"><span class="sw off"></span>Repos / Congé</span>'
         '</div></div>'
-        '<table><thead><tr>'
-        + head_cells +
-        '</tr></thead><tbody>'
-        + body_html +
-        '</tbody></table>'
+        + block_top + block_bot +
         '</div>'
         f'<script>{js}</script>'
         '</body></html>'
@@ -662,17 +669,17 @@ def fiche_blank(offset, year):
 
     def day_fn(d):
         sh = get_shift(d, offset)
-        return (sh, _SHIFT_CLASS.get(sh, 'r'), False, '')
+        return (sh, _poste_kind(sh), '')
 
-    body = _fiche_body(year, day_fn)
     return _fiche_page(year, f"Équipe {team}",
                        f"Horaire annuel vierge · Équipe {team} · SPF Justice",
-                       body, f"fiche_{offset}_{year}")
+                       day_fn, f"fiche_{offset}_{year}")
 
 @app.route("/fiche/agent/<aid>/<int:year>")
 def fiche_agent(aid, year):
     """Fiche annuelle PERSONNELLE : horaire réel de l'agent avec ses
-    modifications (régime 4/5, congés, surcharges de poste, fériés)."""
+    modifications (régime 4/5, congés, surcharges de poste, fériés).
+    Tout ce qui n'est pas un poste travaillé (M/S/12H/08H) est grisé."""
     data = load()
     if aid not in data["agents"]:
         return "Agent inconnu", 404
@@ -683,16 +690,21 @@ def fiche_agent(aid, year):
         info = get_day_info(d, aid, data)
         base = info["base"]
         code = info["code"]
-        if code in ("FERIE", "PONT"):                   # férié = poste réel affiché en bleu
-            return (base, 'b', False, info.get("label") or "Férié")
-        if code in LEAVE_CATALOG:                        # congé/absence réel = case grisée + code
-            return (code[:4], 'r', True, info.get("label") or code)
-        return (base, _SHIFT_CLASS.get(base, 'r'), False, info.get("label") or '')
+        # Férié/pont : afficher le POSTE RÉEL (travaillé->coloré, repos->grisé).
+        # (FERIE/PONT sont aussi des clés du catalogue -> traités AVANT la branche congé)
+        if code in ("FERIE", "PONT"):
+            return (base, _poste_kind(base), info.get("label") or "Férié")
+        if code in LEAVE_CATALOG:                 # congé/absence -> grisé + code
+            return (code[:4], 'off', info.get("label") or code)
+        if code == '4/5':                         # jour 4/5 -> grisé, marqué 4/5
+            return ('4/5', 'off', 'Régime 4/5')
+        # Postes (M/S/12H/08H travaillés -> colorés ; R/36/38 -> grisés)
+        title = info.get("label") or ''
+        return (base, _poste_kind(base), title)
 
-    body = _fiche_body(year, day_fn)
     return _fiche_page(year, agent["name"],
                        f"Horaire personnel · {agent['name']} · Équipe {team} · SPF Justice",
-                       body, f"fiche_agent_{aid}_{year}")
+                       day_fn, f"fiche_agent_{aid}_{year}")
 
 @app.route("/api/events", methods=["POST"])
 def api_add_event():
@@ -1149,7 +1161,8 @@ def api_day(aid, date_str):
     cycle_pos = (delta - offset) % CYCLE_LEN
     mon = d - timedelta(days=d.weekday())
     week = [get_day_info(mon + timedelta(i), aid, data) for i in range(7)]
-    shift_hours = {"M": "06:00 – 14:00", "S": "14:00 – 22:00"}.get(info["base"], "Hors service")
+    shift_hours = {"M": "06:00 – 14:00", "S": "14:00 – 22:00",
+                   "12H": "07:00 – 19:00", "08H": "08:00 – 16:00"}.get(info["base"], "Hors service")
     shift_overridden = date_str in data.get("shift_overrides", {}).get(aid, {})
     return jsonify({**info,
         "week": week,
@@ -1297,6 +1310,8 @@ select:focus,input:focus{border-color:var(--accent)}
 .b-green {border-left-color:#4ade80}
 .b-blue  {border-left-color:#60a5fa}
 .b-purple{border-left-color:#c084fc}
+.b-violet{border-left-color:#a78bfa}
+.b-teal  {border-left-color:#2dd4bf}
 
 /* Fonds tintés des cellules */
 .c-red   {background:rgba(239,68,68,.14)!important}
@@ -1304,6 +1319,8 @@ select:focus,input:focus{border-color:var(--accent)}
 .c-green {background:rgba(34,197,94,.10)!important}
 .c-blue  {background:rgba(59,130,246,.14)!important}
 .c-purple{background:rgba(168,85,247,.12)!important}
+.c-violet{background:rgba(139,92,246,.16)!important}
+.c-teal  {background:rgba(20,184,166,.16)!important}
 
 /* Pills plus opaques */
 .p-red   {background:rgba(239,68,68,.35);color:#fca5a5;font-weight:900}
@@ -1311,6 +1328,8 @@ select:focus,input:focus{border-color:var(--accent)}
 .p-green {background:rgba(34,197,94,.30);color:#86efac;font-weight:900}
 .p-blue  {background:rgba(59,130,246,.35);color:#93c5fd;font-weight:900}
 .p-purple{background:rgba(168,85,247,.30);color:#d8b4fe;font-weight:900}
+.p-violet{background:rgba(139,92,246,.35);color:#c4b5fd;font-weight:900}
+.p-teal  {background:rgba(20,184,166,.35);color:#5eead4;font-weight:900}
 
 /* Numéros colorés par type */
 .n-red   .day-num{color:#f87171}
@@ -1318,6 +1337,8 @@ select:focus,input:focus{border-color:var(--accent)}
 .n-green  .day-num{color:#4ade80}
 .n-blue   .day-num{color:#93c5fd}
 .n-purple .day-num{color:#c084fc}
+.n-violet .day-num{color:#a78bfa}
+.n-teal   .day-num{color:#2dd4bf}
 /* today override : cercle blanc brillant */
 .cal-day.today .day-num{color:#fff!important}
 
@@ -1602,6 +1623,8 @@ select:focus,input:focus{border-color:var(--accent)}
 .shift-btn:hover{border-color:var(--accent)}
 .shift-btn.sb-matin{border-color:#ef4444;color:#fca5a5}
 .shift-btn.sb-soir{border-color:#f97316;color:#fdba74}
+.shift-btn.sb-h12{border-color:#8b5cf6;color:#c4b5fd}
+.shift-btn.sb-h08{border-color:#14b8a6;color:#5eead4}
 .shift-btn.sb-repos{border-color:#22c55e;color:#86efac}
 .shift-btn.sb-reset{border-color:var(--muted);color:var(--muted);font-size:11px}
 .shift-btn.sb-active{opacity:1;font-size:14px}
@@ -1995,6 +2018,8 @@ select:focus,input:focus{border-color:var(--accent)}
       <div class="shift-btn-group" id="dm-shift-btns">
         <button class="shift-btn sb-matin" id="sb-M" onclick="setShiftOverride('M')">🌅 MATIN</button>
         <button class="shift-btn sb-soir" id="sb-S" onclick="setShiftOverride('S')">🌆 SOIR</button>
+        <button class="shift-btn sb-h12" id="sb-12H" onclick="setShiftOverride('12H')">🕛 12H</button>
+        <button class="shift-btn sb-h08" id="sb-08H" onclick="setShiftOverride('08H')">🕗 08H</button>
         <button class="shift-btn sb-repos" id="sb-R" onclick="setShiftOverride('R')">🛌 REPOS</button>
         <button class="shift-btn sb-reset" id="sb-reset" onclick="resetShiftOverride()" title="Restaurer le poste original du cycle">↩ Original</button>
       </div>
@@ -2603,6 +2628,10 @@ async function renderWeekView() {
       bCls='b-red'; cCls='c-red'; pCls='p-red'; pillTxt='Matin'; hours=day.shift_hours||'06:00 – 14:00';
     } else if(base==='S'){
       bCls='b-orange'; cCls='c-orange'; pCls='p-orange'; pillTxt='Soir'; hours=day.shift_hours||'14:00 – 22:00';
+    } else if(base==='12H'){
+      bCls='b-violet'; cCls='c-violet'; pCls='p-violet'; pillTxt='12H'; hours=day.shift_hours||'07:00 – 19:00';
+    } else if(base==='08H'){
+      bCls='b-teal'; cCls='c-teal'; pCls='p-teal'; pillTxt='08H'; hours=day.shift_hours||'08:00 – 16:00';
     } else if(base==='36'||base==='38'){
       bCls='b-purple'; cCls='c-purple'; pCls='p-purple'; pillTxt='Repos '+base;
     }
@@ -2961,6 +2990,10 @@ function renderGrid(cal) {
       bCls='b-red';    cCls='c-red';    nCls='n-red';    pCls='p-red';    pillTxt='MATIN';
     } else if(base==='S'){
       bCls='b-orange'; cCls='c-orange'; nCls='n-orange'; pCls='p-orange'; pillTxt='SOIR';
+    } else if(base==='12H'){
+      bCls='b-violet'; cCls='c-violet'; nCls='n-violet'; pCls='p-violet'; pillTxt='12H';
+    } else if(base==='08H'){
+      bCls='b-teal';   cCls='c-teal';   nCls='n-teal';   pCls='p-teal';   pillTxt='08H';
     } else if(base==='36'||base==='38'){
       bCls='b-purple'; cCls='c-purple'; nCls='n-purple'; pCls='p-purple'; pillTxt='REPOS '+base;
     } else {
@@ -3083,8 +3116,10 @@ const COLOR_MAP={
   orange:{bg:'rgba(249,115,22,.15)',border:'#f97316',text:'#fdba74'},
   green: {bg:'rgba(34,197,94,.15)', border:'#22c55e',text:'#86efac'},
   blue:  {bg:'rgba(59,130,246,.15)',border:'#3b82f6',text:'#93c5fd'},
+  purple:{bg:'rgba(139,92,246,.15)',border:'#8b5cf6',text:'#c4b5fd'},
+  teal:  {bg:'rgba(20,184,166,.15)',border:'#14b8a6',text:'#5eead4'},
 };
-const SHIFT_FULL={M:'MATIN',S:'SOIR',R:'REPOS','36':'REPOS-36','38':'REPOS-38'};
+const SHIFT_FULL={M:'MATIN',S:'SOIR','12H':'JOUR 12H','08H':'JOUR 08H',R:'REPOS','36':'REPOS-36','38':'REPOS-38'};
 const DAY_FR=['Lundi','Mardi','Mercredi','Jeudi','Vendredi','Samedi','Dimanche'];
 const MO_FR=['janvier','février','mars','avril','mai','juin','juillet','août','septembre','octobre','novembre','décembre'];
 
@@ -3166,7 +3201,7 @@ async function renderDayModal(dateStr) {
 
   // Shift override buttons — surligner le poste actuel
   const curBase = d.base; // poste effectif (peut être override)
-  ['M','S','R'].forEach(s=>{
+  ['M','S','12H','08H','R'].forEach(s=>{
     const btn=document.getElementById('sb-'+s);
     if(btn) btn.classList.toggle('sb-active', curBase===s);
   });
@@ -3182,8 +3217,8 @@ async function setShiftOverride(shift) {
     body:JSON.stringify({shift:shift})
   });
   if(r.ok){
-    const labels={M:'MATIN 🌅',S:'SOIR 🌆',R:'REPOS 🛌'};
-    toast('Poste changé : '+labels[shift],'ok');
+    const labels={M:'MATIN 🌅',S:'SOIR 🌆','12H':'12H 🕛','08H':'08H 🕗',R:'REPOS 🛌'};
+    toast('Poste changé : '+(labels[shift]||shift),'ok');
     await renderDayModal(_dayDate);
     renderCalendar();
   } else toast('Erreur','error');
@@ -3317,7 +3352,7 @@ function renderExchangeBalance(balance) {
   area.innerHTML = html;
 }
 
-const POSTE_COLORS={M:'var(--red)',S:'var(--orange)',R:'var(--green)'};
+const POSTE_COLORS={M:'var(--red)',S:'var(--orange)','12H':'#a78bfa','08H':'#2dd4bf',R:'var(--green)'};
 function posteTag(p){ if(!p)return''; const c=POSTE_COLORS[p]||'var(--muted)'; return `<span style="font-size:11px;font-weight:800;color:${c};margin-left:4px">${p}</span>`;}
 
 function renderExchangeList(exs, filter) {
