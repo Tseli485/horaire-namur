@@ -13,50 +13,130 @@ from calendar import monthrange, isleap
 from pathlib import Path
 
 from flask import Flask, jsonify, request, Response, session
+from werkzeug.security import generate_password_hash, check_password_hash
 
 from horaire_agent import get_shift, MONTH_NAMES_FR, DAY_NAMES_FR, CYCLE_LEN, ANCHOR
 from conges_bosa import LEAVE_CATALOG, get_public_holidays, get_vac_entitlement, get_sick_capital
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24))
-_APP_PIN = os.environ.get("APP_PIN", "")   # vide = pas d'auth (dev local)
 _data_dir = Path(os.environ.get("DATA_DIR", str(Path(__file__).parent)))
 DATA_FILE  = _data_dir / "agenda_data.json"
 
-# ── Auth ──────────────────────────────────────────────────────
-def _auth_required():
-    """Retourne True si l'auth est active et l'utilisateur non connecté."""
-    if not _APP_PIN:
-        return False
-    return not session.get("auth")
+def _persistent_secret_key():
+    """Clé de session stable entre redémarrages (sinon tout le monde est
+    déconnecté à chaque reload). Priorité à la variable d'env SECRET_KEY,
+    sinon clé générée une fois et conservée dans DATA_DIR/.secret_key."""
+    env = os.environ.get("SECRET_KEY")
+    if env:
+        return env
+    kp = _data_dir / ".secret_key"
+    try:
+        if kp.exists():
+            return kp.read_text(encoding="utf-8").strip()
+        k = os.urandom(32).hex()
+        _data_dir.mkdir(parents=True, exist_ok=True)
+        kp.write_text(k, encoding="utf-8")
+        return k
+    except Exception:
+        return os.urandom(32)
+
+app.secret_key = _persistent_secret_key()
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
+                  PERMANENT_SESSION_LIFETIME=60 * 60 * 24 * 30)  # 30 jours
+
+# ── Auth PAR AGENT (chacun son PIN, accès à son seul horaire) ──────────────
+# Chaque agent possède un pin_hash. La connexion ouvre une session liée à son
+# identifiant ; toute route comportant <aid> est verrouillée sur l'agent connecté.
+_PUBLIC_PATHS = {"/", "/manifest.json", "/icon.svg", "/dev-version",
+                 "/api/auth/login", "/api/auth/register", "/api/auth/me", "/api/auth/logout"}
+
+def current_aid():
+    return session.get("agent_id")
 
 @app.before_request
 def check_auth():
-    pub = {"/", "/manifest.json", "/icon.svg", "/dev-version", "/api/login", "/api/logout"}
-    if request.path in pub or request.path.startswith("/static"):
+    p = request.path
+    if p in _PUBLIC_PATHS or p.startswith("/static"):
         return
-    # iCal public (accès Google Agenda sans session)
-    if request.path.startswith("/ical/"):
-        return
-    if _auth_required():
+    aid = current_aid()
+    if not aid:
         return jsonify({"error": "Non autorisé", "login_required": True}), 401
+    # Propriété : une route avec <aid> ne peut viser QUE l'agent connecté
+    route_aid = (request.view_args or {}).get("aid")
+    if route_aid is not None and route_aid != aid:
+        return jsonify({"error": "Accès interdit à l'horaire d'un autre agent"}), 403
 
-@app.route("/api/login", methods=["POST"])
-def api_login():
-    if not _APP_PIN:
-        session["auth"] = True
-        return jsonify({"ok": True})
-    pin = (request.json or {}).get("pin", "")
-    import hmac
-    if hmac.compare_digest(str(pin), _APP_PIN):
-        session["auth"] = True
-        return jsonify({"ok": True})
-    return jsonify({"error": "PIN incorrect"}), 403
+@app.route("/api/auth/register", methods=["POST"])
+def api_register():
+    """Crée un compte agent avec son PIN et ouvre la session."""
+    data = load()
+    body = request.json or {}
+    aid  = (body.get("id") or "").strip().upper()
+    name = (body.get("name") or "").strip()
+    pin  = str(body.get("pin") or "")
+    if not _AID_RE.match(aid):
+        return jsonify({"error": "Identifiant invalide (lettres/chiffres, 1-64)"}), 400
+    if aid in data["agents"]:
+        return jsonify({"error": "Cet identifiant existe déjà — choisissez-en un autre"}), 409
+    if not name:
+        return jsonify({"error": "Nom obligatoire"}), 400
+    if len(pin) < 4:
+        return jsonify({"error": "PIN trop court (4 chiffres minimum)"}), 400
+    r45 = body.get("regime_4_5")
+    data["agents"][aid] = {
+        "name":         name,
+        "birth_date":   body.get("birth_date") or None,
+        "career_start": body.get("career_start") or None,
+        "team_offset":  int(body.get("offset", 0)),
+        "regime_4_5":   int(r45) if r45 not in (None, "") else None,
+        "pin_hash":     generate_password_hash(pin),
+    }
+    save(data)
+    session.permanent = True
+    session["agent_id"] = aid
+    return jsonify({"ok": True, "id": aid})
 
-@app.route("/api/logout", methods=["POST"])
-def api_logout():
+@app.route("/api/auth/login", methods=["POST"])
+def api_auth_login():
+    """Connexion : identifiant + PIN."""
+    data = load()
+    body = request.json or {}
+    aid  = (body.get("id") or "").strip().upper()
+    pin  = str(body.get("pin") or "")
+    ag = data["agents"].get(aid)
+    if not ag:
+        return jsonify({"error": "Identifiant ou PIN incorrect"}), 403
+    ph = ag.get("pin_hash")
+    if not ph:
+        # Agent existant sans PIN (ancienne donnée) : le 1er PIN saisi le définit
+        ag["pin_hash"] = generate_password_hash(pin)
+        save(data)
+    elif not check_password_hash(ph, pin):
+        return jsonify({"error": "Identifiant ou PIN incorrect"}), 403
+    session.permanent = True
+    session["agent_id"] = aid
+    return jsonify({"ok": True, "id": aid})
+
+@app.route("/api/auth/logout", methods=["POST"])
+def api_auth_logout():
     session.clear()
     return jsonify({"ok": True})
+
+@app.route("/api/auth/me")
+def api_auth_me():
+    """Renvoie l'agent connecté (ou logged_in=False)."""
+    aid = current_aid()
+    if not aid:
+        return jsonify({"logged_in": False})
+    ag = load()["agents"].get(aid)
+    if not ag:
+        session.clear()
+        return jsonify({"logged_in": False})
+    return jsonify({"logged_in": True, "id": aid, "name": ag["name"],
+                    "team_offset": ag.get("team_offset", 0),
+                    "regime_4_5": ag.get("regime_4_5"),
+                    "birth_date": ag.get("birth_date"),
+                    "career_start": ag.get("career_start")})
 
 # ─────────────────────── ROOT + PWA ──────────────────────────
 @app.route("/")
@@ -239,40 +319,29 @@ def get_day_info(d: date, agent_id: str, data: dict) -> dict:
 # ─────────────────────── API ROUTES ──────────────────────────
 @app.route("/api/agents", methods=["GET"])
 def api_agents():
-    return jsonify(load()["agents"])
+    """Ne renvoie QUE l'agent connecté (isolation des données), sans le pin_hash."""
+    aid = current_aid()
+    ag  = load()["agents"].get(aid)
+    if not ag:
+        return jsonify({})
+    return jsonify({aid: {k: v for k, v in ag.items() if k != "pin_hash"}})
 
 @app.route("/api/reset", methods=["POST"])
 def api_reset():
-    """Remet toutes les données à zéro — confirmation explicite requise."""
-    if (request.json or {}).get("confirm") != "RESET":
-        return jsonify({"error": 'Envoyer {"confirm":"RESET"} pour confirmer'}), 400
-    empty = {"agents": {}, "events": [], "reliquats": {}, "capitals": {}, "exchanges": [], "remarks": {}, "shift_overrides": {}}
-    save(empty)
-    return jsonify({"ok": True})
+    """Désactivé en mode multi-agents (protège les données des autres)."""
+    return jsonify({"error": "Réinitialisation désactivée en mode multi-agents"}), 403
 
 import re as _re
 _AID_RE = _re.compile(r'^[a-zA-Z0-9_\-]{1,64}$')
 
 @app.route("/api/agents", methods=["POST"])
 def api_add_agent():
-    data = load()
-    body = request.json
-    aid  = body["id"]
-    if not _AID_RE.match(str(aid)):
-        return jsonify({"error": "ID agent invalide"}), 400
-    r45  = body.get("regime_4_5")
-    data["agents"][aid] = {
-        "name":         body["name"],
-        "birth_date":   body.get("birth_date") or None,
-        "career_start": body.get("career_start") or None,
-        "team_offset":  int(body.get("offset", 0)),
-        "regime_4_5":   int(r45) if r45 is not None and r45 != "" else None,
-    }
-    save(data)
-    return jsonify({"ok": True, "id": aid})
+    """Création de compte : passer par /api/auth/register (avec PIN)."""
+    return jsonify({"error": "Utilisez la création de compte (avec PIN)"}), 403
 
 @app.route("/api/agents/<aid>", methods=["PATCH"])
 def api_patch_agent(aid):
+    # Propriété déjà vérifiée par check_auth (aid == agent connecté)
     data = load()
     if aid not in data["agents"]:
         return jsonify({"error": "Agent inconnu"}), 404
@@ -286,8 +355,13 @@ def api_patch_agent(aid):
         data["agents"][aid]["career_start"] = body["career_start"] or None
     if "team_offset" in body:
         data["agents"][aid]["team_offset"] = int(body["team_offset"])
+    if body.get("pin"):                       # changement de PIN
+        if len(str(body["pin"])) < 4:
+            return jsonify({"error": "PIN trop court (4 chiffres minimum)"}), 400
+        data["agents"][aid]["pin_hash"] = generate_password_hash(str(body["pin"]))
     save(data)
-    return jsonify({"ok": True, "agent": data["agents"][aid]})
+    ag = {k: v for k, v in data["agents"][aid].items() if k != "pin_hash"}
+    return jsonify({"ok": True, "agent": ag})
 
 @app.route("/api/agents/<aid>", methods=["DELETE"])
 def api_del_agent(aid):
@@ -1724,20 +1798,50 @@ select:focus,input:focus{border-color:var(--accent)}
 </head>
 <body>
 
-<!-- LOGIN MODAL -->
-<div id="login-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:9999;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:16px">
-  <div style="background:#1e293b;border:1px solid #334155;border-radius:16px;padding:36px 40px;max-width:340px;width:90%;text-align:center">
-    <div style="font-size:2rem;margin-bottom:8px">🏛</div>
-    <h2 style="color:#f1f5f9;margin:0 0 4px">HoraireManager</h2>
-    <p style="color:#94a3b8;font-size:.85rem;margin:0 0 24px">Prison de Namur — SPF Justice</p>
-    <input id="pin-input" type="password" inputmode="numeric" placeholder="Code PIN" maxlength="20"
-      style="width:100%;padding:12px;border-radius:8px;border:1px solid #475569;background:#0f172a;color:#f1f5f9;font-size:1.1rem;text-align:center;box-sizing:border-box"
-      onkeydown="if(event.key==='Enter')doLogin()">
-    <button onclick="doLogin()"
-      style="margin-top:14px;width:100%;padding:12px;border-radius:8px;background:#3b82f6;color:#fff;font-weight:700;font-size:1rem;border:none;cursor:pointer">
+<!-- AUTH OVERLAY (connexion / création de compte par agent) -->
+<div id="login-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.88);z-index:9999;align-items:center;justify-content:center;flex-direction:column">
+  <div style="background:#1e293b;border:1px solid #334155;border-radius:16px;padding:28px 30px;max-width:380px;width:92%;text-align:center;box-sizing:border-box">
+    <div style="font-size:2rem;margin-bottom:4px">🏛</div>
+    <h2 style="color:#f1f5f9;margin:0 0 2px">HoraireManager</h2>
+    <p style="color:#94a3b8;font-size:.78rem;margin:0 0 18px">Prison de Namur — SPF Justice</p>
+    <div style="display:flex;gap:6px;margin-bottom:16px">
+      <button id="tab-login" onclick="authMode('login')"
+        style="flex:1;padding:9px;border-radius:8px;border:none;cursor:pointer;font-weight:700;background:#3b82f6;color:#fff">Connexion</button>
+      <button id="tab-register" onclick="authMode('register')"
+        style="flex:1;padding:9px;border-radius:8px;border:1px solid #475569;cursor:pointer;font-weight:700;background:transparent;color:#94a3b8">Créer un compte</button>
+    </div>
+    <input id="auth-id" placeholder="Identifiant (ex: TSE)" maxlength="64" autocomplete="off"
+      style="width:100%;padding:11px;border-radius:8px;border:1px solid #475569;background:#0f172a;color:#f1f5f9;font-size:1rem;box-sizing:border-box;margin-bottom:10px"
+      onkeydown="if(event.key==='Enter')doAuth()">
+    <input id="auth-pin" type="password" inputmode="numeric" placeholder="Code PIN" maxlength="20"
+      style="width:100%;padding:11px;border-radius:8px;border:1px solid #475569;background:#0f172a;color:#f1f5f9;font-size:1rem;text-align:center;box-sizing:border-box;margin-bottom:10px"
+      onkeydown="if(event.key==='Enter')doAuth()">
+    <div id="register-fields" style="display:none">
+      <input id="auth-name" placeholder="Prénom NOM" maxlength="60"
+        style="width:100%;padding:11px;border-radius:8px;border:1px solid #475569;background:#0f172a;color:#f1f5f9;font-size:1rem;box-sizing:border-box;margin-bottom:10px">
+      <select id="auth-offset"
+        style="width:100%;padding:11px;border-radius:8px;border:1px solid #475569;background:#0f172a;color:#f1f5f9;font-size:1rem;box-sizing:border-box;margin-bottom:10px">
+        <option value="14">Équipe 1</option><option value="28">Équipe 2</option>
+        <option value="42">Équipe 3</option><option value="0">Équipe 4</option>
+        <option value="21">Équipe 5</option><option value="35">Équipe 6</option>
+        <option value="49">Équipe 7</option><option value="7">Équipe 8</option>
+      </select>
+      <select id="auth-45"
+        style="width:100%;padding:11px;border-radius:8px;border:1px solid #475569;background:#0f172a;color:#f1f5f9;font-size:1rem;box-sizing:border-box;margin-bottom:10px">
+        <option value="">— Pas de régime 4/5 —</option>
+        <option value="0">4/5 : Lundi</option><option value="1">4/5 : Mardi</option>
+        <option value="2">4/5 : Mercredi</option><option value="3">4/5 : Jeudi</option>
+        <option value="4">4/5 : Vendredi</option>
+      </select>
+      <input id="auth-birth" type="date" max="2007-12-31"
+        style="width:100%;padding:11px;border-radius:8px;border:1px solid #475569;background:#0f172a;color:#94a3b8;font-size:.9rem;box-sizing:border-box;margin-bottom:10px">
+      <div style="color:#64748b;font-size:.72rem;text-align:left;margin:-4px 0 10px">Date de naissance (calcul des congés selon l'âge) — optionnel</div>
+    </div>
+    <button id="auth-submit" onclick="doAuth()"
+      style="width:100%;padding:12px;border-radius:8px;background:#3b82f6;color:#fff;font-weight:700;font-size:1rem;border:none;cursor:pointer">
       Connexion
     </button>
-    <p id="pin-error" style="color:#ef4444;font-size:.85rem;margin:10px 0 0;display:none">PIN incorrect</p>
+    <p id="auth-error" style="color:#ef4444;font-size:.82rem;margin:10px 0 0;display:none"></p>
   </div>
 </div>
 
@@ -1761,15 +1865,15 @@ select:focus,input:focus{border-color:var(--accent)}
     Échanges
   </button>
   <button class="nav-btn" onclick="openAgentModal()">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75"/></svg>
-    Agents
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+    Mon compte
   </button>
   <button class="nav-btn" id="btn-panel-mobile" style="display:none" onclick="toggleMobilePanel()">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 010 14.14M4.93 19.07a10 10 0 010-14.14"/><path d="M15.54 8.46a5 5 0 010 7.07M8.46 15.54a5 5 0 010-7.07"/></svg>
     Réglages
   </button>
 
-  <div class="nav-section">Équipe</div>
+  <div class="nav-section" id="team-section-label">Équipe</div>
   <div id="team-btns" style="display:flex;flex-wrap:wrap;gap:6px;padding:0 12px 12px">
     <button class="team-btn" data-offset="14" onclick="selectTeam(14)">Éq 1</button>
     <button class="team-btn" data-offset="28" onclick="selectTeam(28)">Éq 2</button>
@@ -1943,51 +2047,28 @@ select:focus,input:focus{border-color:var(--accent)}
 <!-- MODAL AGENT -->
 <div class="modal-overlay" id="agent-modal">
   <div class="modal">
-    <h2>Gestion des agents <span class="close" onclick="closeModal('agent-modal')">✕</span></h2>
+    <h2>Mon compte <span class="close" onclick="closeModal('agent-modal')">✕</span></h2>
     <div id="agent-list" style="margin-bottom:16px"></div>
     <hr style="border-color:var(--border);margin:16px 0">
-    <div style="font-size:13px;font-weight:600;margin-bottom:12px">Nouvel agent</div>
+    <div style="font-size:13px;font-weight:600;margin-bottom:10px">📅 Date de début de carrière (SPF Justice)</div>
     <div class="form-row">
-      <div class="form-group"><label>ID</label><input id="na-id" placeholder="EX: TSE"></div>
-      <div class="form-group"><label>Nom</label><input id="na-name" placeholder="Prénom NOM"></div>
-    </div>
-    <div class="form-row">
-      <div class="form-group"><label>Date de naissance</label><input type="date" id="na-birth" max="2007-12-31"></div>
       <div class="form-group">
-        <label>Équipe</label>
-        <select id="na-offset">
-          <option value="14">Équipe 1</option>
-          <option value="28">Équipe 2</option>
-          <option value="42">Équipe 3</option>
-          <option value="0">Équipe 4</option>
-          <option value="21">Équipe 5</option>
-          <option value="35">Équipe 6</option>
-          <option value="49">Équipe 7</option>
-          <option value="7">Équipe 8</option>
-        </select>
+        <input type="date" id="acc-career" max="2025-12-31">
+        <div class="form-note">Sert au calcul du capital maladie (21j × années de service)</div>
       </div>
+      <div class="form-group"><label>&nbsp;</label><button class="btn btn-primary" onclick="saveCareer()">Enregistrer</button></div>
     </div>
-    <div class="form-group">
-      <label>Date de début de carrière (SPF Justice)</label>
-      <input type="date" id="na-career" max="2025-12-31">
-      <div class="form-note">Sert au calcul du capital maladie (21j × années de service)</div>
-    </div>
-    <div class="form-group">
-      <label>Régime 4/5 — jour de repos fixe (lun-ven)</label>
-      <select id="na-45">
-        <option value="">— Pas de régime 4/5 —</option>
-        <option value="0">Lundi</option>
-        <option value="1">Mardi</option>
-        <option value="2">Mercredi</option>
-        <option value="3">Jeudi</option>
-        <option value="4">Vendredi</option>
-      </select>
+    <hr style="border-color:var(--border);margin:16px 0">
+    <div style="font-size:13px;font-weight:600;margin-bottom:10px">🔒 Changer mon code PIN</div>
+    <div class="form-row">
+      <div class="form-group"><label>Nouveau PIN (4 chiffres min.)</label><input id="acc-pin" type="password" inputmode="numeric" maxlength="20" placeholder="••••"></div>
+      <div class="form-group"><label>&nbsp;</label><button class="btn btn-primary" onclick="changePin()">Mettre à jour</button></div>
     </div>
     <div class="modal-footer" style="justify-content:space-between">
-      <button class="btn btn-danger btn-sm" onclick="resetAllData()" title="Remet tout à zéro pour transmettre à un collègue">🗑 Remettre à zéro</button>
+      <button class="btn btn-danger btn-sm" onclick="deleteMyAccount()" title="Supprime définitivement ton compte et toutes tes données">🗑 Supprimer mon compte</button>
       <div style="display:flex;gap:8px">
         <button class="btn" onclick="closeModal('agent-modal')" style="background:var(--card2)">Fermer</button>
-        <button class="btn btn-primary" onclick="addAgent()">Ajouter</button>
+        <button class="btn btn-primary" onclick="doLogout()" style="background:#dc2626">⎋ Déconnexion</button>
       </div>
     </div>
   </div>
@@ -2139,9 +2220,12 @@ async function init() {
   mobileWeekMode = isMobile();
   catalog = await fetch('/api/leaves_catalog').then(r=>r.json());
   populateCatalog();
-  await loadAgents();
-  // Si aucun agent auto-sélectionné, afficher Équipe 4 par défaut
-  if(!curAgent && curTeamOffset === null) selectTeam(0);
+  await loadAgents();   // ne renvoie QUE l'agent connecté -> curAgent = soi
+  // Mode mono-agent : masquer la sélection d'équipe et d'agent (un agent ne voit que lui)
+  ['team-btns','mobile-team-bar','mobile-agent-bar','team-section-label'].forEach(id=>{
+    const e=document.getElementById(id); if(e) e.style.display='none';
+  });
+  const aSec=document.querySelector('.agent-section'); if(aSec) aSec.style.display='none';
   showView('calendar');
   gotoToday();
   initSwipe();
@@ -2423,10 +2507,35 @@ async function addAgent() {
 }
 
 async function deleteAgent(id) {
-  if(!confirm('Supprimer cet agent et tous ses congés ?')) return;
+  if(!confirm('Supprimer ce compte et toutes ses données ?')) return;
   await fetch(`/api/agents/${id}`,{method:'DELETE'});
-  toast('Agent supprimé');
+  if(id===curAgent){ await fetch('/api/auth/logout',{method:'POST'}); location.reload(); return; }
+  toast('Compte supprimé');
   await loadAgents();
+}
+
+// ── Mon compte ──
+async function changePin(){
+  const pin = document.getElementById('acc-pin').value.trim();
+  if(pin.length < 4){ toast('PIN trop court (4 chiffres min.)','error'); return; }
+  const r = await fetch(`/api/agents/${curAgent}`,{method:'PATCH',
+    headers:{'Content-Type':'application/json'}, body:JSON.stringify({pin})});
+  if(r.ok){ toast('PIN mis à jour'); document.getElementById('acc-pin').value=''; }
+  else toast('Erreur','error');
+}
+async function saveCareer(){
+  const career = document.getElementById('acc-career').value || null;
+  const r = await fetch(`/api/agents/${curAgent}`,{method:'PATCH',
+    headers:{'Content-Type':'application/json'}, body:JSON.stringify({career_start:career})});
+  if(r.ok){ toast('Date de carrière enregistrée'); loadAgents(); }
+  else toast('Erreur','error');
+}
+async function deleteMyAccount(){
+  if(!confirm('⚠️ Supprimer DÉFINITIVEMENT ton compte et toutes tes données ?')) return;
+  if(!confirm('Dernière confirmation : cette action est irréversible.')) return;
+  await fetch(`/api/agents/${curAgent}`,{method:'DELETE'});
+  await fetch('/api/auth/logout',{method:'POST'});
+  location.reload();
 }
 
 function printMonth() {
@@ -3288,7 +3397,12 @@ async function removeEvent(agent,start,code) {
 // ── MODALS ──
 function openModal(id){document.getElementById(id).classList.add('open')}
 function closeModal(id){document.getElementById(id).classList.remove('open')}
-function openAgentModal(){loadAgents();openModal('agent-modal')}
+function openAgentModal(){
+  loadAgents();
+  const c=document.getElementById('acc-career');
+  if(c && _allAgents[curAgent]) c.value = _allAgents[curAgent].career_start || '';
+  openModal('agent-modal');
+}
 
 // ── TOAST ──
 function toast(msg,type='ok'){
@@ -3476,21 +3590,66 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape'){
   document.querySelectorAll('.modal-overlay.open').forEach(m=>m.classList.remove('open'));
 }});
 
-init();
-
-// ── AUTH ──────────────────────────────────────────────────────
-async function doLogin(){
-  const pin = document.getElementById('pin-input').value;
-  const r = await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pin})});
-  if(r.ok){ document.getElementById('login-overlay').style.display='none'; init(); }
-  else { const err=document.getElementById('pin-error'); err.style.display='block'; document.getElementById('pin-input').value=''; }
+// ── AUTH PAR AGENT ────────────────────────────────────────────
+let _authMode = 'login';
+function authMode(m){
+  _authMode = m;
+  const reg = m === 'register';
+  document.getElementById('register-fields').style.display = reg ? 'block' : 'none';
+  document.getElementById('auth-submit').textContent = reg ? 'Créer mon compte' : 'Connexion';
+  document.getElementById('auth-error').style.display = 'none';
+  const tl = document.getElementById('tab-login'), tr = document.getElementById('tab-register');
+  tl.style.background = reg ? 'transparent' : '#3b82f6'; tl.style.color = reg ? '#94a3b8' : '#fff';
+  tl.style.border = reg ? '1px solid #475569' : 'none';
+  tr.style.background = reg ? '#3b82f6' : 'transparent'; tr.style.color = reg ? '#fff' : '#94a3b8';
+  tr.style.border = reg ? 'none' : '1px solid #475569';
+}
+function _authErr(msg){
+  const e = document.getElementById('auth-error');
+  e.textContent = msg; e.style.display = 'block';
+}
+async function doAuth(){
+  const id  = document.getElementById('auth-id').value.trim().toUpperCase();
+  const pin = document.getElementById('auth-pin').value.trim();
+  if(!id || !pin){ _authErr('Identifiant et PIN obligatoires'); return; }
+  let url, payload;
+  if(_authMode === 'register'){
+    const name = document.getElementById('auth-name').value.trim();
+    if(!name){ _authErr('Nom obligatoire'); return; }
+    const r45 = document.getElementById('auth-45').value;
+    payload = { id, pin, name,
+      offset: parseInt(document.getElementById('auth-offset').value),
+      regime_4_5: r45 === '' ? null : parseInt(r45),
+      birth_date: document.getElementById('auth-birth').value || null };
+    url = '/api/auth/register';
+  } else {
+    payload = { id, pin };
+    url = '/api/auth/login';
+  }
+  const r = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  const j = await r.json().catch(()=>({}));
+  if(r.ok){
+    document.getElementById('login-overlay').style.display = 'none';
+    document.getElementById('auth-pin').value = '';
+    init();
+  } else {
+    _authErr(j.error || 'Erreur');
+  }
+}
+async function doLogout(){
+  await fetch('/api/auth/logout',{method:'POST'});
+  location.reload();
 }
 
 (async function checkAuth(){
-  const r = await fetch('/api/agents');
-  if(r.status===401){
-    document.getElementById('login-overlay').style.display='flex';
-    document.getElementById('pin-input').focus();
+  const me = await fetch('/api/auth/me').then(r=>r.json()).catch(()=>({logged_in:false}));
+  if(me.logged_in){
+    document.getElementById('login-overlay').style.display = 'none';
+    init();
+  } else {
+    authMode('login');
+    document.getElementById('login-overlay').style.display = 'flex';
+    document.getElementById('auth-id').focus();
   }
 })();
 </script>
