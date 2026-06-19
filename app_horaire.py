@@ -4,7 +4,7 @@ HoraireManager - Prison de Namur / SPF Justice
 Application web de gestion des horaires rotatifs
 Lancement: python app_horaire.py  -> http://localhost:5050
 """
-import sys, os
+import sys, os, secrets
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'lib'))
 
 import json, uuid as _uuid
@@ -58,6 +58,16 @@ def check_auth():
     p = request.path
     if p in _PUBLIC_PATHS or p.startswith("/static"):
         return
+    # iCal : accès sans session via jeton secret propre à l'agent
+    # (permet la synchro Google Agenda tout en restant privé : le lien d'un
+    #  agent est indevinable et ne donne accès qu'à SON horaire)
+    if p.startswith("/ical/"):
+        ag_id = (request.view_args or {}).get("aid")
+        tok   = request.args.get("token", "")
+        ag    = load()["agents"].get(ag_id) if ag_id else None
+        if ag and tok and secrets.compare_digest(tok, ag.get("ical_token") or ""):
+            return
+        return jsonify({"error": "Lien iCal invalide ou expiré"}), 403
     aid = current_aid()
     if not aid:
         return jsonify({"error": "Non autorisé", "login_required": True}), 401
@@ -90,6 +100,7 @@ def api_register():
         "team_offset":  int(body.get("offset", 0)),
         "regime_4_5":   int(r45) if r45 not in (None, "") else None,
         "pin_hash":     generate_password_hash(pin),
+        "ical_token":   secrets.token_urlsafe(16),
     }
     save(data)
     session.permanent = True
@@ -1121,6 +1132,20 @@ def api_exchanges_delete(eid):
     data["exchanges"] = [e for e in data.get("exchanges", []) if e["id"] != eid]
     save(data)
     return jsonify({"removed": before - len(data["exchanges"])})
+
+@app.route("/api/ical_url")
+def api_ical_url():
+    """Renvoie le lien iCal privé (avec jeton) de l'agent connecté."""
+    aid  = current_aid()
+    data = load()
+    ag   = data["agents"].get(aid)
+    if not ag:
+        return jsonify({"error": "Non connecté"}), 401
+    if not ag.get("ical_token"):
+        ag["ical_token"] = secrets.token_urlsafe(16)
+        save(data)
+    url = request.host_url.rstrip("/") + f"/ical/{aid}.ics?token={ag['ical_token']}"
+    return jsonify({"url": url})
 
 @app.route("/ical/<aid>.ics")
 def export_ical(aid):
@@ -2323,10 +2348,11 @@ function toggleMobilePanel() {
   document.getElementById('btn-panel-mobile').classList.toggle('active', rp.classList.contains('panel-open'));
 }
 
-function syncGoogleCal() {
+async function syncGoogleCal() {
   if(!curAgent) return;
-  const base = window.location.origin;
-  const icalUrl = base + '/ical/' + curAgent + '.ics';
+  const res = await fetch('/api/ical_url').then(r=>r.json()).catch(()=>null);
+  if(!res || !res.url){ toast('Lien iCal indisponible','error'); return; }
+  const icalUrl = res.url;
   const gcalUrl = 'https://calendar.google.com/calendar/r?cid=' + encodeURIComponent(icalUrl);
   const info = document.getElementById('gcal-info');
   info.style.display = 'block';
