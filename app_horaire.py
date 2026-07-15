@@ -278,7 +278,7 @@ def get_day_info(d: date, agent_id: str, data: dict) -> dict:
 
     # ── OVERRIDE MANUEL ───────────────────────────────────────────────────────
     shift_ov = data.get("shift_overrides", {}).get(agent_id, {}).get(d.isoformat())
-    if shift_ov in ("M", "S", "R", "12H", "08H"):
+    if shift_ov == "R" or (shift_ov and is_worked_shift(shift_ov)):
         base = shift_ov
         decale_38 = False
         decale_r  = False
@@ -313,9 +313,9 @@ def get_day_info(d: date, agent_id: str, data: dict) -> dict:
             eff, code, label = 'R', 'REPOS-R',  'Repos (décalé ↓)'
 
     # ── COULEUR ───────────────────────────────────────────────────────────────
-    _BASE_COLOR = {"M": "red", "S": "orange", "12H": "purple", "08H": "teal"}
+    _BASE_COLOR = {"M": "red", "S": "orange", "12H": "purple", "08H": "teal", "N": "indigo"}
     if code is None:
-        color = _BASE_COLOR.get(base, "green")
+        color = _BASE_COLOR.get(base) or ("teal" if is_worked_shift(base) else "green")
     elif code in ("FERIE", "PONT"):
         color = "blue"
     else:
@@ -383,8 +383,30 @@ def api_del_agent(aid):
     return jsonify({"ok": True})
 
 VALID_OFFSETS = {0, 7, 14, 21, 28, 35, 42, 49}
-SHIFT_LABELS = {'M':'Matin','S':'Soir','R':'Repos','36':'Repos 36h','38':'Repos 38h'}
-SHIFT_HOURS  = {'M':'06:00 – 14:00', 'S':'14:00 – 22:00'}
+SHIFT_LABELS = {'M':'Matin','S':'Soir','N':'Nuit','R':'Repos','36':'Repos 36h','38':'Repos 38h'}
+SHIFT_HOURS  = {'M':'06:00 – 14:00', 'S':'14:00 – 22:00', 'N':'22:00 – 06:30'}
+
+# ── HORAIRES DÉCALÉS (shift de 8h : fin = début + 8h) + NUIT (22h → 06h30) ───
+_DECALE_RE = _re.compile(r'^(\d{1,2})H(\d{2})?$')   # ex: 07H30, 09H, 12H00
+
+def shift_hours_of(code):
+    """Heures 'HH:MM – HH:MM' d'un poste travaillé, sinon None.
+    M/S/N/12H = horaires fixes ; tout code type 07H30 = début + 8h de travail."""
+    fixed = {'M': '06:00 – 14:00', 'S': '14:00 – 22:00',
+             'N': '22:00 – 06:30', '12H': '07:00 – 19:00'}
+    if code in fixed:
+        return fixed[code]
+    m = _DECALE_RE.match(code or '')
+    if m:
+        h, mn = int(m.group(1)), int(m.group(2) or 0)
+        if h > 23 or mn > 59:
+            return None
+        return f'{h:02d}:{mn:02d} – {(h + 8) % 24:02d}:{mn:02d}'
+    return None
+
+def is_worked_shift(code):
+    """Poste travaillé : M, S, N, 12H, 08H ou horaire décalé (07H30…)."""
+    return bool(shift_hours_of(code))
 
 def _hols_dict(year):
     """Construit {date: nom} depuis get_public_holidays (liste de tuples)."""
@@ -493,8 +515,8 @@ def api_shift_override(aid, date_str):
         save(data)
         return jsonify({"ok": True})
     shift = (request.json or {}).get("shift", "").upper()
-    if shift not in ("M", "S", "R", "12H", "08H"):
-        return jsonify({"error": "Shift invalide (M/S/R/12H/08H)"}), 400
+    if shift != "R" and not is_worked_shift(shift):
+        return jsonify({"error": "Shift invalide (M/S/N/R/12H/08H ou décalé ex: 07H30)"}), 400
     data["shift_overrides"].setdefault(aid, {})[date_str] = shift
     save(data)
     return jsonify({"ok": True, "shift": shift})
@@ -512,8 +534,8 @@ def print_month(aid, year, month):
     for d in range(1, days_in_month + 1):
         day_info = get_day_info(date(year, month, d), aid, data)
         day_info["remark"] = remarks.get(day_info["date"], "")
-        # Jour presté = poste travaillé (M/S/12H/08H), sans congé/événement posé
-        if day_info["base"] in ("M", "S", "12H", "08H") and day_info["code"] is None:
+        # Jour presté = poste travaillé (M/S/N/12H/08H/décalé), sans congé/événement posé
+        if is_worked_shift(day_info["base"]) and day_info["code"] is None:
             worked_days.append(day_info)
     month_name = MONTH_NAMES_FR[month - 1]
     matin_count = sum(1 for d in worked_days if d["base"] == "M")
@@ -524,9 +546,10 @@ def print_month(aid, year, month):
     for i, day in enumerate(worked_days, 1):
         _pill = {"M": ("MATIN", "#dbeafe", "#1e40af"),
                  "S": ("SOIR",  "#ffedd5", "#9a3412"),
+                 "N": ("NUIT",  "#e0e7ff", "#3730a3"),
                  "12H": ("12H", "#ede9fe", "#6d28d9"),
                  "08H": ("08H", "#ccfbf1", "#0f766e")}
-        pill_label, pill_bg, pill_color = _pill.get(day["base"], ("SOIR", "#ffedd5", "#9a3412"))
+        pill_label, pill_bg, pill_color = _pill.get(day["base"], (day["base"], "#ccfbf1", "#0f766e"))
         remark_txt = day.get("remark", "")
         full_name  = day_names_full.get(day["day_name"], day["day_name"])
         rows_html += (
@@ -600,11 +623,13 @@ _FICHE_TEAM = {0: 4, 7: 8, 14: 1, 21: 5, 28: 2, 35: 6, 42: 3, 49: 7}
 
 # Postes TRAVAILLÉS (colorés) ; tout le reste (R/36/38/congé) = grisé
 def _poste_kind(p):
-    """Classe CSS du poste : m/s/w12/w08 = travaillé (coloré), off = grisé."""
+    """Classe CSS du poste : m/s/n/w12/w08/dec = travaillé (coloré), off = grisé."""
     if p == 'M':   return 'm'
     if p == 'S':   return 's'
+    if p == 'N':   return 'n'
     if p == '12H': return 'w12'
     if p == '08H': return 'w08'
+    if is_worked_shift(p): return 'dec'   # horaire décalé (07H30, 09H…)
     return 'off'   # R, 36, 38, congés, 4/5… -> grisé
 
 _FICHE_CSS = """
@@ -619,8 +644,8 @@ body{font-family:'Segoe UI',Arial,sans-serif;background:#475569;color:#0f172a;pa
 .legend{display:flex;gap:9px;align-items:center;font-size:7.5pt;color:#475569;flex-wrap:wrap;justify-content:flex-end}
 .legend .b{display:inline-flex;align-items:center;gap:3px}
 .legend .sw{width:11px;height:11px;border-radius:3px;display:inline-block}
-.sw.m{background:#fecaca}.sw.s{background:#fed7aa}
-.sw.w12{background:#ddd6fe}.sw.w08{background:#99f6e4}.sw.off{background:#cbd5e1}
+.sw.m{background:#fecaca}.sw.s{background:#fed7aa}.sw.n{background:#c7d2fe}
+.sw.w12{background:#ddd6fe}.sw.w08{background:#99f6e4}.sw.dec{background:#fde68a}.sw.off{background:#cbd5e1}
 table{width:100%;border-collapse:collapse;table-layout:fixed;margin-bottom:5mm}
 table.b2{margin-bottom:0}
 th{background:#1e40af;color:#fff;font-size:8pt;font-weight:700;padding:3px 2px;
@@ -637,8 +662,10 @@ td.d .pose{display:inline-block;width:24px;text-align:center;font-weight:800;
 /* POSTES TRAVAILLÉS = colorés */
 td.m .pose{background:#fee2e2;color:#b91c1c}
 td.s .pose{background:#ffedd5;color:#c2410c}
+td.n .pose{background:#e0e7ff;color:#3730a3}
 td.w12 .pose{background:#ede9fe;color:#6d28d9}
 td.w08 .pose{background:#ccfbf1;color:#0f766e}
+td.dec .pose{background:#fef3c7;color:#92400e}
 /* TOUT LE RESTE (R/36/38/congé/4-5) = case grisée */
 td.off{background:#cbd5e1}
 td.off .pose{background:transparent;color:#334155}
@@ -735,8 +762,10 @@ def _fiche_page(year, title_html, subtitle, day_fn, storage_key):
         '<div class="legend">'
         '<span class="b"><span class="sw m"></span>Matin</span>'
         '<span class="b"><span class="sw s"></span>Soir</span>'
+        '<span class="b"><span class="sw n"></span>Nuit</span>'
         '<span class="b"><span class="sw w12"></span>12H</span>'
         '<span class="b"><span class="sw w08"></span>08H</span>'
+        '<span class="b"><span class="sw dec"></span>Décalé</span>'
         '<span class="b"><span class="sw off"></span>Repos / Congé</span>'
         '</div></div>'
         + block_top + block_bot +
@@ -761,36 +790,230 @@ def fiche_blank(offset, year):
                        f"Horaire annuel vierge · Équipe {team} · SPF Justice",
                        day_fn, f"fiche_{offset}_{year}")
 
+def _agent_fiche_day(d, aid, data):
+    """(badge, kind, title) d'un jour pour les fiches agent (annuelle & mensuelle)."""
+    info = get_day_info(d, aid, data)
+    base = info["base"]
+    code = info["code"]
+    # Férié/pont : afficher le POSTE RÉEL (travaillé->coloré, repos->grisé).
+    # (FERIE/PONT sont aussi des clés du catalogue -> traités AVANT la branche congé)
+    if code in ("FERIE", "PONT"):
+        return (base, _poste_kind(base), info.get("label") or "Férié")
+    if code in LEAVE_CATALOG:                 # congé/absence -> grisé + code (3 car. max, aligné)
+        return (code[:3], 'off', info.get("label") or code)
+    if code == '4/5':                         # jour 4/5 -> grisé, marqué 4/5
+        return ('4/5', 'off', 'Régime 4/5')
+    # Postes (M/S/N/12H/08H/décalés travaillés -> colorés ; R/36/38 -> grisés)
+    return (base, _poste_kind(base), info.get("label") or '')
+
 @app.route("/fiche/agent/<aid>/<int:year>")
 def fiche_agent(aid, year):
     """Fiche annuelle PERSONNELLE : horaire réel de l'agent avec ses
     modifications (régime 4/5, congés, surcharges de poste, fériés).
-    Tout ce qui n'est pas un poste travaillé (M/S/12H/08H) est grisé."""
+    Tout ce qui n'est pas un poste travaillé (M/S/N/12H/08H/décalé) est grisé."""
     data = load()
     if aid not in data["agents"]:
         return "Agent inconnu", 404
     agent = data["agents"][aid]
     team  = _FICHE_TEAM.get(agent.get("team_offset", 0), "?")
-
-    def day_fn(d):
-        info = get_day_info(d, aid, data)
-        base = info["base"]
-        code = info["code"]
-        # Férié/pont : afficher le POSTE RÉEL (travaillé->coloré, repos->grisé).
-        # (FERIE/PONT sont aussi des clés du catalogue -> traités AVANT la branche congé)
-        if code in ("FERIE", "PONT"):
-            return (base, _poste_kind(base), info.get("label") or "Férié")
-        if code in LEAVE_CATALOG:                 # congé/absence -> grisé + code (3 car. max, aligné)
-            return (code[:3], 'off', info.get("label") or code)
-        if code == '4/5':                         # jour 4/5 -> grisé, marqué 4/5
-            return ('4/5', 'off', 'Régime 4/5')
-        # Postes (M/S/12H/08H travaillés -> colorés ; R/36/38 -> grisés)
-        title = info.get("label") or ''
-        return (base, _poste_kind(base), title)
-
+    day_fn = lambda d: _agent_fiche_day(d, aid, data)
     return _fiche_page(year, agent["name"],
                        f"Horaire personnel · {agent['name']} · Équipe {team} · SPF Justice",
                        day_fn, f"fiche_agent_{aid}_{year}")
+
+# ── FICHE MENSUELLE (1 mois, compteur jours prestés + remboursement km) ──────
+_FICHE_MOIS_CSS = """
+.wrap{display:flex;gap:6mm;align-items:flex-start}
+.wrap table{width:47%;margin-bottom:0}
+.wrap td{height:6.4mm}
+.wrap td.d{font-size:8pt}
+.wrap td.d .dn{width:26px;font-size:7.5pt}
+.wrap td.d .num{width:17px;font-size:8pt}
+.wrap td.d .pose{width:46px;font-size:8pt;padding:2px 0}
+.side{flex:1;display:flex;flex-direction:column;gap:5mm}
+.panel{border:1px solid #e2e8f0;border-radius:6px;padding:4mm}
+.panel h2{font-size:10pt;color:#1e40af;margin-bottom:3mm;border-bottom:2px solid #1e40af;padding-bottom:1.5mm}
+.cnt{width:100%;border-collapse:collapse;table-layout:auto;margin-bottom:0}
+.cnt td,.cnt th{border:1px solid #e2e8f0;font-size:8.5pt;padding:3px 6px;height:auto;white-space:nowrap}
+.cnt th{background:#eff6ff;color:#1e40af;text-align:left;text-transform:none;letter-spacing:0;font-weight:600}
+.cnt td.v{text-align:right;font-weight:800;width:52px}
+.cnt tr.tot td{background:#1e40af;color:#fff;font-weight:800;font-size:9.5pt;border-color:#1e3a8a}
+.km input{width:100%;border:1px solid #cbd5e1;border-radius:4px;padding:3px 5px;font-size:9pt;
+  font-weight:700;text-align:right;font-family:inherit;color:#0f172a;background:#fff}
+.km .res{text-align:right;font-weight:800;font-size:9.5pt}
+.km .res.neg{color:#b91c1c}
+.km .res.pos{color:#15803d}
+.note{font-size:7pt;color:#94a3b8;margin-top:2mm;line-height:1.35}
+.bar select{padding:7px 10px;border-radius:7px;border:1px solid #1e40af;font-size:13px;
+  font-weight:600;color:#1e40af;background:#fff;cursor:pointer}
+@media print{.km input{border:none}}
+"""
+
+_FICHE_MOIS_JS = """
+const KEY='STORAGEKEY';
+function tog(cb){cb.closest('td').classList.toggle('on', cb.checked);save();refresh();}
+function save(){
+  const on=[...document.querySelectorAll('input.c:checked')].map(c=>c.dataset.k);
+  localStorage.setItem(KEY, JSON.stringify(on));
+}
+function loadCk(){
+  let on=[]; try{on=JSON.parse(localStorage.getItem(KEY)||'[]')}catch(e){}
+  const set=new Set(on);
+  document.querySelectorAll('input.c').forEach(cb=>{
+    if(set.has(cb.dataset.k)){cb.checked=true;cb.closest('td').classList.add('on');}
+  });
+}
+function clearAll(){
+  if(!confirm('Décocher toutes les cases C manuelles ?'))return;
+  document.querySelectorAll('input.c').forEach(cb=>{cb.checked=false;cb.closest('td').classList.remove('on');});
+  save();refresh();
+}
+const KINDS={m:'Matin (M)',s:'Soir (S)',n:'Nuit (N · 22h-06h30)',w12:'Jour 12H',w08:'Jour 08H',dec:'Horaire décalé (8h)'};
+function counts(){
+  const c={m:0,s:0,n:0,w12:0,w08:0,dec:0};
+  document.querySelectorAll('td.d').forEach(td=>{
+    if(td.classList.contains('on'))return;      // marqué congé manuellement -> exclu
+    for(const k in c){ if(td.classList.contains(k)){c[k]++;break;} }
+  });
+  return c;
+}
+function fmt(x){return x.toLocaleString('fr-BE',{minimumFractionDigits:2,maximumFractionDigits:2});}
+function refresh(){
+  const c=counts(); let tot=0, rows='';
+  for(const k in KINDS){ rows+='<tr><th>'+KINDS[k]+'</th><td class="v">'+c[k]+'</td></tr>'; tot+=c[k]; }
+  rows+='<tr class="tot"><td>TOTAL jours prestés</td><td class="v">'+tot+'</td></tr>';
+  document.getElementById('cnt-body').innerHTML=rows;
+  const km   =parseFloat(document.getElementById('km').value)||0;
+  const tarif=parseFloat(document.getElementById('tarif').value)||0;
+  const remb =parseFloat(document.getElementById('remb').value)||0;
+  const totKm=tot*km, calc=totKm*tarif, diff=calc-remb;
+  document.getElementById('nbj').textContent=tot;
+  document.getElementById('tot-km').textContent=fmt(totKm)+' km';
+  document.getElementById('calc').textContent=fmt(calc)+' €';
+  const dEl=document.getElementById('diff');
+  dEl.textContent=(diff>0?'+':'')+fmt(diff)+' €';
+  dEl.className='res '+(diff>0.004?'neg':(diff<-0.004?'pos':''));
+  localStorage.setItem(KEY+'_km', JSON.stringify({
+    km:document.getElementById('km').value,
+    tarif:document.getElementById('tarif').value,
+    remb:document.getElementById('remb').value}));
+}
+function loadKm(){
+  try{
+    const v=JSON.parse(localStorage.getItem(KEY+'_km')||'{}');
+    if(v.km)document.getElementById('km').value=v.km;
+    if(v.tarif)document.getElementById('tarif').value=v.tarif;
+    if(v.remb)document.getElementById('remb').value=v.remb;
+  }catch(e){}
+}
+function goTo(y,m){location.href='/fiche/mois/AGENTID/'+y+'/'+m;}
+document.addEventListener('DOMContentLoaded',()=>{loadCk();loadKm();refresh();});
+"""
+
+@app.route("/fiche/mois/<aid>/<int:year>/<int:month>")
+def fiche_month(aid, year, month):
+    """Fiche MENSUELLE : même présentation que la fiche annuelle, un seul mois,
+    avec compteur de jours prestés (M/S/N/12H/08H/décalés) et tableau de
+    remboursement kilométrique (comparaison montant calculé / remboursé)."""
+    data = load()
+    if aid not in data["agents"]:
+        return "Agent inconnu", 404
+    if not (1 <= month <= 12):
+        return "Mois invalide", 400
+    agent = data["agents"][aid]
+    team  = _FICHE_TEAM.get(agent.get("team_offset", 0), "?")
+    month_name = MONTH_NAMES_FR[month - 1].capitalize()
+
+    rows = []
+    for day in range(1, monthrange(year, month)[1] + 1):
+        d = date(year, month, day)
+        badge, kind, title = _agent_fiche_day(d, aid, data)
+        dn  = DAY_NAMES_FR[d.weekday()]
+        key = f'{month}-{day}'
+        t   = f' title="{title}"' if title else ''
+        rows.append(
+            f'<tr><td class="d {kind}" data-k="{key}"{t}>'
+            f'<span class="dn">{dn}</span>'
+            f'<span class="num">{day}</span>'
+            f'<span class="pose">{badge}</span>'
+            f'<input type="checkbox" class="c" data-k="{key}" '
+            f'onchange="tog(this)" title="Congé (marquage manuel)">'
+            f'</td></tr>'
+        )
+
+    prev_y, prev_m = (year - 1, 12) if month == 1 else (year, month - 1)
+    next_y, next_m = (year + 1, 1) if month == 12 else (year, month + 1)
+    month_opts = "".join(
+        f'<option value="{m}"{" selected" if m == month else ""}>'
+        f'{MONTH_NAMES_FR[m-1].capitalize()}</option>' for m in range(1, 13))
+    year_opts = "".join(
+        f'<option value="{y}"{" selected" if y == year else ""}>{y}</option>'
+        for y in range(year - 1, year + 3))
+    js = (_FICHE_MOIS_JS
+          .replace("STORAGEKEY", f"fiche_mois_{aid}_{year}_{month}")
+          .replace("AGENTID", aid))
+
+    html = (
+        '<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f'<title>{agent["name"]} — {month_name} {year}</title>'
+        f'<style>{_FICHE_CSS}{_FICHE_MOIS_CSS}</style></head><body>'
+        '<div class="bar">'
+        '<button onclick="window.print()">🖨️ Imprimer / PDF</button>'
+        '<button class="ghost" onclick="clearAll()">Tout décocher</button>'
+        f'<button class="ghost" onclick="goTo({prev_y},{prev_m})">◀</button>'
+        '<select id="selm" onchange="goTo(document.getElementById(\'sely\').value,this.value)">'
+        f'{month_opts}</select>'
+        '<select id="sely" onchange="goTo(this.value,document.getElementById(\'selm\').value)">'
+        f'{year_opts}</select>'
+        f'<button class="ghost" onclick="goTo({next_y},{next_m})">▶</button>'
+        f'<span class="yr">{agent["name"]} · {month_name} {year}</span>'
+        '</div>'
+        '<div class="sheet">'
+        '<div class="hdr">'
+        f'<div><h1>Prison de Namur — {month_name} {year}</h1>'
+        f'<div class="sub">Fiche mensuelle · {agent["name"]} · Équipe {team} · SPF Justice</div></div>'
+        '<div class="legend">'
+        '<span class="b"><span class="sw m"></span>Matin</span>'
+        '<span class="b"><span class="sw s"></span>Soir</span>'
+        '<span class="b"><span class="sw n"></span>Nuit</span>'
+        '<span class="b"><span class="sw w12"></span>12H</span>'
+        '<span class="b"><span class="sw w08"></span>08H</span>'
+        '<span class="b"><span class="sw dec"></span>Décalé</span>'
+        '<span class="b"><span class="sw off"></span>Repos / Congé</span>'
+        '</div></div>'
+        '<div class="wrap">'
+        f'<table><thead><tr><th>{month_name} {year}</th></tr></thead>'
+        f'<tbody>{"".join(rows)}</tbody></table>'
+        '<div class="side">'
+        '<div class="panel"><h2>🧮 Jours prestés du mois</h2>'
+        '<table class="cnt"><tbody id="cnt-body"></tbody></table>'
+        '<div class="note">Sont comptés : les postes M, S, N (nuit 22h-06h30), 12H, 08H '
+        'et les horaires décalés (shift de 8h). Repos, congés, 4/5 et cases cochées '
+        'manuellement sont exclus du compteur.</div></div>'
+        '<div class="panel"><h2>🚗 Remboursement kilométrique</h2>'
+        '<table class="cnt km"><tbody>'
+        '<tr><th>Jours prestés (aller-retour)</th><td class="v" id="nbj">0</td></tr>'
+        '<tr><th>Km aller-retour officiel</th><td class="v">'
+        '<input type="number" id="km" step="0.1" min="0" oninput="refresh()" placeholder="0,0"></td></tr>'
+        '<tr><th>Tarif administration (€/km)</th><td class="v">'
+        '<input type="number" id="tarif" step="0.0001" min="0" oninput="refresh()" placeholder="0,0000"></td></tr>'
+        '<tr><th>Total km du mois</th><td class="res" id="tot-km">0,00 km</td></tr>'
+        '<tr class="tot"><td>Montant calculé</td><td class="v" id="calc">0,00 €</td></tr>'
+        '<tr><th>Montant remboursé par l\'État (€)</th><td class="v">'
+        '<input type="number" id="remb" step="0.01" min="0" oninput="refresh()" placeholder="0,00"></td></tr>'
+        '<tr><th>Différence (calculé − remboursé)</th><td class="res" id="diff">0,00 €</td></tr>'
+        '</tbody></table>'
+        '<div class="note">Encodez le km aller-retour officiel et le tarif au km de '
+        'l\'administration : le montant est calculé sur les jours prestés du mois. '
+        'Comparez ensuite avec le montant réellement remboursé par l\'État. '
+        'Les valeurs encodées sont conservées sur cet appareil.</div></div>'
+        '</div>'
+        '</div>'
+        f'<script>{js}</script>'
+        '</body></html>'
+    )
+    return Response(html, mimetype='text/html; charset=utf-8')
 
 @app.route("/api/events", methods=["POST"])
 def api_add_event():
@@ -1172,6 +1395,9 @@ def export_ical(aid):
     SHIFT_LABELS = {
         "M":  ("🌅 MATIN",  "06:00", "14:00", "OPAQUE"),
         "S":  ("🌆 SOIR",   "14:00", "22:00", "OPAQUE"),
+        "N":  ("🌙 NUIT",   "22:00", "06:30", "OPAQUE"),
+        "12H":("🕛 JOUR 12H","07:00","19:00", "OPAQUE"),
+        "08H":("🕗 JOUR 08H","08:00","16:00", "OPAQUE"),
         "R":  ("🛌 REPOS",  None,    None,    "TRANSPARENT"),
         "38": ("📋 38h",    None,    None,    "TRANSPARENT"),
         "36": ("📋 36h",    None,    None,    "TRANSPARENT"),
@@ -1200,6 +1426,11 @@ def export_ical(aid):
             title = s[0]
             transp = s[3]
             color  = "11" if eff == "M" else ("6" if eff == "S" else "8")
+        elif is_worked_shift(eff):
+            # Horaire décalé (07H30, 09H…) : shift de 8h
+            title  = f"🕐 DÉCALÉ {eff}"
+            transp = "OPAQUE"
+            color  = "8"
         else:
             cur += timedelta(1)
             continue
@@ -1208,14 +1439,17 @@ def export_ical(aid):
         dt  = cur.strftime("%Y%m%d")
         now = date.today().strftime("%Y%m%dT%H%M%SZ")
 
-        if eff in ("M", "S") and not code:
-            s = SHIFT_LABELS[eff]
+        hours = None if code else shift_hours_of(eff)
+        if hours:
+            h1, h2 = [x.strip() for x in hours.split("–")]
+            # Fin <= début (ex: NUIT 22:00 – 06:00) -> l'événement se termine le lendemain
+            end_dt = (cur + timedelta(1)).strftime("%Y%m%d") if h2 <= h1 else dt
             lines += [
                 "BEGIN:VEVENT",
                 f"UID:{uid}@horaire-namur",
                 f"DTSTAMP:{now}",
-                f"DTSTART;TZID=Europe/Brussels:{dt}T{s[1].replace(':','')}00",
-                f"DTEND;TZID=Europe/Brussels:{dt}T{s[2].replace(':','')}00",
+                f"DTSTART;TZID=Europe/Brussels:{dt}T{h1.replace(':','')}00",
+                f"DTEND;TZID=Europe/Brussels:{end_dt}T{h2.replace(':','')}00",
                 f"SUMMARY:{title}",
                 f"COLOR:{color}",
                 f"TRANSP:{transp}",
@@ -1261,8 +1495,7 @@ def api_day(aid, date_str):
     cycle_pos = (delta - offset) % CYCLE_LEN
     mon = d - timedelta(days=d.weekday())
     week = [get_day_info(mon + timedelta(i), aid, data) for i in range(7)]
-    shift_hours = {"M": "06:00 – 14:00", "S": "14:00 – 22:00",
-                   "12H": "07:00 – 19:00", "08H": "08:00 – 16:00"}.get(info["base"], "Hors service")
+    shift_hours = shift_hours_of(info["base"]) or "Hors service"
     shift_overridden = date_str in data.get("shift_overrides", {}).get(aid, {})
     return jsonify({**info,
         "week": week,
@@ -1412,6 +1645,7 @@ select:focus,input:focus{border-color:var(--accent)}
 .b-purple{border-left-color:#c084fc}
 .b-violet{border-left-color:#a78bfa}
 .b-teal  {border-left-color:#2dd4bf}
+.b-indigo{border-left-color:#818cf8}
 
 /* Fonds tintés des cellules */
 .c-red   {background:rgba(239,68,68,.14)!important}
@@ -1421,6 +1655,7 @@ select:focus,input:focus{border-color:var(--accent)}
 .c-purple{background:rgba(168,85,247,.12)!important}
 .c-violet{background:rgba(139,92,246,.16)!important}
 .c-teal  {background:rgba(20,184,166,.16)!important}
+.c-indigo{background:rgba(99,102,241,.16)!important}
 
 /* Pills plus opaques */
 .p-red   {background:rgba(239,68,68,.35);color:#fca5a5;font-weight:900}
@@ -1430,6 +1665,7 @@ select:focus,input:focus{border-color:var(--accent)}
 .p-purple{background:rgba(168,85,247,.30);color:#d8b4fe;font-weight:900}
 .p-violet{background:rgba(139,92,246,.35);color:#c4b5fd;font-weight:900}
 .p-teal  {background:rgba(20,184,166,.35);color:#5eead4;font-weight:900}
+.p-indigo{background:rgba(99,102,241,.38);color:#c7d2fe;font-weight:900}
 
 /* Numéros colorés par type */
 .n-red   .day-num{color:#f87171}
@@ -1439,6 +1675,7 @@ select:focus,input:focus{border-color:var(--accent)}
 .n-purple .day-num{color:#c084fc}
 .n-violet .day-num{color:#a78bfa}
 .n-teal   .day-num{color:#2dd4bf}
+.n-indigo .day-num{color:#818cf8}
 /* today override : cercle blanc brillant */
 .cal-day.today .day-num{color:#fff!important}
 
@@ -1723,6 +1960,7 @@ select:focus,input:focus{border-color:var(--accent)}
 .shift-btn:hover{border-color:var(--accent)}
 .shift-btn.sb-matin{border-color:#ef4444;color:#fca5a5}
 .shift-btn.sb-soir{border-color:#f97316;color:#fdba74}
+.shift-btn.sb-nuit{border-color:#6366f1;color:#a5b4fc}
 .shift-btn.sb-h12{border-color:#8b5cf6;color:#c4b5fd}
 .shift-btn.sb-h08{border-color:#14b8a6;color:#5eead4}
 .shift-btn.sb-repos{border-color:#22c55e;color:#86efac}
@@ -1934,6 +2172,7 @@ select:focus,input:focus{border-color:var(--accent)}
       <button id="btn-print" onclick="printMonth()" title="Imprimer les jours prestés (A4 PDF)" style="margin-left:8px;background:#1e40af;color:#fff;border:none;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:13px">🖨️ Imprimer</button>
       <button id="btn-fiche-me" onclick="openFicheAgent()" title="Fiche annuelle de l'agent (avec ses congés, 4/5, modifications)" style="margin-left:4px;background:#0f766e;color:#fff;border:none;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:13px">📄 Ma fiche</button>
       <button id="btn-fiche-blank" onclick="openFicheBlank()" title="Fiche annuelle vierge de l'équipe (cycle brut)" style="margin-left:4px;background:#64748b;color:#fff;border:none;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:13px">📄 Vierge</button>
+      <button id="btn-fiche-mois" onclick="openFicheMois()" title="Fiche mensuelle : jours prestés + remboursement kilométrique" style="margin-left:4px;background:#7c3aed;color:#fff;border:none;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:13px">📄 Mois</button>
     </div>
   </div>
   <!-- Barre agent — visible seulement sur tablette/mobile -->
@@ -2125,11 +2364,15 @@ select:focus,input:focus{border-color:var(--accent)}
       <div class="shift-btn-group" id="dm-shift-btns">
         <button class="shift-btn sb-matin" id="sb-M" onclick="setShiftOverride('M')">🌅 MATIN</button>
         <button class="shift-btn sb-soir" id="sb-S" onclick="setShiftOverride('S')">🌆 SOIR</button>
+        <button class="shift-btn sb-nuit" id="sb-N" onclick="setShiftOverride('N')">🌙 NUIT</button>
         <button class="shift-btn sb-h12" id="sb-12H" onclick="setShiftOverride('12H')">🕛 12H</button>
         <button class="shift-btn sb-h08" id="sb-08H" onclick="setShiftOverride('08H')">🕗 08H</button>
         <button class="shift-btn sb-repos" id="sb-R" onclick="setShiftOverride('R')">🛌 REPOS</button>
         <button class="shift-btn sb-reset" id="sb-reset" onclick="resetShiftOverride()" title="Restaurer le poste original du cycle">↩ Original</button>
       </div>
+      <select id="sb-decale" onchange="if(this.value)setShiftOverride(this.value)" title="Horaire décalé : shift de 8h, la fin est calculée automatiquement (nuit = 22h-06h30 via NUIT)" style="margin-top:8px;width:100%;padding:8px;border:2px solid var(--border);border-radius:8px;background:var(--card2);color:var(--text);font-weight:700;font-size:13px;cursor:pointer">
+        <option value="">🕐 Horaire décalé (shift 8h) — choisir l'heure de début…</option>
+      </select>
     </div>
     <div class="dm-remark-section">
       <div class="dm-remark-label">
@@ -2573,6 +2816,10 @@ function openFicheAgent() {
   if(!curAgent){ toast('Sélectionnez un agent pour sa fiche personnelle','error'); return; }
   window.open('/fiche/agent/'+curAgent+'/'+curYear, '_blank');
 }
+function openFicheMois() {
+  if(!curAgent){ toast('Sélectionnez un agent pour sa fiche mensuelle','error'); return; }
+  window.open('/fiche/mois/'+curAgent+'/'+curYear+'/'+curMonth, '_blank');
+}
 function openFicheBlank() {
   const off = (curTeamOffset !== null) ? curTeamOffset : 0;
   window.open('/fiche/'+off+'/'+curYear, '_blank');
@@ -2748,7 +2995,7 @@ async function renderWeekView() {
 
     if(code==='FERIE'||code==='PONT'){
       bCls='b-blue'; cCls='c-blue'; pCls='p-blue';
-      const _sp={M:'Matin',S:'Soir',R:'Repos','36':'36h','38':'38h'};
+      const _sp={M:'Matin',S:'Soir',N:'Nuit',R:'Repos','36':'36h','38':'38h'};
       pillTxt=_sp[base]||'Repos';
       reasonTxt=(code==='PONT'?'Pont — ':'Jour férié — ')+(day.label||'');
       hours=day.shift_hours||'';
@@ -2768,6 +3015,10 @@ async function renderWeekView() {
       bCls='b-violet'; cCls='c-violet'; pCls='p-violet'; pillTxt='12H'; hours=day.shift_hours||'07:00 – 19:00';
     } else if(base==='08H'){
       bCls='b-teal'; cCls='c-teal'; pCls='p-teal'; pillTxt='08H'; hours=day.shift_hours||'08:00 – 16:00';
+    } else if(base==='N'){
+      bCls='b-indigo'; cCls='c-indigo'; pCls='p-indigo'; pillTxt='Nuit'; hours=day.shift_hours||'22:00 – 06:30';
+    } else if(/^\d{1,2}H\d{2}$/.test(base)){
+      bCls='b-teal'; cCls='c-teal'; pCls='p-teal'; pillTxt=base; hours=day.shift_hours||'';
     } else if(base==='36'||base==='38'){
       bCls='b-purple'; cCls='c-purple'; pCls='p-purple'; pillTxt='Repos '+base;
     }
@@ -3107,7 +3358,7 @@ function renderGrid(cal) {
 
     if(code==='FERIE'||code==='PONT'){
       bCls='b-blue'; cCls='c-blue'; nCls='n-blue'; pCls='p-blue';
-      const _sp={M:'MATIN',S:'SOIR',R:'REPOS','36':'REPOS-36','38':'REPOS-38'};
+      const _sp={M:'MATIN',S:'SOIR',N:'NUIT',R:'REPOS','36':'REPOS-36','38':'REPOS-38'};
       pillTxt=_sp[base]||'REPOS';
       reasonTxt=(code==='PONT'?'[Pont] ':'[Ferie] ')+(day.label||'');
     } else if(code==='4/5'){
@@ -3130,6 +3381,10 @@ function renderGrid(cal) {
       bCls='b-violet'; cCls='c-violet'; nCls='n-violet'; pCls='p-violet'; pillTxt='12H';
     } else if(base==='08H'){
       bCls='b-teal';   cCls='c-teal';   nCls='n-teal';   pCls='p-teal';   pillTxt='08H';
+    } else if(base==='N'){
+      bCls='b-indigo'; cCls='c-indigo'; nCls='n-indigo'; pCls='p-indigo'; pillTxt='NUIT';
+    } else if(/^\d{1,2}H\d{2}$/.test(base)){
+      bCls='b-teal';   cCls='c-teal';   nCls='n-teal';   pCls='p-teal';   pillTxt=base;
     } else if(base==='36'||base==='38'){
       bCls='b-purple'; cCls='c-purple'; nCls='n-purple'; pCls='p-purple'; pillTxt='REPOS '+base;
     } else {
@@ -3254,8 +3509,9 @@ const COLOR_MAP={
   blue:  {bg:'rgba(59,130,246,.15)',border:'#3b82f6',text:'#93c5fd'},
   purple:{bg:'rgba(139,92,246,.15)',border:'#8b5cf6',text:'#c4b5fd'},
   teal:  {bg:'rgba(20,184,166,.15)',border:'#14b8a6',text:'#5eead4'},
+  indigo:{bg:'rgba(99,102,241,.15)',border:'#6366f1',text:'#a5b4fc'},
 };
-const SHIFT_FULL={M:'MATIN',S:'SOIR','12H':'JOUR 12H','08H':'JOUR 08H',R:'REPOS','36':'REPOS-36','38':'REPOS-38'};
+const SHIFT_FULL={M:'MATIN',S:'SOIR',N:'NUIT','12H':'JOUR 12H','08H':'JOUR 08H',R:'REPOS','36':'REPOS-36','38':'REPOS-38'};
 const DAY_FR=['Lundi','Mardi','Mercredi','Jeudi','Vendredi','Samedi','Dimanche'];
 const MO_FR=['janvier','février','mars','avril','mai','juin','juillet','août','septembre','octobre','novembre','décembre'];
 
@@ -3337,13 +3593,32 @@ async function renderDayModal(dateStr) {
 
   // Shift override buttons — surligner le poste actuel
   const curBase = d.base; // poste effectif (peut être override)
-  ['M','S','12H','08H','R'].forEach(s=>{
+  ['M','S','N','12H','08H','R'].forEach(s=>{
     const btn=document.getElementById('sb-'+s);
     if(btn) btn.classList.toggle('sb-active', curBase===s);
   });
+  // Sélecteur d'horaire décalé (shift 8h : fin = début + 8h)
+  initDecaleSelect();
+  const dsel=document.getElementById('sb-decale');
+  if(dsel){ dsel.value=curBase; if(dsel.value!==curBase) dsel.value=''; }
   // Bouton reset : visible seulement si override actif
   const resetBtn=document.getElementById('sb-reset');
   if(resetBtn) resetBtn.style.display = d.shift_overridden ? 'block' : 'none';
+}
+
+function initDecaleSelect(){
+  const sel=document.getElementById('sb-decale');
+  if(!sel||sel.options.length>1) return;   // déjà rempli
+  for(let h=5;h<=17;h++){
+    for(const mn of [0,30]){
+      const code=String(h).padStart(2,'0')+'H'+String(mn).padStart(2,'0');
+      const eh=(h+8)%24;
+      const lab='🕐 '+String(h).padStart(2,'0')+':'+String(mn).padStart(2,'0')
+               +' → '+String(eh).padStart(2,'0')+':'+String(mn).padStart(2,'0')+'  (8h)';
+      const o=document.createElement('option'); o.value=code; o.textContent=lab;
+      sel.appendChild(o);
+    }
+  }
 }
 
 async function setShiftOverride(shift) {
@@ -3353,7 +3628,7 @@ async function setShiftOverride(shift) {
     body:JSON.stringify({shift:shift})
   });
   if(r.ok){
-    const labels={M:'MATIN 🌅',S:'SOIR 🌆','12H':'12H 🕛','08H':'08H 🕗',R:'REPOS 🛌'};
+    const labels={M:'MATIN 🌅',S:'SOIR 🌆',N:'NUIT 🌙','12H':'12H 🕛','08H':'08H 🕗',R:'REPOS 🛌'};
     toast('Poste changé : '+(labels[shift]||shift),'ok');
     await renderDayModal(_dayDate);
     renderCalendar();
@@ -3493,7 +3768,7 @@ function renderExchangeBalance(balance) {
   area.innerHTML = html;
 }
 
-const POSTE_COLORS={M:'var(--red)',S:'var(--orange)','12H':'#a78bfa','08H':'#2dd4bf',R:'var(--green)'};
+const POSTE_COLORS={M:'var(--red)',S:'var(--orange)',N:'#818cf8','12H':'#a78bfa','08H':'#2dd4bf',R:'var(--green)'};
 function posteTag(p){ if(!p)return''; const c=POSTE_COLORS[p]||'var(--muted)'; return `<span style="font-size:11px;font-weight:800;color:${c};margin-left:4px">${p}</span>`;}
 
 function renderExchangeList(exs, filter) {
@@ -3690,6 +3965,46 @@ async function doLogout(){
     }).catch(()=>{});
   }
   setInterval(check,2000);
+})();
+</script>
+<script>
+/* ── Avis de mise à jour : affiché UNE fois par version à chaque utilisateur ── */
+(function(){
+  const APP_VERSION='2026-07-15-fiche-mois';
+  const NEWS=[
+    ['📄','<b>Fiche mensuelle</b> — nouveau bouton « 📄 Mois » : le mois de votre choix, '
+        +'même présentation que la fiche annuelle, avec <b>compteur de jours prestés</b> '
+        +'(M, S, N, 12H, 08H, horaires décalés) et <b>tableau de remboursement kilométrique</b> '
+        +'(km officiel × tarif €/km, comparaison avec le montant remboursé par l\'État).'],
+    ['🌙','<b>Poste NUIT</b> (22h00 – 06h30) : sélectionnable dans le détail d\'un jour, '
+        +'compté comme jour travaillé et synchronisé dans Google Agenda.'],
+    ['🕐','<b>Horaires décalés</b> : choisissez l\'heure de début dans le détail d\'un jour, '
+        +'la fin est calculée automatiquement (shift de 8h). Ex : 07H30 → 07:30-15:30.'],
+  ];
+  function show(){
+    if(localStorage.getItem('hm_seen_version')===APP_VERSION) return;
+    const ov=document.createElement('div');
+    ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.65);display:flex;'
+      +'align-items:center;justify-content:center;z-index:9999;padding:16px';
+    ov.innerHTML=
+      '<div style="background:var(--card,#1e293b);color:var(--text,#e2e8f0);'
+      +'border:1px solid var(--border,#334155);border-radius:14px;max-width:540px;width:100%;'
+      +'padding:22px;box-shadow:0 10px 40px rgba(0,0,0,.5);max-height:85vh;overflow-y:auto">'
+      +'<div style="font-size:17px;font-weight:800;margin-bottom:4px">🆕 Mise à jour de l\'application</div>'
+      +'<div style="font-size:12px;color:var(--muted,#94a3b8);margin-bottom:14px">Nouveautés du 15/07/2026</div>'
+      +NEWS.map(n=>'<div style="display:flex;gap:10px;margin-bottom:12px;font-size:13.5px;line-height:1.5">'
+        +'<div style="font-size:20px;flex-shrink:0">'+n[0]+'</div><div>'+n[1]+'</div></div>').join('')
+      +'<button id="wn-ok" style="margin-top:6px;width:100%;padding:11px;border:none;border-radius:9px;'
+      +'background:#1e40af;color:#fff;font-weight:700;font-size:14px;cursor:pointer">OK, compris !</button>'
+      +'</div>';
+    document.body.appendChild(ov);
+    document.getElementById('wn-ok').onclick=function(){
+      localStorage.setItem('hm_seen_version',APP_VERSION);
+      ov.remove();
+    };
+  }
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',show);
+  else show();
 })();
 </script>
 </body>
