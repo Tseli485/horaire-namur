@@ -154,6 +154,16 @@ def api_auth_me():
 def index():
     return Response(HTML, mimetype='text/html; charset=utf-8')
 
+@app.after_request
+def no_cache_shell(resp):
+    """Empêche le cache navigateur/PWA de servir une vieille version de l'app
+    (les téléphones gardaient l'ancien HTML faute d'en-tête Cache-Control)."""
+    if request.path in ("/", "/dev-version", "/manifest.json"):
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+    return resp
+
 @app.route("/dev-version")
 def dev_version():
     mtime = int(Path(__file__).stat().st_mtime)
