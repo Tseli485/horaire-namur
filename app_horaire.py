@@ -1842,7 +1842,7 @@ select:focus,input:focus{border-color:var(--accent)}
   /* Topbar compact — 1 seule ligne */
   #topbar{padding:4px 8px;gap:4px;flex-direction:row;align-items:center;flex-wrap:wrap}
   #topbar h2{font-size:12px;font-weight:800;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .month-nav{justify-content:flex-end;gap:3px;flex:2}
+  .month-nav{justify-content:flex-end;gap:3px;flex:2;flex-wrap:wrap;row-gap:4px}
   .month-nav button{padding:4px 8px;font-size:12px;min-width:30px;border-radius:7px}
   .month-nav span{font-size:12px;min-width:80px;text-align:center}
   #btn-week-toggle{padding:4px 8px;font-size:11px}
