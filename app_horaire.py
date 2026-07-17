@@ -1073,6 +1073,16 @@ def api_add_event():
         return jsonify({"error": "Agent inconnu"}), 400
     if body["code"] not in LEAVE_CATALOG:
         return jsonify({"error": f"Code inconnu: {body['code']}"}), 400
+    # Maladie 1 jour sans certificat : max 2 par année civile (AR 19/11/1998, mod. 17/05/2019)
+    if body["code"] == "MSC":
+        if body["date_start"] != body["date_end"]:
+            return jsonify({"error": "Maladie sans certificat : 1 seul jour à la fois (BOSA)"}), 400
+        yr = body["date_start"][:4]
+        used = sum(1 for e in data["events"]
+                   if e["agent_id"] == aid and e["code"] == "MSC"
+                   and e["date_start"][:4] == yr)
+        if used >= 2:
+            return jsonify({"error": f"Limite BOSA atteinte : 2 jours sans certificat déjà pris en {yr} — certificat médical requis"}), 400
     ev = {"agent_id": aid, "code": body["code"],
           "label": LEAVE_CATALOG[body["code"]]["label"],
           "category": LEAVE_CATALOG[body["code"]]["category"],
@@ -1128,11 +1138,16 @@ def api_balance(aid, year):
             d += timedelta(1)
         counters[code] = counters.get(code, 0) + days
     vac_used  = counters.get("VAC",  0)
-    sick_used = counters.get("MAL",  0) + counters.get("MAL_LONG", 0)
+    sick_used = counters.get("MAL",  0) + counters.get("MAL_LONG", 0) + counters.get("MSC", 0)
+    # Jours sans certificat : comptés en NOMBRE D'ABSENCES (max 2/an), pas en jours cycle
+    msc_used = sum(1 for e in data["events"]
+                   if e["agent_id"] == aid and e["code"] == "MSC"
+                   and e["date_start"][:4] == str(year))
     return jsonify({
         "agent": agent["name"], "year": year, "age": age,
         "vacances": {"droit": vac_droit,  "utilise": vac_used,  "solde": vac_droit - vac_used},
         "maladie":  {"droit": sick_droit, "utilise": sick_used, "solde": sick_droit - sick_used},
+        "sans_certif": {"droit": 2, "utilise": msc_used, "solde": 2 - msc_used},
         "detail": counters,
     })
 
@@ -3562,14 +3577,14 @@ function renderGrid(cal) {
 
 function renderBalance(bal) {
   document.getElementById('bal-year').textContent=bal.year;
-  const v=bal.vacances, m=bal.maladie;
+  const v=bal.vacances, m=bal.maladie, sc=bal.sans_certif||{droit:2,utilise:0};
   const vPct=Math.round((v.utilise/v.droit)*100);
   const mPct=Math.round((m.utilise/m.droit)*100);
   const vCls=vPct>80?'danger':vPct>60?'warn':'';
   const mCls=mPct>80?'danger':mPct>60?'warn':'';
   let detail='';
   Object.entries(bal.detail||{}).forEach(([k,v])=>{
-    if(k!=='VAC'&&k!=='MAL'&&v>0) detail+=`<div class="balance-row"><span class="balance-label">${catalog[k]?.label||k}</span><span class="balance-value" style="color:var(--green)">${v}j</span></div>`;
+    if(k!=='VAC'&&k!=='MAL'&&k!=='MSC'&&v>0) detail+=`<div class="balance-row"><span class="balance-label">${catalog[k]?.label||k}</span><span class="balance-value" style="color:var(--green)">${v}j</span></div>`;
   });
   document.getElementById('balance-content').innerHTML=`
     <div class="balance-row">
@@ -3583,6 +3598,10 @@ function renderBalance(bal) {
         <div style="display:flex;justify-content:space-between"><span class="balance-label">Maladie</span><span class="balance-value" style="color:${mPct>80?'var(--red)':'var(--green)'}">${m.solde}/${m.droit}j</span></div>
         <div class="balance-bar"><div class="balance-fill ${mCls}" style="width:${mPct}%"></div></div>
       </div>
+    </div>
+    <div class="balance-row">
+      <span class="balance-label">🤒 Maladie sans certificat <span style="opacity:.65">(max 2/an — BOSA)</span></span>
+      <span class="balance-value" style="color:${sc.utilise>=sc.droit?'var(--red)':'var(--green)'}">${sc.utilise} / ${sc.droit}</span>
     </div>
     ${detail}`;
 }
@@ -4117,8 +4136,12 @@ async function doLogout(){
 <script>
 /* ── Avis de mise à jour : affiché UNE fois par version à chaque utilisateur ── */
 (function(){
-  const APP_VERSION='2026-07-15-regimes';
+  const APP_VERSION='2026-07-17-msc';
   const NEWS=[
+    ['🤒','<b>Maladie 1 jour sans certificat</b> — nouveau type d\'absence dans « + Ajouter '
+        +'congé » (catégorie Maladie). Règle BOSA : maximum <b>2 absences d\'un jour par an</b> '
+        +'sans certificat médical — compteur visible dans la carte des soldes, blocage '
+        +'automatique au-delà de 2.'],
     ['👤','<b>Régimes de travail</b> — nouvelle carte « Régime de travail » dans le panneau '
         +'latéral du calendrier : <b>fixe Matin</b>, <b>fixe Soir</b>, <b>fixe Nuit</b> (Lun-Ven, '
         +'week-end repos) ou <b>mi-temps 1 jour sur 2</b> (vous choisissez le premier jour '

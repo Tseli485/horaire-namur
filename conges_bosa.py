@@ -53,6 +53,17 @@ LEAVE_CATALOG = {
         "requires_approval": False,
         "impacts_sick_balance": True,
     },
+    "MSC": {
+        "label": "Maladie 1 jour sans certificat",
+        "category": "MALADIE",
+        "color": "#f1948a",
+        "base_ref": "AR 19/11/1998 (mod. AR 17/05/2019)",
+        "note": "Max 2 absences d'un jour par annee civile sans certificat medical; compte dans le contingent maladie",
+        "annual_days": 2,
+        "fractional": False,
+        "requires_approval": False,
+        "impacts_sick_balance": True,
+    },
     "MAL_LONG": {
         "label": "Longue maladie",
         "category": "MALADIE",
