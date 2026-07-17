@@ -242,6 +242,29 @@ def get_day_info(d: date, agent_id: str, data: dict) -> dict:
     raw_base = get_shift(d, offset)
     base     = raw_base
 
+    # ── RÉGIME DE TRAVAIL PERSONNALISÉ (fixe M/S/N, mi-temps 1 j sur 2) ───────
+    # Remplace le cycle d'équipe comme source du poste de base.
+    # Les surcharges manuelles (override) restent prioritaires : un agent fixe
+    # ou mi-temps peut toujours décider de travailler en pause un jour donné.
+    work_regime = agent.get("work_regime")
+    if work_regime in ("fixe_M", "fixe_S", "fixe_N"):
+        base   = work_regime[-1] if d.weekday() < 5 else 'R'   # Lun-Ven fixe, WE repos
+        regime = None                                           # 4/5 sans objet
+    elif work_regime == "mi_temps":
+        try:
+            _anchor = date.fromisoformat(agent.get("mi_temps_anchor") or "")
+        except ValueError:
+            _anchor = None
+        if _anchor:
+            if (d - _anchor).days % 2 == 0:          # jour travaillé (1 j sur 2)
+                ms = agent.get("mi_temps_shift")
+                if ms in ("M", "S", "N"):
+                    base = ms                        # poste fixe choisi
+                # sinon : on garde le poste du cycle d'équipe ce jour-là
+            else:                                    # jour suivant = non travaillé
+                base = 'R'
+            regime = None
+
     # ── RÉGIME 4/5 ────────────────────────────────────────────────────────────
     # Règles :
     #  1. Le jour désigné (lun-ven) est TOUJOURS vert "4/5".
@@ -370,6 +393,22 @@ def api_patch_agent(aid):
     if "regime_4_5" in body:
         v = body["regime_4_5"]
         data["agents"][aid]["regime_4_5"] = int(v) if v is not None else None
+    if "work_regime" in body:
+        v = body["work_regime"]
+        if v not in (None, "", "cycle", "fixe_M", "fixe_S", "fixe_N", "mi_temps"):
+            return jsonify({"error": "Régime invalide"}), 400
+        data["agents"][aid]["work_regime"] = v if v in ("fixe_M", "fixe_S", "fixe_N", "mi_temps") else None
+    if "mi_temps_anchor" in body:
+        v = body["mi_temps_anchor"]
+        if v:
+            try:
+                date.fromisoformat(v)
+            except ValueError:
+                return jsonify({"error": "Date de départ mi-temps invalide"}), 400
+        data["agents"][aid]["mi_temps_anchor"] = v or None
+    if "mi_temps_shift" in body:
+        v = body["mi_temps_shift"]
+        data["agents"][aid]["mi_temps_shift"] = v if v in ("M", "S", "N") else None
     if "birth_date" in body:
         data["agents"][aid]["birth_date"] = body["birth_date"] or None
     if "career_start" in body:
@@ -1527,7 +1566,7 @@ def api_stats(aid, year):
     hols   = {h[0]: h[2] for h in get_public_holidays(year)}
     months_data = []
     for m in range(1, 13):
-        cm = cm_s = cr = cf = cl = 0
+        cm = cm_s = ca = cr = cf = cl = 0
         for d in range(1, monthrange(year, m)[1]+1):
             info = get_day_info(date(year, m, d), aid, data)
             b = info["base"]
@@ -1535,9 +1574,10 @@ def api_stats(aid, year):
             elif info["code"]:                   cl += 1
             elif b == "M":                        cm += 1
             elif b == "S":                        cm_s += 1
+            elif is_worked_shift(b):              ca += 1   # Nuit, 12H, 08H, décalés
             else:                                 cr += 1
         months_data.append({"month": MONTH_NAMES_FR[m-1][:3],
-                             "M": cm, "S": cm_s, "R": cr, "F": cf, "C": cl})
+                             "M": cm, "S": cm_s, "A": ca, "R": cr, "F": cf, "C": cl})
     return jsonify(months_data)
 
 # ─────────────────────── HTML TEMPLATE ───────────────────────
@@ -2255,6 +2295,32 @@ select:focus,input:focus{border-color:var(--accent)}
         </div>
         <div style="margin-top:10px;font-size:11px;color:var(--muted)" id="label-45"></div>
       </div>
+      <div class="card" id="card-regime">
+        <h3>Régime de travail</h3>
+        <div style="font-size:11px;color:var(--muted);margin-bottom:10px">Cycle d'équipe par défaut. Un régime fixe ou mi-temps remplace le cycle — vous gardez la possibilité de changer le poste d'un jour donné (travail en pause) via le détail du jour.</div>
+        <select id="wr-select" onchange="onWorkRegimeChange()" style="width:100%;padding:8px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px;margin-bottom:8px">
+          <option value="">🔄 Cycle d'équipe (défaut)</option>
+          <option value="fixe_M">🌅 Fixe Matin — Lun-Ven</option>
+          <option value="fixe_S">🌆 Fixe Soir — Lun-Ven</option>
+          <option value="fixe_N">🌙 Fixe Nuit (22h-06h30) — Lun-Ven</option>
+          <option value="mi_temps">½ Mi-temps — 1 jour sur 2</option>
+        </select>
+        <div id="wr-mitemps" style="display:none;flex-direction:column;gap:8px">
+          <label style="font-size:11px;color:var(--muted)">Premier jour travaillé :
+            <input type="date" id="wr-anchor" style="width:100%;padding:7px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px;margin-top:3px">
+          </label>
+          <label style="font-size:11px;color:var(--muted)">Poste des jours travaillés :
+            <select id="wr-shift" style="width:100%;padding:7px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px;margin-top:3px">
+              <option value="">Selon le cycle d'équipe</option>
+              <option value="M">🌅 Matin</option>
+              <option value="S">🌆 Soir</option>
+              <option value="N">🌙 Nuit (22h-06h30)</option>
+            </select>
+          </label>
+        </div>
+        <button class="btn btn-primary btn-sm" style="width:100%;margin-top:8px" onclick="saveWorkRegime()">Enregistrer le régime</button>
+        <div style="margin-top:8px;font-size:11px;color:var(--muted)" id="wr-label"></div>
+      </div>
       <div class="card">
         <h3>Actions rapides</h3>
         <div style="display:flex;flex-direction:column;gap:8px">
@@ -2644,8 +2710,60 @@ function updateAgentInfo(agents) {
   let info = age_str ? `${age_str} | ` : '';
   info += teamLabel(a.team_offset);
   if(a.regime_4_5 != null) info += ` | 4/5 ${WD_SHORT[a.regime_4_5]}`;
+  const WR_SHORT={fixe_M:'Fixe Matin',fixe_S:'Fixe Soir',fixe_N:'Fixe Nuit',mi_temps:'Mi-temps'};
+  if(a.work_regime) info += ` | ${WR_SHORT[a.work_regime]||a.work_regime}`;
   el.textContent = info;
   refresh45UI(a.regime_4_5);
+  fillWorkRegime(a);
+}
+
+// ── RÉGIME DE TRAVAIL (fixe M/S/N, mi-temps 1j/2) ──
+const WR_LABELS={
+  fixe_M:'Fixe Matin (06:00-14:00, Lun-Ven, week-end repos)',
+  fixe_S:'Fixe Soir (14:00-22:00, Lun-Ven, week-end repos)',
+  fixe_N:'Fixe Nuit (22:00-06:30, Lun-Ven, week-end repos)',
+  mi_temps:'Mi-temps : 1 jour travaillé / 1 jour repos'
+};
+function onWorkRegimeChange(){
+  const v=document.getElementById('wr-select').value;
+  document.getElementById('wr-mitemps').style.display = v==='mi_temps' ? 'flex' : 'none';
+}
+function fillWorkRegime(a){
+  const sel=document.getElementById('wr-select'); if(!sel) return;
+  sel.value=a.work_regime||'';
+  const anc=document.getElementById('wr-anchor'); if(anc) anc.value=a.mi_temps_anchor||'';
+  const sh=document.getElementById('wr-shift'); if(sh) sh.value=a.mi_temps_shift||'';
+  onWorkRegimeChange();
+  const lbl=document.getElementById('wr-label');
+  if(lbl){
+    if(a.work_regime){
+      let t='Régime actif : '+(WR_LABELS[a.work_regime]||a.work_regime);
+      if(a.work_regime==='mi_temps'&&a.mi_temps_anchor) t+=' — 1er jour travaillé : '+a.mi_temps_anchor;
+      if(a.work_regime==='mi_temps') t+=' — poste : '+({M:'Matin',S:'Soir',N:'Nuit'}[a.mi_temps_shift]||'selon cycle');
+      lbl.textContent=t;
+    } else lbl.textContent="Régime actuel : cycle d'équipe.";
+  }
+}
+async function saveWorkRegime(){
+  if(!curAgent){ toast('Sélectionnez un agent','error'); return; }
+  const v=document.getElementById('wr-select').value;
+  const body={work_regime:v||null};
+  if(v==='mi_temps'){
+    const a=document.getElementById('wr-anchor').value;
+    if(!a){ toast('Choisissez le premier jour travaillé','error'); return; }
+    body.mi_temps_anchor=a;
+    body.mi_temps_shift=document.getElementById('wr-shift').value||null;
+  }
+  const r=await fetch('/api/agents/'+curAgent,{
+    method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const j=await r.json();
+  if(r.ok){
+    toast('Régime de travail enregistré','ok');
+    fillWorkRegime(j.agent);
+    const ags=await fetch('/api/agents').then(x=>x.json());
+    updateAgentInfo(ags);
+    renderCalendar();
+  } else toast(j.error||'Erreur','error');
 }
 
 function refresh45UI(wd) {
@@ -3457,17 +3575,20 @@ function renderBalance(bal) {
 
 function renderMonthStats(s) {
   if(!s){document.getElementById('month-stats').innerHTML='';return;}
-  const total=s.M+s.S+s.R+s.F+s.C;
+  const sA=s.A||0;
+  const total=s.M+s.S+sA+s.R+s.F+s.C;
   document.getElementById('month-stats').innerHTML=`
     <div class="stat-bar">
       <div style="width:${s.M/total*100}%;background:var(--red);border-radius:6px 0 0 6px" title="Matin ${s.M}j"></div>
       <div style="width:${s.S/total*100}%;background:var(--orange)" title="Soir ${s.S}j"></div>
+      <div style="width:${sA/total*100}%;background:#6366f1" title="Nuit/décalés ${sA}j"></div>
       <div style="width:${(s.R+s.C)/total*100}%;background:var(--green)" title="Repos/Congés ${s.R+s.C}j"></div>
       <div style="width:${s.F/total*100}%;background:var(--green-dark);border-radius:0 6px 6px 0" title="Fériés ${s.F}j"></div>
     </div>
     <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:10px;font-size:12px;color:var(--muted)">
       <span><span style="color:var(--red)">●</span> Matin: ${s.M}j</span>
       <span><span style="color:var(--orange)">●</span> Soir: ${s.S}j</span>
+      ${sA?`<span><span style="color:#a5b4fc">●</span> Nuit/décalés: ${sA}j</span>`:''}
       <span><span style="color:var(--green)">●</span> Repos: ${s.R}j</span>
       <span><span style="color:var(--green-dark)">●</span> Fériés: ${s.F}j</span>
       ${s.C?`<span><span style="color:#86efac">●</span> Congés: ${s.C}j</span>`:''}
@@ -3498,6 +3619,8 @@ function renderMiniMonth(cal) {
     else if(d.code){bc='rgba(34,197,94,.28)';tc='#86efac';}
     else if(d.base==='M'){bc='rgba(239,68,68,.35)';tc='#fca5a5';}
     else if(d.base==='S'){bc='rgba(249,115,22,.35)';tc='#fdba74';}
+    else if(d.base==='N'){bc='rgba(99,102,241,.35)';tc='#a5b4fc';}
+    else if(d.base==='12H'||d.base==='08H'||/^\d{1,2}H\d{2}$/.test(d.base)){bc='rgba(20,184,166,.35)';tc='#5eead4';}
     else if(d.base==='36'||d.base==='38'){bc='rgba(168,85,247,.28)';tc='#d8b4fe';}
     else{bc='rgba(34,197,94,.22)';tc='#86efac';}
     const ring=d.is_today?'box-shadow:0 0 0 1.5px #f8fafc;':'';
@@ -3980,8 +4103,13 @@ async function doLogout(){
 <script>
 /* ── Avis de mise à jour : affiché UNE fois par version à chaque utilisateur ── */
 (function(){
-  const APP_VERSION='2026-07-15-fiche-mois';
+  const APP_VERSION='2026-07-15-regimes';
   const NEWS=[
+    ['👤','<b>Régimes de travail</b> — nouvelle carte « Régime de travail » dans le panneau '
+        +'latéral du calendrier : <b>fixe Matin</b>, <b>fixe Soir</b>, <b>fixe Nuit</b> (Lun-Ven, '
+        +'week-end repos) ou <b>mi-temps 1 jour sur 2</b> (vous choisissez le premier jour '
+        +'travaillé et le poste). Le cycle d\'équipe reste le défaut — et vous pouvez toujours '
+        +'travailler en pause un jour donné via le détail du jour.'],
     ['📄','<b>Fiche mensuelle</b> — nouveau bouton « 📄 Mois » : le mois de votre choix, '
         +'même présentation que la fiche annuelle, avec <b>compteur de jours prestés</b> '
         +'(M, S, N, 12H, 08H, horaires décalés) et <b>tableau de remboursement kilométrique</b> '
