@@ -2743,10 +2743,20 @@ function fillWorkRegime(a){
       lbl.textContent=t;
     } else lbl.textContent="Régime actuel : cycle d'équipe.";
   }
+  // Interaction 4/5 <-> régime : le régime personnalisé suspend le 4/5 -> le dire clairement
+  const c45=document.getElementById('card-45');
+  if(c45) c45.style.opacity = a.work_regime ? .5 : 1;
+  if(a.work_regime && a.regime_4_5 != null){
+    const l45=document.getElementById('label-45');
+    if(l45) l45.textContent = "⚠ 4/5 suspendu : un régime de travail personnalisé est actif. Repassez sur « Cycle d'équipe » pour le réactiver.";
+  }
 }
 async function saveWorkRegime(){
   if(!curAgent){ toast('Sélectionnez un agent','error'); return; }
   const v=document.getElementById('wr-select').value;
+  if(v && document.querySelector('.btn-45.active')){
+    if(!confirm("Ce régime remplace le cycle d'équipe ET suspend votre 4/5 tant qu'il est actif. Continuer ?")) return;
+  }
   const body={work_regime:v||null};
   if(v==='mi_temps'){
     const a=document.getElementById('wr-anchor').value;
@@ -2778,6 +2788,10 @@ function refresh45UI(wd) {
 
 async function set45(wd) {
   if(!curAgent){ toast('Sélectionnez un agent','error'); return; }
+  const _wr=document.getElementById('wr-select');
+  if(wd!=null && _wr && _wr.value){
+    if(!confirm("Un régime de travail personnalisé est actif : le 4/5 ne s'appliquera que si vous repassez sur « Cycle d'équipe ». Continuer ?")) return;
+  }
   const r = await fetch(`/api/agents/${curAgent}`, {
     method:'PATCH',
     headers:{'Content-Type':'application/json'},
