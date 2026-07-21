@@ -247,9 +247,12 @@ def get_day_info(d: date, agent_id: str, data: dict) -> dict:
     # Les surcharges manuelles (override) restent prioritaires : un agent fixe
     # ou mi-temps peut toujours décider de travailler en pause un jour donné.
     work_regime = agent.get("work_regime")
-    if work_regime in ("fixe_M", "fixe_S", "fixe_N"):
-        base   = work_regime[-1] if d.weekday() < 5 else 'R'   # Lun-Ven fixe, WE repos
-        regime = None                                           # 4/5 sans objet
+    _fixed_regime = work_regime in ("fixe_M", "fixe_S", "fixe_N")
+    if _fixed_regime:
+        base = work_regime[-1] if d.weekday() < 5 else 'R'      # Lun-Ven fixe, WE repos
+        # Le 4/5 SE CUMULE avec un régime fixe : le jour désigné devient repos
+        # (traité dans le bloc 4/5 ci-dessous, sans déplacement de repos —
+        #  le cycle d'équipe ne s'applique pas à un régime fixe).
     elif work_regime == "mi_temps":
         try:
             _anchor = date.fromisoformat(agent.get("mi_temps_anchor") or "")
@@ -285,6 +288,10 @@ def get_day_info(d: date, agent_id: str, data: dict) -> dict:
         if d == rest_day:
             # Ce jour EST le 4/5 — base R (repos), code géré plus bas
             base = 'R'
+        elif _fixed_regime:
+            # Régime fixe : poste identique chaque jour ouvrable, donc aucun
+            # repos de cycle (R/38h/36h) à déplacer. Rien à faire.
+            pass
         else:
             # Vérifier si un déplacement (R ou 38h) arrive sur ce jour
             # depuis la semaine courante OU la semaine précédente
@@ -456,6 +463,32 @@ def shift_hours_of(code):
 def is_worked_shift(code):
     """Poste travaillé : M, S, N, 12H, 08H ou horaire décalé (07H30…)."""
     return bool(shift_hours_of(code))
+
+# ── PRORATA BOSA (prestations réduites) ──────────────────────────────────────
+# Règle BOSA : le droit est réduit proportionnellement aux prestations non
+# fournies — droit = Base − (Y × Base / 260) — puis ARRONDI À L'UNITÉ SUPÉRIEURE.
+#   4/5 (Y = 52 j/an)  ->  Base × 4/5   (ex. 33 j -> 26,4 -> 27 j)
+#   mi-temps           ->  Base × 1/2
+# Un régime fixe (Matin/Soir/Nuit, Lun-Ven) reste du temps plein : coefficient 1.
+# Calcul en entiers : évite toute dérive de virgule flottante (0.8 inexact).
+def regime_fraction(agent):
+    """Fraction de prestations (num, den) de l'agent. (1,1) = temps plein."""
+    if agent.get("work_regime") == "mi_temps":
+        return (1, 2)
+    if agent.get("regime_4_5") is not None:
+        return (4, 5)
+    return (1, 1)
+
+def regime_label(frac):
+    """Libellé court du régime pour l'affichage ('' si temps plein)."""
+    return {(4, 5): "4/5", (1, 2): "1/2"}.get(tuple(frac), "")
+
+def prorata_bosa(days, frac):
+    """Droit proratisé, arrondi à l'unité SUPÉRIEURE (règle BOSA)."""
+    num, den = frac
+    if days is None or num == den:
+        return days
+    return -(-int(days) * num // den)   # division entière plafond, exacte
 
 def _hols_dict(year):
     """Construit {date: nom} depuis get_public_holidays (liste de tuples)."""
@@ -1118,8 +1151,10 @@ def api_balance(aid, year):
     else:
         age = agent.get("age", 40)
     vac_info  = get_vac_entitlement(age)
-    vac_droit = vac_info["days"]
-    sick_droit = 21   # allocation annuelle indicative affichage solde carte
+    # Prorata BOSA si prestations réduites (4/5, mi-temps) — arrondi supérieur
+    _frac      = regime_fraction(agent)
+    vac_droit  = prorata_bosa(vac_info["days"], _frac)
+    sick_droit = prorata_bosa(21, _frac)   # allocation annuelle indicative
     counters   = {}
     hols       = {h[0] for h in get_public_holidays(year)}
     offset     = agent["team_offset"]
@@ -1132,8 +1167,10 @@ def api_balance(aid, year):
         d = es
         while d <= ee:
             if d.year == year:
-                base = get_shift(d, offset)
-                if base in ("M","S") and d not in hols:
+                # Poste réellement prévu pour CET agent (4/5, régime fixe,
+                # mi-temps, surcharges) — et non le cycle brut d'équipe.
+                base = get_day_info(d, aid, data)["base"]
+                if is_worked_shift(base) and d not in hols:
                     days += 1
             d += timedelta(1)
         counters[code] = counters.get(code, 0) + days
@@ -1145,6 +1182,7 @@ def api_balance(aid, year):
                    and e["date_start"][:4] == str(year))
     return jsonify({
         "agent": agent["name"], "year": year, "age": age,
+        "regime": regime_label(_frac),   # '4/5', '1/2' ou '' (temps plein)
         "vacances": {"droit": vac_droit,  "utilise": vac_used,  "solde": vac_droit - vac_used},
         "maladie":  {"droit": sick_droit, "utilise": sick_used, "solde": sick_droit - sick_used},
         "sans_certif": {"droit": 2, "utilise": msc_used, "solde": 2 - msc_used},
@@ -1180,6 +1218,11 @@ def api_entitlements(aid, year):
 
     # Droits vacances annuels + reliquat
     vac_info = get_vac_entitlement(age_yr)
+    # Prorata BOSA appliqué aux valeurs INDICATIVES seulement : un quota saisi
+    # manuellement provient de la fiche RH et est déjà proratisé — on n'y touche pas.
+    _frac         = regime_fraction(agent)
+    _regime_lbl   = regime_label(_frac)
+    vac_auto_prorata = prorata_bosa(vac_info["days"], _frac)
     reliquat = data.get("reliquats", {}).get(aid, {}).get(str(year), 0)
     # Capitals manuels saisis par l'utilisateur (overrides calcul auto)
     manual_caps = data.get("capitals", {}).get(aid, {}).get(str(year), {})
@@ -1193,11 +1236,12 @@ def api_entitlements(aid, year):
         age_after_bday = age_yr + 1
         vac_after = get_vac_entitlement(age_after_bday)
         if vac_after["days"] != vac_info["days"]:
+            _after_prorata = prorata_bosa(vac_after["days"], _frac)
             next_bracket_info = {
                 "date":   bday_this_year,
                 "age":    age_after_bday,
-                "days":   vac_after["days"],
-                "delta":  vac_after["days"] - vac_info["days"],
+                "days":   _after_prorata,
+                "delta":  _after_prorata - vac_auto_prorata,
             }
 
     # Capital maladie (calcule a partir d'aujourd'hui, annees COMPLETES sans arrondi)
@@ -1228,8 +1272,10 @@ def api_entitlements(aid, year):
         code = e["code"]
         d = es
         while d <= ee:
-            base = get_shift(d, offset)
-            if base in ("M", "S") and d not in hols(d.year):
+            # Poste réellement prévu pour CET agent (4/5, régime fixe, mi-temps,
+            # surcharges) — et non le cycle brut d'équipe.
+            base = get_day_info(d, aid, data)["base"]
+            if is_worked_shift(base) and d not in hols(d.year):
                 if d.year == year:
                     counters_year[code] = counters_year.get(code, 0) + 1
                 if code in ("MAL", "MAL_LONG"):
@@ -1260,9 +1306,11 @@ def api_entitlements(aid, year):
         "next_bracket":       next_bracket_info,
         "birth_date":         bd_str,
         "career_start":       cs_str,
+        "regime":             _regime_lbl,   # '4/5', '1/2' ou '' (temps plein)
         "vacances": {
             "droit":         vac_droit_eff,
-            "droit_auto":    vac_info["days"],    # toujours disponible pour info
+            "droit_auto":    vac_auto_prorata,        # indicatif, proratisé BOSA
+            "droit_auto_tp": vac_info["days"],        # référence temps plein
             "reliquat":      reliquat,
             "total":         vac_droit_eff + reliquat,
             "utilise":       vac_used,
@@ -1274,8 +1322,13 @@ def api_entitlements(aid, year):
     }
     # Capital maladie : toujours affiché, 0 par défaut jusqu'à saisie manuelle
     effective_capital = sick_cap_manual if sick_cap_manual is not None else 0
+    # Capital indicatif proratisé : BOSA confirme la réduction pour prestations
+    # réduites mais ne publie pas la formule -> estimation, à confirmer par le
+    # service du personnel. Le capital effectif reste la saisie manuelle.
+    _cap_auto = prorata_bosa(sick_info["capital"], _frac) if sick_info else None
     result["maladie"] = {
         "capital":        effective_capital,
+        "capital_auto":   _cap_auto,          # estimation proratisée (indicatif)
         "utilise":        sick_all_years,
         "solde":          effective_capital - sick_all_years,
         "is_advance":     False,
@@ -3266,7 +3319,13 @@ function renderEntitlements(ent) {
   const vNotSet = !v.manual && v.droit === 0;
   let vBody = '';
   if(vNotSet) {
+    // Suggestion BOSA : droit indicatif, déjà proratisé si prestations réduites
+    const sugg = (v.droit_auto != null)
+      ? '<div style="font-size:10px;color:var(--accent);margin-top:2px">≈ ' + v.droit_auto + 'j selon BOSA'
+        + (ent.regime ? ' (' + ent.regime + ' — proratisé)' : '') + '</div>'
+      : '';
     vBody = '<div style="font-size:13px;color:var(--orange);font-weight:700;margin:4px 0">⚠ À définir</div>'
+          + sugg
           + '<div style="font-size:10px;color:var(--muted)">' + v.utilise + 'j déjà pris</div>';
   } else {
     const reliqHtml = v.reliquat > 0
@@ -3297,7 +3356,14 @@ function renderEntitlements(ent) {
     const mManTag = m.manual ? ' <span style="color:var(--orange);font-weight:900">✎</span>' : '';
     let mBody = '';
     if(mNotSet) {
+      // Estimation indicative : BOSA réduit le capital pour prestations réduites
+      // mais ne publie pas la formule -> à confirmer par le service du personnel.
+      const suggM = (m.capital_auto != null)
+        ? '<div style="font-size:10px;color:var(--accent);margin-top:2px">≈ ' + m.capital_auto + 'j estimés'
+          + (ent.regime ? ' (' + ent.regime + ')' : '') + ' — à confirmer RH</div>'
+        : '';
       mBody = '<div style="font-size:13px;color:var(--orange);font-weight:700;margin:4px 0">⚠ À définir</div>'
+            + suggM
             + '<div style="font-size:10px;color:var(--muted)">' + m.utilise + 'j déjà pris</div>';
     } else {
       mBody = '<div style="display:flex;align-items:baseline;gap:4px">'
