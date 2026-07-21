@@ -4233,9 +4233,33 @@ window.APP_VERSION = null;
     b.appendChild(txt); b.appendChild(btn); b.appendChild(close);
     document.body.appendChild(b);
   }
+  /* Confirmation après coup : si l'app était FERMÉE pendant le déploiement,
+     l'agent n'aurait rien vu. On compare la version au dernier lancement
+     (mémorisée sur l'appareil) et on confirme la mise à jour. */
+  function showUpdatedToast(txt){
+    const b=document.createElement('div');
+    b.style.cssText='position:fixed;left:50%;transform:translateX(-50%);bottom:18px;'
+      +'z-index:10000;background:#15803d;color:#fff;padding:11px 16px;border-radius:10px;'
+      +'font-size:13.5px;max-width:92vw;box-shadow:0 6px 24px rgba(0,0,0,.45)';
+    b.textContent='✅ Application mise à jour — version du '+txt;
+    document.body.appendChild(b);
+    setTimeout(()=>b.remove(),7000);
+  }
+  const _KEY='app_version_seen';
   function check(){
     fetch('/dev-version',{cache:'no-store'}).then(r=>r.json()).then(d=>{
-      if(window.APP_VERSION===null){ window.APP_VERSION=d.v; return; }
+      if(window.APP_VERSION===null){
+        window.APP_VERSION=d.v;
+        let seen=null;
+        try{ seen=parseInt(localStorage.getItem(_KEY)||'',10)||null; }catch(e){}
+        if(seen && seen!==d.v){
+          const dt=new Date(d.v*1000);
+          showUpdatedToast(dt.toLocaleDateString('fr-BE')+' à '
+            +dt.toLocaleTimeString('fr-BE',{hour:'2-digit',minute:'2-digit'}));
+        }
+        try{ localStorage.setItem(_KEY,String(d.v)); }catch(e){}
+        return;
+      }
       if(d.v!==window.APP_VERSION) showUpdateBanner();
     }).catch(()=>{});
   }
