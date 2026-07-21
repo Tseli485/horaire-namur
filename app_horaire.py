@@ -249,10 +249,16 @@ def get_day_info(d: date, agent_id: str, data: dict) -> dict:
     work_regime = agent.get("work_regime")
     _fixed_regime = work_regime in ("fixe_M", "fixe_S", "fixe_N")
     if _fixed_regime:
-        base = work_regime[-1] if d.weekday() < 5 else 'R'      # Lun-Ven fixe, WE repos
+        # Lun-Ven : poste fixe tous les jours ouvrables.
+        # Week-end : l'agent reste dans le roulement de son équipe (1 week-end
+        # sur 2 dans le cycle de 56 j) — il travaille alors SON poste fixe.
+        if d.weekday() < 5:
+            base = work_regime[-1]
+        else:
+            base = work_regime[-1] if is_worked_shift(raw_base) else 'R'
         # Le 4/5 SE CUMULE avec un régime fixe : le jour désigné devient repos
         # (traité dans le bloc 4/5 ci-dessous, sans déplacement de repos —
-        #  le cycle d'équipe ne s'applique pas à un régime fixe).
+        #  le cycle d'équipe ne fournit que le rythme des week-ends).
     elif work_regime == "mi_temps":
         try:
             _anchor = date.fromisoformat(agent.get("mi_temps_anchor") or "")
