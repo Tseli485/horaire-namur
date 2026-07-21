@@ -2472,6 +2472,7 @@ select:focus,input:focus{border-color:var(--accent)}
       <div class="form-group"><label>Nouveau PIN (4 chiffres min.)</label><input id="acc-pin" type="password" inputmode="numeric" maxlength="20" placeholder="••••"></div>
       <div class="form-group"><label>&nbsp;</label><button class="btn btn-primary" onclick="changePin()">Mettre à jour</button></div>
     </div>
+    <div id="acc-version" style="font-size:11px;color:var(--muted);text-align:center;margin-top:14px"></div>
     <div class="modal-footer" style="justify-content:space-between">
       <button class="btn btn-danger btn-sm" onclick="deleteMyAccount()" title="Supprime définitivement ton compte et toutes tes données">🗑 Supprimer mon compte</button>
       <div style="display:flex;gap:8px">
@@ -3934,6 +3935,15 @@ function openAgentModal(){
   loadAgents();
   const c=document.getElementById('acc-career');
   if(c && _allAgents[curAgent]) c.value = _allAgents[curAgent].career_start || '';
+  // Version installée : permet de vérifier qu'on a bien la dernière mise à jour
+  const vEl=document.getElementById('acc-version');
+  if(vEl){
+    fetch('/dev-version',{cache:'no-store'}).then(r=>r.json()).then(d=>{
+      const dt=new Date(d.v*1000);
+      vEl.textContent='Version du '+dt.toLocaleDateString('fr-BE')
+        +' à '+dt.toLocaleTimeString('fr-BE',{hour:'2-digit',minute:'2-digit'});
+    }).catch(()=>{ vEl.textContent=''; });
+  }
   openModal('agent-modal');
 }
 
@@ -4187,16 +4197,45 @@ async function doLogout(){
 })();
 </script>
 <script>
-/* ── Live-reload : rafraîchit le browser quand le serveur redémarre ── */
+/* ── Notification de mise à jour ─────────────────────────────────────────
+   Avant : rechargement forcé et silencieux toutes les 2 s (l'agent perdait
+   sa saisie en cours et n'était jamais informé). Maintenant : bandeau visible
+   avec un bouton, l'agent choisit quand actualiser.
+   Vérification toutes les 60 s + à chaque retour sur l'app (onglet/PWA). */
+window.APP_VERSION = null;
 (function(){
-  let _v=null;
+  function showUpdateBanner(){
+    if(document.getElementById('update-banner')) return;
+    const b=document.createElement('div');
+    b.id='update-banner';
+    b.style.cssText='position:fixed;left:50%;transform:translateX(-50%);bottom:18px;'
+      +'z-index:10000;background:#1e40af;color:#fff;padding:12px 16px;border-radius:10px;'
+      +'display:flex;align-items:center;gap:14px;font-size:14px;max-width:92vw;'
+      +'box-shadow:0 6px 24px rgba(0,0,0,.45)';
+    const txt=document.createElement('span');
+    txt.textContent='🔄 Nouvelle version disponible';
+    const btn=document.createElement('button');
+    btn.textContent='Actualiser';
+    btn.style.cssText='background:#fff;color:#1e40af;border:none;border-radius:7px;'
+      +'padding:7px 14px;font-weight:700;cursor:pointer;white-space:nowrap';
+    btn.onclick=()=>location.reload();
+    const close=document.createElement('span');
+    close.textContent='✕';
+    close.title='Plus tard';
+    close.style.cssText='cursor:pointer;opacity:.75;font-size:16px';
+    close.onclick=()=>b.remove();
+    b.appendChild(txt); b.appendChild(btn); b.appendChild(close);
+    document.body.appendChild(b);
+  }
   function check(){
-    fetch('/dev-version').then(r=>r.json()).then(d=>{
-      if(_v===null){_v=d.v;return;}
-      if(d.v!==_v){location.reload();}
+    fetch('/dev-version',{cache:'no-store'}).then(r=>r.json()).then(d=>{
+      if(window.APP_VERSION===null){ window.APP_VERSION=d.v; return; }
+      if(d.v!==window.APP_VERSION) showUpdateBanner();
     }).catch(()=>{});
   }
-  setInterval(check,2000);
+  check();
+  setInterval(check,60000);
+  document.addEventListener('visibilitychange',()=>{ if(!document.hidden) check(); });
 })();
 </script>
 <script>
