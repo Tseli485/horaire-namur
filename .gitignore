@@ -4,3 +4,4 @@ lib/
 *.pdf
 agenda_data.json
 .claude/
+.secret_key
