@@ -203,10 +203,28 @@ def pwa_icon():
     return svg, 200, {"Content-Type": "image/svg+xml"}
 
 # ─────────────────────── DATA HELPERS ────────────────────────
+_DEFAULTS = {"agents": {}, "events": [], "reliquats": {}, "capitals": {},
+             "exchanges": [], "remarks": {}, "shift_overrides": {}}
+
 def load():
-    if DATA_FILE.exists():
-        return json.loads(DATA_FILE.read_text(encoding="utf-8-sig"))
-    return {"agents": {}, "events": [], "reliquats": {}, "capitals": {}, "exchanges": [], "remarks": {}, "shift_overrides": {}}
+    if not DATA_FILE.exists():
+        return json.loads(json.dumps(_DEFAULTS))
+    data = json.loads(DATA_FILE.read_text(encoding="utf-8-sig"))
+    # Normalisation défensive : un export PowerShell (ConvertTo-Json) écrit les
+    # collections vides en objets `{}`. Sans cela, `data["events"].append(...)`
+    # lève AttributeError sur un dict. On rétablit le type attendu.
+    for key, default in _DEFAULTS.items():
+        val = data.get(key)
+        if isinstance(default, list) and not isinstance(val, list):
+            if isinstance(val, dict) and isinstance(val.get("value"), list):
+                data[key] = val["value"]      # {"value": [...], "Count": n}
+            elif isinstance(val, dict) and val:
+                data[key] = list(val.values())
+            else:
+                data[key] = []
+        elif isinstance(default, dict) and not isinstance(val, dict):
+            data[key] = {}
+    return data
 
 def save(data):
     _data_dir.mkdir(parents=True, exist_ok=True)

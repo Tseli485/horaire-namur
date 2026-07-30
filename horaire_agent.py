@@ -28,8 +28,18 @@ N_TEAMS = 8
 OFFSET_PER_TEAM = CYCLE_LEN // N_TEAMS  # = 7 jours
 
 # Mapping equipe (1-8) -> offset dans le cycle de 56j
-# Detecte depuis les PDFs reels (Prison de Namur)
+# Detecte depuis les PDFs reels (Prison de Namur), valide a 100% sur
+# Equipe 7 et Equipe 8 (2026 et 2027).
+# ATTENTION: l'ordre des equipes dans le cycle n'est PAS sequentiel
+# (4, 8, 1, 5, 2, 6, 3, 7). Ne jamais recalculer un numero d'equipe par
+# une formule du type (t - 4) * OFFSET_PER_TEAM : c'est faux.
 TEAM_OFFSETS = {1: 14, 2: 28, 3: 42, 4: 0, 5: 21, 6: 35, 7: 49, 8: 7}
+OFFSET_TO_TEAM = {off: team for team, off in TEAM_OFFSETS.items()}
+
+
+def team_from_offset(offset: int):
+    """Numero d'equipe correspondant a un offset, ou None si non standard."""
+    return OFFSET_TO_TEAM.get(offset % CYCLE_LEN)
 
 MONTH_NAMES_FR = [
     'JANVIER','FEVRIER','MARS','AVRIL','MAI','JUIN',
@@ -109,15 +119,7 @@ def detect_team_offset(pdf_path: str, year: int) -> tuple:
 
     confidence = best_matches / len(real_sequence) * 100
 
-    # Deduire le numero d'equipe (hypothese: equipes decalees de 7j)
-    # Equipe 4 = offset 0 par convention
-    team_num = None
-    for t in range(1, N_TEAMS + 1):
-        if (t - 4) * OFFSET_PER_TEAM % CYCLE_LEN == best_offset:
-            team_num = t
-            break
-
-    return best_offset, team_num, confidence
+    return best_offset, team_from_offset(best_offset), confidence
 
 
 def generate_schedule(year: int, team_offset: int = 0) -> dict:
@@ -176,11 +178,8 @@ def schedule_stats(schedule: dict) -> dict:
 
 def print_schedule(schedule: dict, year: int, team_offset: int):
     """Affiche l'horaire de maniere lisible."""
-    team_info = f"offset={team_offset}j"
-    for t in range(1, N_TEAMS + 1):
-        if (t - 4) * OFFSET_PER_TEAM % CYCLE_LEN == team_offset:
-            team_info = f"Equipe {t}"
-            break
+    _t = team_from_offset(team_offset)
+    team_info = f"Equipe {_t}" if _t else f"offset={team_offset}j"
 
     print(f"\n{'='*60}")
     print(f"HORAIRE {year} - Prison de Namur - {team_info}")
@@ -250,9 +249,8 @@ if __name__ == '__main__':
         print(f"Cycle: {CYCLE_LEN} jours | Offset inter-equipe: {OFFSET_PER_TEAM} jours")
         print(f"Ancre: Equipe 4 = 2026-01-01 = position 1 du cycle\n")
         for t in range(1, N_TEAMS + 1):
-            off = (t - 4) * OFFSET_PER_TEAM % CYCLE_LEN
-            d = ANCHOR
-            sh = get_shift(d, off)
+            off = TEAM_OFFSETS[t]
+            sh = get_shift(ANCHOR, off)
             print(f"  Equipe {t}: offset={off:2d}j | Jan 1 2026 = {sh}")
 
     elif args.action == 'generate':
