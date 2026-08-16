@@ -7,12 +7,13 @@ Lancement: python app_horaire.py  -> http://localhost:5050
 import sys, os, secrets
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'lib'))
 
-import json, uuid as _uuid
+import json, uuid as _uuid, time
+import urllib.request, urllib.parse, urllib.error
 from datetime import date, timedelta
 from calendar import monthrange, isleap
 from pathlib import Path
 
-from flask import Flask, jsonify, request, Response, session
+from flask import Flask, jsonify, request, Response, session, redirect
 from werkzeug.security import generate_password_hash, check_password_hash
 
 from horaire_agent import get_shift, MONTH_NAMES_FR, DAY_NAMES_FR, CYCLE_LEN, ANCHOR
@@ -413,7 +414,8 @@ def api_agents():
     ag  = load()["agents"].get(aid)
     if not ag:
         return jsonify({})
-    return jsonify({aid: {k: v for k, v in ag.items() if k != "pin_hash"}})
+    _hidden = ("pin_hash", "google")   # secrets jamais exposés au navigateur
+    return jsonify({aid: {k: v for k, v in ag.items() if k not in _hidden}})
 
 @app.route("/api/reset", methods=["POST"])
 def api_reset():
@@ -1578,6 +1580,74 @@ def api_exchanges_delete(eid):
     save(data)
     return jsonify({"removed": before - len(data["exchanges"])})
 
+# ── SYNC GOOGLE AGENDA (sens unique : programme -> calendrier dédié) ─────────
+GOOGLE_CLIENT_ID     = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REDIRECT_URI  = os.environ.get("GOOGLE_REDIRECT_URI",
+                                      "https://tseli.pythonanywhere.com/oauth/google/callback")
+GOOGLE_SCOPE = "https://www.googleapis.com/auth/calendar"
+
+@app.route("/api/google/status")
+def google_status():
+    g = load()["agents"].get(current_aid(), {}).get("google", {})
+    return jsonify({
+        "configured": bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET),
+        "connected":  bool(g.get("refresh_token")),
+    })
+
+@app.route("/oauth/google/start")
+def google_oauth_start():
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET):
+        return "Google Agenda non configuré (variables d'environnement manquantes)", 500
+    state = secrets.token_urlsafe(16)
+    session["oauth_state"] = state
+    params = {
+        "client_id":     GOOGLE_CLIENT_ID,
+        "redirect_uri":  GOOGLE_REDIRECT_URI,
+        "response_type": "code",
+        "scope":         GOOGLE_SCOPE,
+        "access_type":   "offline",     # -> refresh_token
+        "prompt":        "consent",     # force le refresh_token à chaque fois
+        "state":         state,
+        "include_granted_scopes": "true",
+    }
+    return redirect("https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params))
+
+@app.route("/oauth/google/callback")
+def google_oauth_callback():
+    aid = current_aid()
+    if not aid:
+        return "Session expirée — reconnectez-vous à l'app puis réessayez.", 401
+    if request.args.get("state") != session.get("oauth_state"):
+        return "État OAuth invalide (sécurité CSRF) — relancez la connexion.", 400
+    if request.args.get("error"):
+        return f"Autorisation Google refusée : {request.args.get('error')}", 400
+    code = request.args.get("code")
+    if not code:
+        return "Code d'autorisation manquant.", 400
+    body = urllib.parse.urlencode({
+        "code":          code,
+        "client_id":     GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "redirect_uri":  GOOGLE_REDIRECT_URI,
+        "grant_type":    "authorization_code",
+    }).encode()
+    req = urllib.request.Request("https://oauth2.googleapis.com/token", data=body,
+                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            tok = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        return "Échec de l'échange de token : " + e.read().decode()[:400], 400
+    d = load()
+    g = d["agents"][aid].setdefault("google", {})
+    if tok.get("refresh_token"):
+        g["refresh_token"] = tok["refresh_token"]
+    g["access_token"] = tok.get("access_token")
+    g["expiry"]       = int(time.time()) + int(tok.get("expires_in", 0))
+    save(d)
+    return redirect("/?gconnected=1")
+
 @app.route("/api/ical_url")
 def api_ical_url():
     """Renvoie le lien iCal privé (avec jeton) de l'agent connecté."""
@@ -2595,6 +2665,9 @@ select:focus,input:focus{border-color:var(--accent)}
       <div class="form-group"><label>Nouveau PIN (4 chiffres min.)</label><input id="acc-pin" type="password" inputmode="numeric" maxlength="20" placeholder="••••"></div>
       <div class="form-group"><label>&nbsp;</label><button class="btn btn-primary" onclick="changePin()">Mettre à jour</button></div>
     </div>
+    <hr style="border-color:var(--border);margin:16px 0">
+    <div style="font-size:13px;font-weight:600;margin-bottom:8px">🔗 Google Agenda</div>
+    <div id="acc-google" style="font-size:12px;color:var(--muted)">Chargement…</div>
     <div id="acc-version" style="font-size:11px;color:var(--muted);text-align:center;margin-top:14px"></div>
     <div class="modal-footer" style="justify-content:space-between">
       <button class="btn btn-danger btn-sm" onclick="deleteMyAccount()" title="Supprime définitivement ton compte et toutes tes données">🗑 Supprimer mon compte</button>
@@ -4091,6 +4164,20 @@ function openAgentModal(){
   const c=document.getElementById('acc-career');
   if(c && _allAgents[curAgent]) c.value = _allAgents[curAgent].career_start || '';
   // Version installée : permet de vérifier qu'on a bien la dernière mise à jour
+  const gEl=document.getElementById('acc-google');
+  if(gEl){
+    gEl.textContent='Chargement…';
+    fetch('/api/google/status').then(r=>r.json()).then(s=>{
+      if(!s.configured){
+        gEl.innerHTML='<span style="color:#f59e0b">⚠ Non configuré côté serveur (variables d\'environnement Google manquantes).</span>';
+      } else if(s.connected){
+        gEl.innerHTML='<span style="color:var(--green,#16a34a)">✅ Connecté à Google Agenda.</span>'
+          +' <button class="btn btn-sm" style="background:var(--card2);margin-left:6px" onclick="location.href=\'/oauth/google/start\'">Reconnecter</button>';
+      } else {
+        gEl.innerHTML='<button class="btn btn-sm btn-primary" onclick="location.href=\'/oauth/google/start\'">🔗 Connecter mon Google Agenda</button>';
+      }
+    }).catch(()=>{ gEl.textContent='Indisponible.'; });
+  }
   const vEl=document.getElementById('acc-version');
   if(vEl){
     fetch('/dev-version',{cache:'no-store'}).then(r=>r.json()).then(d=>{
