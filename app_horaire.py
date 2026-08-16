@@ -354,11 +354,13 @@ def get_day_info(d: date, agent_id: str, data: dict) -> dict:
                and date.fromisoformat(e["date_start"]) <= d
                <= date.fromisoformat(e["date_end"])]
     eff, code, label = base, None, None
+    ev_status = None                      # 'demande' | 'accepte' pour un congé posé
     if d in hols:
         eff, code, label = hols[d][0], hols[d][0], hols[d][1]
     if events:
         ev = events[0]
         eff, code, label = ev["code"], ev["code"], ev["label"]
+        ev_status = ev.get("status", "accepte")   # anciens congés = acceptés
 
     # ── JOUR 4/5 (priorité SUR fériés/ponts, sous congés explicites/overrides) ──
     # Un jour 4/5 reste affiché 4/5 même si c'est un jour férié.
@@ -388,6 +390,7 @@ def get_day_info(d: date, agent_id: str, data: dict) -> dict:
     return {"date": d.isoformat(), "day_num": d.day, "day_name": DAY_NAMES_FR[d.weekday()],
             "weekday": d.weekday(), "base": base, "effective": eff,
             "code": code, "label": label, "color": color,
+            "event_status": ev_status,
             "is_today": d == date.today(), "events": events, "remark": "",
             "decale_38": decale_38, "decale_r": decale_r}
 
@@ -1140,12 +1143,66 @@ def api_add_event():
                    and e["date_start"][:4] == yr)
         if used >= 2:
             return jsonify({"error": f"Limite BOSA atteinte : 2 jours sans certificat déjà pris en {yr} — certificat médical requis"}), 400
+    status = body.get("status", "demande")
+    if status not in ("demande", "accepte"):
+        status = "demande"
     ev = {"agent_id": aid, "code": body["code"],
           "label": LEAVE_CATALOG[body["code"]]["label"],
           "category": LEAVE_CATALOG[body["code"]]["category"],
           "date_start": body["date_start"], "date_end": body["date_end"],
-          "note": body.get("note", ""), "created": date.today().isoformat()}
+          "note": body.get("note", ""), "status": status,
+          "created": date.today().isoformat()}
     data["events"].append(ev)
+    save(data)
+    return jsonify({"ok": True})
+
+@app.route("/api/events/confirm", methods=["POST"])
+def api_confirm_event():
+    """Confirme un congé demandé — en totalité ou sur une plage partielle.
+    La partie confirmée passe en 'accepte' ; le reste demeure 'demande'
+    (un congé peut donc être scindé en jusqu'à 3 morceaux)."""
+    data = load()
+    body = request.json or {}
+    aid  = body.get("agent_id")
+    if aid not in data["agents"]:
+        return jsonify({"error": "Agent inconnu"}), 400
+    key = (body.get("code"), body.get("date_start"), body.get("date_end"))
+    # Plage confirmée (par défaut : tout le congé)
+    c_start = body.get("confirm_start") or key[1]
+    c_end   = body.get("confirm_end")   or key[2]
+    try:
+        cs, ce = date.fromisoformat(c_start), date.fromisoformat(c_end)
+    except (ValueError, TypeError):
+        return jsonify({"error": "Dates de confirmation invalides"}), 400
+
+    out, target = [], None
+    for e in data["events"]:
+        if (e["agent_id"] == aid and e["code"] == key[0]
+                and e["date_start"] == key[1] and e["date_end"] == key[2]
+                and e.get("status", "accepte") == "demande"):
+            target = e
+        else:
+            out.append(e)
+    if target is None:
+        return jsonify({"error": "Congé demandé introuvable"}), 404
+
+    es, ee = date.fromisoformat(target["date_start"]), date.fromisoformat(target["date_end"])
+    cs, ce = max(cs, es), min(ce, ee)
+    if cs > ce:
+        return jsonify({"error": "La plage confirmée est hors du congé"}), 400
+
+    def _clone(s, e, st):
+        n = dict(target); n["date_start"] = s.isoformat()
+        n["date_end"] = e.isoformat(); n["status"] = st
+        return n
+
+    if es < cs:                              # avant : reste demandé
+        out.append(_clone(es, cs - timedelta(1), "demande"))
+    out.append(_clone(cs, ce, "accepte"))    # confirmé
+    if ce < ee:                              # après : reste demandé
+        out.append(_clone(ce + timedelta(1), ee, "demande"))
+
+    data["events"] = out
     save(data)
     return jsonify({"ok": True})
 
@@ -1179,7 +1236,8 @@ def api_balance(aid, year):
     _frac      = regime_fraction(agent)
     vac_droit  = prorata_bosa(vac_info["days"], _frac)
     sick_droit = prorata_bosa(21, _frac)   # allocation annuelle indicative
-    counters   = {}
+    counters   = {}   # jours ACCEPTÉS (entament le solde)
+    pending    = {}   # jours DEMANDÉS (comptés à part, provisoires)
     hols       = {h[0] for h in get_public_holidays(year)}
     offset     = agent["team_offset"]
     for e in data["events"]:
@@ -1197,8 +1255,10 @@ def api_balance(aid, year):
                 if is_worked_shift(base) and d not in hols:
                     days += 1
             d += timedelta(1)
-        counters[code] = counters.get(code, 0) + days
+        bucket = pending if e.get("status", "accepte") == "demande" else counters
+        bucket[code] = bucket.get(code, 0) + days
     vac_used  = counters.get("VAC",  0)
+    vac_att   = pending.get("VAC",   0)   # vacances en attente de validation
     sick_used = counters.get("MAL",  0) + counters.get("MAL_LONG", 0) + counters.get("MSC", 0)
     # Jours sans certificat : comptés en NOMBRE D'ABSENCES (max 2/an), pas en jours cycle
     msc_used = sum(1 for e in data["events"]
@@ -1207,10 +1267,11 @@ def api_balance(aid, year):
     return jsonify({
         "agent": agent["name"], "year": year, "age": age,
         "regime": regime_label(_frac),   # '4/5', '1/2' ou '' (temps plein)
-        "vacances": {"droit": vac_droit,  "utilise": vac_used,  "solde": vac_droit - vac_used},
+        "vacances": {"droit": vac_droit,  "utilise": vac_used,  "solde": vac_droit - vac_used,
+                     "en_attente": vac_att},
         "maladie":  {"droit": sick_droit, "utilise": sick_used, "solde": sick_droit - sick_used},
         "sans_certif": {"droit": 2, "utilise": msc_used, "solde": 2 - msc_used},
-        "detail": counters,
+        "detail": counters, "en_attente": pending,
     })
 
 @app.route("/api/entitlements/<aid>/<int:year>")
@@ -1285,7 +1346,8 @@ def api_entitlements(aid, year):
         return _hc[yr]
 
     # Comptage de tous les conges : cette annee + total toutes annees pour MAL
-    counters_year  = {}   # code -> jours ouvres pris cette annee
+    counters_year  = {}   # code -> jours ACCEPTÉS pris cette annee
+    pending_year   = {}   # code -> jours DEMANDÉS (en attente), cette annee
     sick_all_years = 0    # total historique MAL/MAL_LONG pour le capital
 
     for e in data["events"]:
@@ -1294,6 +1356,7 @@ def api_entitlements(aid, year):
         es   = date.fromisoformat(e["date_start"])
         ee   = date.fromisoformat(e["date_end"])
         code = e["code"]
+        is_pending = e.get("status", "accepte") == "demande"
         d = es
         while d <= ee:
             # Poste réellement prévu pour CET agent (4/5, régime fixe, mi-temps,
@@ -1301,8 +1364,12 @@ def api_entitlements(aid, year):
             base = get_day_info(d, aid, data)["base"]
             if is_worked_shift(base) and d not in hols(d.year):
                 if d.year == year:
-                    counters_year[code] = counters_year.get(code, 0) + 1
-                if code in ("MAL", "MAL_LONG"):
+                    if is_pending:
+                        pending_year[code] = pending_year.get(code, 0) + 1
+                    else:
+                        counters_year[code] = counters_year.get(code, 0) + 1
+                # Un congé maladie n'est pas "demandé" ; on ne compte que l'accepté
+                if code in ("MAL", "MAL_LONG") and not is_pending:
                     sick_all_years += 1
             d += timedelta(1)
 
@@ -1314,11 +1381,13 @@ def api_entitlements(aid, year):
         used_yr = counters_year.get(code, 0)
         quota   = info.get("days")  # None si variable
         # Inclure si utilise OU si quota fixe (circonstances, specials)
-        if used_yr > 0 or (quota is not None):
+        pend_yr = pending_year.get(code, 0)
+        if used_yr > 0 or pend_yr > 0 or (quota is not None):
             conges_detail[code] = {
                 "label":    info["label"],
                 "category": info["category"],
                 "used":     used_yr,
+                "pending":  pend_yr,
                 "quota":    quota,
             }
 
@@ -1341,6 +1410,7 @@ def api_entitlements(aid, year):
             "solde":         vac_droit_eff + reliquat - vac_used,
             "epargnable_an": vac_info["annual_save"],
             "manual":        vac_droit_manual is not None,
+            "en_attente":    pending_year.get("VAC", 0),
         },
         "conges_detail": conges_detail,
     }
@@ -1559,7 +1629,10 @@ def export_ical(aid):
 
         # Titre de l'événement
         if code and code not in ("REPOS-38", "REPOS-R"):
-            title = f"🗓 {label}"
+            if info.get("event_status") == "demande":
+                title = f"❔ {label} (demandé)"
+            else:
+                title = f"🗓 {label}"
             transp = "TRANSPARENT"
             color  = "7"   # cyan = congé/férié
         elif eff in SHIFT_LABELS:
@@ -1788,6 +1861,7 @@ select:focus,input:focus{border-color:var(--accent)}
 .b-violet{border-left-color:#a78bfa}
 .b-teal  {border-left-color:#2dd4bf}
 .b-indigo{border-left-color:#818cf8}
+.b-amber {border-left-color:#f59e0b}
 
 /* Fonds tintés des cellules */
 .c-red   {background:rgba(239,68,68,.14)!important}
@@ -1798,6 +1872,7 @@ select:focus,input:focus{border-color:var(--accent)}
 .c-violet{background:rgba(139,92,246,.16)!important}
 .c-teal  {background:rgba(20,184,166,.16)!important}
 .c-indigo{background:rgba(99,102,241,.16)!important}
+.c-amber {background:rgba(245,158,11,.18)!important}
 
 /* Pills plus opaques */
 .p-red   {background:rgba(239,68,68,.35);color:#fca5a5;font-weight:900}
@@ -1808,6 +1883,7 @@ select:focus,input:focus{border-color:var(--accent)}
 .p-violet{background:rgba(139,92,246,.35);color:#c4b5fd;font-weight:900}
 .p-teal  {background:rgba(20,184,166,.35);color:#5eead4;font-weight:900}
 .p-indigo{background:rgba(99,102,241,.38);color:#c7d2fe;font-weight:900}
+.p-amber {background:rgba(245,158,11,.38);color:#fcd34d;font-weight:900}
 
 /* Numéros colorés par type */
 .n-red   .day-num{color:#f87171}
@@ -1818,6 +1894,7 @@ select:focus,input:focus{border-color:var(--accent)}
 .n-violet .day-num{color:#a78bfa}
 .n-teal   .day-num{color:#2dd4bf}
 .n-indigo .day-num{color:#818cf8}
+.n-amber  .day-num{color:#fbbf24}
 /* today override : cercle blanc brillant */
 .cal-day.today .day-num{color:#fff!important}
 
@@ -2468,6 +2545,14 @@ select:focus,input:focus{border-color:var(--accent)}
     <div class="form-group">
       <label>Note (optionnel)</label>
       <input type="text" id="leave-note-text" placeholder="Ex: grippe, congé été...">
+    </div>
+    <div class="form-group">
+      <label>Statut</label>
+      <select id="leave-status">
+        <option value="demande" selected>⏳ Demandé (en attente de validation)</option>
+        <option value="accepte">✅ Déjà accepté (officiel)</option>
+      </select>
+      <div class="form-note">Un congé demandé pourra être confirmé (total ou partiel) une fois accordé.</div>
     </div>
     <div class="modal-footer">
       <button class="btn" onclick="closeModal('leave-modal')" style="background:var(--card2)">Annuler</button>
@@ -3240,8 +3325,10 @@ async function renderWeekView() {
       bCls='b-green'; cCls='c-green'; pCls='p-green'; pillTxt='Repos';
       reasonTxt=code==='REPOS-38'?'38h décalé':'Repos décalé';
     } else if(code){
-      bCls='b-green'; cCls='c-green'; pCls='p-green'; pillTxt='Congé';
-      reasonTxt=day.label||code;
+      const pend=day.event_status==='demande';
+      bCls=pend?'b-amber':'b-green'; cCls=pend?'c-amber':'c-green'; pCls=pend?'p-amber':'p-green';
+      pillTxt=pend?'⏳ Demandé':'Congé';
+      reasonTxt=(pend?'⏳ ':'')+(day.label||code);
     } else if(base==='M'){
       bCls='b-red'; cCls='c-red'; pCls='p-red'; pillTxt='Matin'; hours=day.shift_hours||'06:00 – 14:00';
     } else if(base==='S'){
@@ -3617,9 +3704,11 @@ function renderGrid(cal) {
       pillTxt='REPOS';
       reasonTxt=code==='REPOS-38'?'38h decale':'R decale';
     } else if(code){
-      bCls='b-green'; cCls='c-green'; nCls='n-green'; pCls='p-green';
-      pillTxt='CONGÉ';
-      const lbl=day.label||code;
+      const pend=day.event_status==='demande';
+      bCls=pend?'b-amber':'b-green'; cCls=pend?'c-amber':'c-green';
+      nCls=pend?'n-amber':'n-green'; pCls=pend?'p-amber':'p-green';
+      pillTxt=pend?'⏳ DEM.':'CONGÉ';
+      const lbl=(pend?'⏳ ':'')+(day.label||code);
       reasonTxt=lbl.length>26?lbl.substring(0,24)+'…':lbl;
     } else if(base==='M'){
       bCls='b-red';    cCls='c-red';    nCls='n-red';    pCls='p-red';    pillTxt='MATIN';
@@ -3831,14 +3920,25 @@ async function renderDayModal(dateStr) {
   // Events
   let evHTML=`<div class="dm-sec-title">Congés / Absences</div>`;
   if(d.events&&d.events.length>0){
-    evHTML+=d.events.map(e=>`
+    evHTML+=d.events.map(e=>{
+      const st = e.status || 'accepte';
+      const badge = st==='demande'
+        ? '<span style="background:#fef3c7;color:#92400e;font-size:10px;font-weight:800;padding:2px 7px;border-radius:10px">⏳ DEMANDÉ</span>'
+        : '<span style="background:#dcfce7;color:#166534;font-size:10px;font-weight:800;padding:2px 7px;border-radius:10px">✅ ACCEPTÉ</span>';
+      const ident = `'${e.agent_id}','${e.code}','${e.date_start}','${e.date_end}'`;
+      const confirmBtns = st==='demande'
+        ? `<button class="btn btn-sm" style="background:var(--green,#16a34a);color:#fff" onclick="confirmEvent(${ident},true)">✅ Tout accepter</button>
+           <button class="btn btn-sm" style="background:var(--card2)" onclick="confirmEvent(${ident},false)">Partiel…</button>`
+        : '';
+      return `
       <div class="dm-event-row">
         <div>
-          <div class="dm-ev-label">${e.label}</div>
+          <div class="dm-ev-label">${e.label} ${badge}</div>
           <div class="dm-ev-meta">${e.date_start} au ${e.date_end}${e.note?' · '+e.note:''}</div>
+          <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">${confirmBtns}</div>
         </div>
         <button class="btn btn-danger btn-sm" onclick="removeEvent('${e.agent_id}','${e.date_start}','${e.code}')">Suppr.</button>
-      </div>`).join('');
+      </div>`;}).join('');
   } else {
     evHTML+=`<div style="color:var(--muted);font-size:12px;padding:10px 0">Aucun congé enregistré pour ce jour.</div>`;
   }
@@ -3937,13 +4037,29 @@ async function submitLeave() {
   const start=document.getElementById('leave-start').value;
   const end=document.getElementById('leave-end').value;
   const note=document.getElementById('leave-note-text').value;
+  const stEl=document.getElementById('leave-status');
+  const status = stEl ? stEl.value : 'demande';
   if(!curAgent){toast('Sélectionnez un agent','error');return;}
   if(!code||!start||!end){toast('Remplissez tous les champs','error');return;}
   if(start>end){toast('Date fin < date début','error');return;}
   const r=await fetch('/api/events',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({agent_id:curAgent,code,date_start:start,date_end:end,note})});
-  if(r.ok){toast('Congé enregistré');closeModal('leave-modal');renderCalendar();}
+    body:JSON.stringify({agent_id:curAgent,code,date_start:start,date_end:end,note,status})});
+  if(r.ok){toast(status==='accepte'?'Congé accepté enregistré':'Demande de congé enregistrée');closeModal('leave-modal');renderCalendar();}
   else toast('Erreur lors de l\'enregistrement','error');
+}
+
+async function confirmEvent(agent,code,start,end,full){
+  let cs=start, ce=end;
+  if(!full){
+    cs=prompt('Confirmer À PARTIR du (AAAA-MM-JJ) :',start);
+    if(!cs) return;
+    ce=prompt('Confirmer JUSQU\'AU (AAAA-MM-JJ) :',end);
+    if(!ce) return;
+  }
+  const r=await fetch('/api/events/confirm',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({agent_id:agent,code,date_start:start,date_end:end,confirm_start:cs,confirm_end:ce})});
+  if(r.ok){toast(full?'Congé accepté ✅':'Jours confirmés ✅');renderCalendar();if(_dayDate) renderDayModal(_dayDate);}
+  else{const j=await r.json().catch(()=>({}));toast(j.error||'Erreur','error');}
 }
 
 async function removeEvent(agent,start,code) {
