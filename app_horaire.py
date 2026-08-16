@@ -1648,6 +1648,169 @@ def google_oauth_callback():
     save(d)
     return redirect("/?gconnected=1")
 
+# ── PHASE 2/3 : écriture des postes dans un calendrier Google dédié ─────────
+# Sens unique programme -> Google. Calendrier séparé "Horaire Prison" créé sur
+# le compte de l'agent ; l'agenda personnel de l'utilisateur n'est jamais touché.
+GOOGLE_COLOR_ID = {  # -> Google Calendar colorId (mêmes couleurs que l'app)
+    "red": "11", "orange": "6", "indigo": "9", "purple": "3",
+    "teal": "7", "green": "10", "blue": "2",
+}
+GOOGLE_SHIFT_TITLES = {
+    "M": "🌅 MATIN", "S": "🌆 SOIR", "N": "🌙 NUIT",
+    "12H": "🕛 JOUR 12H", "08H": "🕗 JOUR 08H",
+}
+GOOGLE_SYNC_PAST_DAYS   = 31    # ~1 mois passé
+GOOGLE_SYNC_FUTURE_DAYS = 120   # ~4 mois futurs (limite les appels API par sync)
+
+def _google_ensure_token(aid, data):
+    """Rafraîchit l'access_token via le refresh_token si expiré (ou absent)."""
+    g = data["agents"][aid].get("google", {})
+    if not g.get("refresh_token"):
+        return None
+    if g.get("access_token") and int(g.get("expiry", 0)) > int(time.time()) + 60:
+        return g["access_token"]
+    body = urllib.parse.urlencode({
+        "client_id":     GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "refresh_token": g["refresh_token"],
+        "grant_type":    "refresh_token",
+    }).encode()
+    req = urllib.request.Request("https://oauth2.googleapis.com/token", data=body,
+                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            tok = json.loads(r.read().decode())
+    except urllib.error.HTTPError:
+        return None
+    g["access_token"] = tok.get("access_token")
+    g["expiry"]       = int(time.time()) + int(tok.get("expires_in", 0))
+    data["agents"][aid]["google"] = g
+    save(data)
+    return g["access_token"]
+
+def _google_api(aid, data, method, path, body=None, params=None):
+    """Appel authentifié à l'API Google Calendar v3. Réessaie brièvement en cas
+    de limite de débit (429/403 rateLimitExceeded)."""
+    token = _google_ensure_token(aid, data)
+    if not token:
+        raise RuntimeError("Google Agenda non connecté — cliquez sur 'Connecter mon Google Agenda'.")
+    url = "https://www.googleapis.com/calendar/v3" + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    payload = json.dumps(body).encode() if body is not None else None
+    last_err = None
+    for attempt in range(3):
+        req = urllib.request.Request(url, data=payload, method=method,
+                                     headers={"Authorization": f"Bearer {token}",
+                                              "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                raw = r.read()
+                return json.loads(raw) if raw else None
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code in (403, 429) and attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            raise RuntimeError(f"Erreur API Google ({e.code}) : {e.read().decode()[:300]}")
+    raise RuntimeError(f"Erreur API Google ({last_err.code}) après réessais.")
+
+def _google_ensure_calendar(aid, data):
+    """Crée le calendrier dédié 'Horaire Prison' et enregistre son id."""
+    created = _google_api(aid, data, "POST", "/calendars",
+                          body={"summary": "Horaire Prison", "timeZone": "Europe/Brussels"})
+    cal_id = created["id"]
+    g = data["agents"][aid].setdefault("google", {})
+    g["calendar_id"] = cal_id
+    save(data)
+    return cal_id
+
+def _google_list_events(aid, data, cal_id_quoted):
+    items, page_token = [], None
+    while True:
+        params = {"maxResults": 250}
+        if page_token:
+            params["pageToken"] = page_token
+        page = _google_api(aid, data, "GET", f"/calendars/{cal_id_quoted}/events", params=params)
+        items += page.get("items", [])
+        page_token = page.get("nextPageToken")
+        if not page_token:
+            break
+    return items
+
+def _google_sync_events(aid):
+    """Vide le calendrier dédié puis le réécrit avec les postes de l'agent
+    (sur la fenêtre GOOGLE_SYNC_PAST_DAYS/GOOGLE_SYNC_FUTURE_DAYS)."""
+    data = load()
+    if aid not in data["agents"]:
+        raise RuntimeError("Agent inconnu.")
+
+    cal_id = data["agents"][aid].get("google", {}).get("calendar_id")
+    existing = []
+    if cal_id:
+        try:
+            existing = _google_list_events(aid, data, urllib.parse.quote(cal_id))
+        except RuntimeError:
+            cal_id = None   # calendrier supprimé côté Google -> on en recrée un
+    if not cal_id:
+        cal_id = _google_ensure_calendar(aid, data)
+
+    q = urllib.parse.quote(cal_id)
+    for ev in existing:
+        _google_api(aid, data, "DELETE", f"/calendars/{q}/events/{ev['id']}")
+    deleted = len(existing)
+
+    start = date.today() - timedelta(days=GOOGLE_SYNC_PAST_DAYS)
+    end   = date.today() + timedelta(days=GOOGLE_SYNC_FUTURE_DAYS)
+    cur = start
+    created = 0
+    while cur < end:
+        info = get_day_info(cur, aid, data)
+        eff, code, label = info["effective"], info["code"], info["label"]
+
+        if code and code not in ("REPOS-38", "REPOS-R"):
+            title = f"❔ {label} (demandé)" if info.get("event_status") == "demande" else f"🗓 {label}"
+        elif is_worked_shift(eff):
+            title = GOOGLE_SHIFT_TITLES.get(eff, f"🕐 DÉCALÉ {eff}")
+        else:
+            cur += timedelta(1)
+            continue
+
+        color_id = GOOGLE_COLOR_ID.get(info["color"], "8")
+        hours = None if code else shift_hours_of(eff)
+        if hours:
+            h1, h2 = [x.strip() for x in hours.split("–")]
+            end_date = (cur + timedelta(1)) if h2 <= h1 else cur
+            body = {
+                "summary": title,
+                "colorId": color_id,
+                "start": {"dateTime": f"{cur.isoformat()}T{h1}:00", "timeZone": "Europe/Brussels"},
+                "end":   {"dateTime": f"{end_date.isoformat()}T{h2}:00", "timeZone": "Europe/Brussels"},
+            }
+        else:
+            body = {
+                "summary": title,
+                "colorId": color_id,
+                "start": {"date": cur.isoformat()},
+                "end":   {"date": (cur + timedelta(1)).isoformat()},
+            }
+        _google_api(aid, data, "POST", f"/calendars/{q}/events", body=body)
+        created += 1
+        cur += timedelta(1)
+
+    return {"deleted": deleted, "created": created}
+
+@app.route("/api/google/sync", methods=["POST"])
+def api_google_sync():
+    aid = current_aid()
+    if not aid:
+        return jsonify({"error": "Non connecté"}), 401
+    try:
+        result = _google_sync_events(aid)
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, **result})
+
 @app.route("/api/ical_url")
 def api_ical_url():
     """Renvoie le lien iCal privé (avec jeton) de l'agent connecté."""
@@ -2934,28 +3097,37 @@ function toggleMobilePanel() {
 
 async function syncGoogleCal() {
   if(!curAgent) return;
-  const res = await fetch('/api/ical_url').then(r=>r.json()).catch(()=>null);
-  if(!res || !res.url){ toast('Lien iCal indisponible','error'); return; }
-  const icalUrl = res.url;
-  const gcalUrl = 'https://calendar.google.com/calendar/r?cid=' + encodeURIComponent(icalUrl);
+  const ok = confirm('Ceci va vider le calendrier Google "Horaire Prison" puis le réécrire '
+    + 'avec votre horaire actuel (1 mois passé + 4 mois à venir). Votre agenda personnel '
+    + 'n\'est jamais modifié. Continuer ?');
+  if(!ok) return;
+  const btn  = document.getElementById('btn-gcal');
   const info = document.getElementById('gcal-info');
   info.style.display = 'block';
-  info.innerHTML = '';
-  const safeIcal = document.createTextNode(icalUrl);
-  const aIcal = document.createElement('a');
-  aIcal.href = icalUrl; aIcal.style.cssText = 'color:var(--accent);word-break:break-all';
-  aIcal.appendChild(safeIcal);
-  const aGcal = document.createElement('a');
-  aGcal.href = gcalUrl; aGcal.target = '_blank';
-  aGcal.style.cssText = 'color:#4285f4;font-weight:700';
-  aGcal.textContent = '▶ Ouvrir dans Google Agenda';
-  info.insertAdjacentHTML('beforeend', '<b>Lien iCal :</b><br>');
-  info.appendChild(aIcal);
-  info.insertAdjacentHTML('beforeend', '<br><br><b>Méthode 1 — Bouton automatique :</b><br>');
-  info.appendChild(aGcal);
-  info.insertAdjacentHTML('beforeend', '<br><br><b>Méthode 2 — Manuel :</b><br>Google Agenda → Autres agendas (+) → Via URL → coller le lien iCal');
-  // Essayer d\'ouvrir directement
-  window.open(gcalUrl, '_blank');
+  info.textContent = 'Synchronisation en cours…';
+  if(btn) btn.disabled = true;
+  try {
+    const r = await fetch('/api/google/sync', {method:'POST'});
+    const body = await r.json().catch(()=>({}));
+    if(!r.ok){
+      if(/connect/i.test(body.error||'')){
+        info.textContent = 'Non connecté à Google Agenda.';
+        toast('Connectez d\'abord votre compte Google (⚙ Mon compte → Google Agenda)','error');
+      } else {
+        info.textContent = 'Erreur : ' + (body.error || 'inconnue');
+        toast('Échec de la synchronisation','error');
+      }
+      return;
+    }
+    info.textContent = `✅ Synchronisé : ${body.created} événement(s) écrit(s) `
+      + `(${body.deleted} ancien(s) supprimé(s)).`;
+    toast('Google Agenda synchronisé ✅','ok');
+  } catch(e) {
+    info.textContent = 'Erreur réseau.';
+    toast('Échec de la synchronisation','error');
+  } finally {
+    if(btn) btn.disabled = false;
+  }
 }
 
 const WD_FR=['Lundi','Mardi','Mercredi','Jeudi','Vendredi'];
