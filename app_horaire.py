@@ -253,6 +253,15 @@ def _get_displaced_target(d_orig: date, offset: int) -> "date | None":
         cand += timedelta(1)
     return None
 
+def _short_leave_label(code, label):
+    """Libellé court et lisible pour le calendrier : 'Maladie' pour toute
+    absence maladie, sinon le 1er mot du libellé ('Congé' pour les vacances
+    et congés de circonstance). Le détail complet reste dans le modal jour."""
+    cat = LEAVE_CATALOG.get(code, {}).get("category", "")
+    if cat == "MALADIE":
+        return "Maladie"
+    return (label.split()[0] if label else code)
+
 def get_day_info(d: date, agent_id: str, data: dict) -> dict:
     agent   = data["agents"][agent_id]
     offset  = agent["team_offset"]
@@ -357,10 +366,12 @@ def get_day_info(d: date, agent_id: str, data: dict) -> dict:
     ev_status = None                      # 'demande' | 'accepte' pour un congé posé
     if d in hols:
         eff, code, label = hols[d][0], hols[d][0], hols[d][1]
+    label_short = None
     if events:
         ev = events[0]
         eff, code, label = ev["code"], ev["code"], ev["label"]
         ev_status = ev.get("status", "accepte")   # anciens congés = acceptés
+        label_short = _short_leave_label(ev["code"], label)
 
     # ── JOUR 4/5 (priorité SUR fériés/ponts, sous congés explicites/overrides) ──
     # Un jour 4/5 reste affiché 4/5 même si c'est un jour férié.
@@ -389,7 +400,7 @@ def get_day_info(d: date, agent_id: str, data: dict) -> dict:
 
     return {"date": d.isoformat(), "day_num": d.day, "day_name": DAY_NAMES_FR[d.weekday()],
             "weekday": d.weekday(), "base": base, "effective": eff,
-            "code": code, "label": label, "color": color,
+            "code": code, "label": label, "label_short": label_short, "color": color,
             "event_status": ev_status,
             "is_today": d == date.today(), "events": events, "remark": "",
             "decale_38": decale_38, "decale_r": decale_r}
@@ -2115,7 +2126,10 @@ select:focus,input:focus{border-color:var(--accent)}
     max-height:90dvh;overflow-y:auto;
     padding-bottom:env(safe-area-inset-bottom,12px);
   }
-  #day-modal .modal{border-radius:20px 20px 0 0!important}
+  /* Le modal jour doit DÉFILER sur mobile (sinon la remarque, tout en bas,
+     est coupée) — la règle #day-modal .modal a overflow:hidden par défaut */
+  #day-modal .modal{border-radius:20px 20px 0 0!important;
+    overflow-y:auto!important;max-height:90dvh}
   .dm-top{grid-template-columns:1fr}
   .dm-nav{padding:12px 16px}
   .dm-main-date{font-size:18px}
@@ -3327,8 +3341,9 @@ async function renderWeekView() {
     } else if(code){
       const pend=day.event_status==='demande';
       bCls=pend?'b-amber':'b-green'; cCls=pend?'c-amber':'c-green'; pCls=pend?'p-amber':'p-green';
-      pillTxt=pend?'⏳ Demandé':'Congé';
-      reasonTxt=(pend?'⏳ ':'')+(day.label||code);
+      const sh=day.label_short||day.label||code;
+      pillTxt=(pend?'⏳ ':'')+sh;   // ex: "Maladie", "Congé", "⏳ Congé"
+      reasonTxt='';
     } else if(base==='M'){
       bCls='b-red'; cCls='c-red'; pCls='p-red'; pillTxt='Matin'; hours=day.shift_hours||'06:00 – 14:00';
     } else if(base==='S'){
@@ -3707,9 +3722,9 @@ function renderGrid(cal) {
       const pend=day.event_status==='demande';
       bCls=pend?'b-amber':'b-green'; cCls=pend?'c-amber':'c-green';
       nCls=pend?'n-amber':'n-green'; pCls=pend?'p-amber':'p-green';
-      pillTxt=pend?'⏳ DEM.':'CONGÉ';
-      const lbl=(pend?'⏳ ':'')+(day.label||code);
-      reasonTxt=lbl.length>26?lbl.substring(0,24)+'…':lbl;
+      const sh=day.label_short||day.label||code;
+      pillTxt=(pend?'⏳ ':'')+sh;   // ex: "Maladie", "Congé"
+      reasonTxt='';
     } else if(base==='M'){
       bCls='b-red';    cCls='c-red';    nCls='n-red';    pCls='p-red';    pillTxt='MATIN';
     } else if(base==='S'){
