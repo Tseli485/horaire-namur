@@ -1652,8 +1652,10 @@ def google_oauth_callback():
 # Sens unique programme -> Google. Calendrier séparé "Horaire Prison" créé sur
 # le compte de l'agent ; l'agenda personnel de l'utilisateur n'est jamais touché.
 GOOGLE_COLOR_ID = {  # -> Google Calendar colorId (mêmes couleurs que l'app)
+    # ATTENTION : colorId Google Calendar 2 = "Sage" (vert clair), PAS bleu.
+    # Le bleu le plus proche disponible est 1 = "Lavender".
     "red": "11", "orange": "6", "indigo": "9", "purple": "3",
-    "teal": "7", "green": "10", "blue": "2",
+    "teal": "7", "green": "10", "blue": "1",
 }
 GOOGLE_SHIFT_TITLES = {
     "M": "🌅 MATIN", "S": "🌆 SOIR", "N": "🌙 NUIT",
@@ -1770,20 +1772,23 @@ def _google_sync_events(aid):
 
         if code and code not in ("REPOS-38", "REPOS-R"):
             title = f"❔ {label} (demandé)" if info.get("event_status") == "demande" else f"🗓 {label}"
+        elif code in ("REPOS-38", "REPOS-R"):
+            title = f"🛌 {label}"          # ex: "Repos 38h (décalé ↓)"
         elif is_worked_shift(eff):
             title = GOOGLE_SHIFT_TITLES.get(eff, f"🕐 DÉCALÉ {eff}")
         else:
-            cur += timedelta(1)
-            continue
+            title = "🛌 " + SHIFT_LABELS.get(eff, "Repos")   # R, 38, 36
 
         color_id = GOOGLE_COLOR_ID.get(info["color"], "8")
         hours = None if code else shift_hours_of(eff)
+        transparency = "opaque" if hours else "transparent"   # busy si poste travaillé, libre sinon
         if hours:
             h1, h2 = [x.strip() for x in hours.split("–")]
             end_date = (cur + timedelta(1)) if h2 <= h1 else cur
             body = {
                 "summary": title,
                 "colorId": color_id,
+                "transparency": transparency,
                 "start": {"dateTime": f"{cur.isoformat()}T{h1}:00", "timeZone": "Europe/Brussels"},
                 "end":   {"dateTime": f"{end_date.isoformat()}T{h2}:00", "timeZone": "Europe/Brussels"},
             }
@@ -1791,6 +1796,7 @@ def _google_sync_events(aid):
             body = {
                 "summary": title,
                 "colorId": color_id,
+                "transparency": transparency,
                 "start": {"date": cur.isoformat()},
                 "end":   {"date": (cur + timedelta(1)).isoformat()},
             }
