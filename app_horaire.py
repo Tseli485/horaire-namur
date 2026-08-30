@@ -1678,8 +1678,8 @@ GOOGLE_SHIFT_TITLES = {
     "M": "🌅 MATIN", "S": "🌆 SOIR", "N": "🌙 NUIT",
     "12H": "🕛 JOUR 12H", "08H": "🕗 JOUR 08H",
 }
-GOOGLE_SYNC_PAST_DAYS   = 31    # ~1 mois passé
-GOOGLE_SYNC_FUTURE_DAYS = 120   # ~4 mois futurs (limite les appels API par sync)
+GOOGLE_SYNC_PAST_DAYS   = 92    # ~3 mois passés
+GOOGLE_SYNC_FUTURE_DAYS = 365   # ~12 mois futurs (écriture par lots -> pas de timeout)
 
 def _google_ensure_token(aid, data):
     """Rafraîchit l'access_token via le refresh_token si expiré (ou absent)."""
@@ -1734,6 +1734,48 @@ def _google_api(aid, data, method, path, body=None, params=None):
             raise RuntimeError(f"Erreur API Google ({e.code}) : {e.read().decode()[:300]}")
     raise RuntimeError(f"Erreur API Google ({last_err.code}) après réessais.")
 
+def _google_batch(aid, data, requests):
+    """Exécute des requêtes Calendar par lots de 50 via l'endpoint batch Google
+    (multipart/mixed). Divise ~700 appels séquentiels en ~15 → indispensable avec
+    la fenêtre 3→12 mois pour ne pas dépasser le timeout requête PythonAnywhere.
+    `requests` = [{'method','path','body'(optionnel)}]. Renvoie le nb de 2xx."""
+    token = _google_ensure_token(aid, data)
+    if not token:
+        raise RuntimeError("Google Agenda non connecté — cliquez sur 'Connecter mon Google Agenda'.")
+    ok = 0
+    for i in range(0, len(requests), 50):
+        chunk    = requests[i:i + 50]
+        boundary = f"batch_horaire_{i}"
+        parts    = []
+        for j, rq in enumerate(chunk):
+            sub = f"{rq['method']} {rq['path']} HTTP/1.1\r\n"
+            if rq.get("body") is not None:
+                sub += "Content-Type: application/json\r\n\r\n" + json.dumps(rq["body"])
+            else:
+                sub += "\r\n"
+            parts.append(f"--{boundary}\r\n"
+                         f"Content-Type: application/http\r\n"
+                         f"Content-ID: <item{j}>\r\n\r\n{sub}\r\n")
+        payload = ("".join(parts) + f"--{boundary}--\r\n").encode()
+        for attempt in range(4):
+            req = urllib.request.Request(
+                "https://www.googleapis.com/batch/calendar/v3",
+                data=payload, method="POST",
+                headers={"Authorization": f"Bearer {token}",
+                         "Content-Type": f"multipart/mixed; boundary={boundary}"})
+            try:
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    resp = r.read().decode(errors="replace")
+                for m in ("HTTP/1.1 200", "HTTP/1.1 201", "HTTP/1.1 204"):
+                    ok += resp.count(m)
+                break
+            except urllib.error.HTTPError as e:
+                if e.code in (403, 429, 500, 503) and attempt < 3:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"Erreur batch Google ({e.code}) : {e.read().decode()[:300]}")
+    return ok
+
 def _google_ensure_calendar(aid, data):
     """Crée le calendrier dédié 'Horaire Prison' et enregistre son id."""
     created = _google_api(aid, data, "POST", "/calendars",
@@ -1775,14 +1817,15 @@ def _google_sync_events(aid):
         cal_id = _google_ensure_calendar(aid, data)
 
     q = urllib.parse.quote(cal_id)
-    for ev in existing:
-        _google_api(aid, data, "DELETE", f"/calendars/{q}/events/{ev['id']}")
-    deleted = len(existing)
+    # Suppression par lots (batch) — évite ~N appels séquentiels
+    del_reqs = [{"method": "DELETE", "path": f"/calendar/v3/calendars/{q}/events/{ev['id']}"}
+                for ev in existing if ev.get("id")]
+    deleted = _google_batch(aid, data, del_reqs) if del_reqs else 0
 
     start = date.today() - timedelta(days=GOOGLE_SYNC_PAST_DAYS)
     end   = date.today() + timedelta(days=GOOGLE_SYNC_FUTURE_DAYS)
     cur = start
-    created = 0
+    post_reqs = []
     while cur < end:
         info = get_day_info(cur, aid, data)
         eff, code, label = info["effective"], info["code"], info["label"]
@@ -1817,10 +1860,11 @@ def _google_sync_events(aid):
                 "start": {"date": cur.isoformat()},
                 "end":   {"date": (cur + timedelta(1)).isoformat()},
             }
-        _google_api(aid, data, "POST", f"/calendars/{q}/events", body=body)
-        created += 1
+        post_reqs.append({"method": "POST", "path": f"/calendar/v3/calendars/{q}/events", "body": body})
         cur += timedelta(1)
 
+    # Insertion par lots (batch)
+    created = _google_batch(aid, data, post_reqs) if post_reqs else 0
     return {"deleted": deleted, "created": created}
 
 @app.route("/api/google/sync", methods=["POST"])
