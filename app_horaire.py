@@ -229,7 +229,18 @@ def load():
 
 def save(data):
     _data_dir.mkdir(parents=True, exist_ok=True)
-    DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    payload = json.dumps(data, ensure_ascii=False, indent=2, default=str)
+    tmp_path = DATA_FILE.with_suffix(DATA_FILE.suffix + ".tmp")
+    last_err = None
+    for _attempt in range(3):
+        try:
+            tmp_path.write_text(payload, encoding="utf-8")
+            os.replace(tmp_path, DATA_FILE)
+            return
+        except OSError as _e:
+            last_err = _e
+            time.sleep(0.05)
+    raise last_err
 
 def _get_week_shift(d: date, offset: int) -> str:
     """Poste dominant (M ou S) de la semaine contenant d.
@@ -567,6 +578,8 @@ def api_calendar_team(offset, year, month):
     """Calendrier d'une equipe (pas d'agent requis)."""
     if offset not in VALID_OFFSETS:
         return jsonify({"error": "Offset invalide"}), 400
+    if not (1 <= month <= 12):
+        return jsonify({"error": "Mois invalide"}), 400
     days_in_month = monthrange(year, month)[1]
     first_day_wd  = date(year, month, 1).weekday()
     hols = _hols_dict(year)
@@ -592,6 +605,8 @@ def api_calendar(aid, year, month):
     data  = load()
     if aid not in data["agents"]:
         return jsonify({"error": "Agent inconnu"}), 404
+    if not (1 <= month <= 12):
+        return jsonify({"error": "Mois invalide"}), 400
     days_in_month = monthrange(year, month)[1]
     first_day_wd  = date(year, month, 1).weekday()   # 0=Lun
     remarks = data.get("remarks", {}).get(aid, {})
@@ -650,6 +665,8 @@ def print_month(aid, year, month):
     if aid not in data["agents"]:
         return "Agent inconnu", 404
     agent = data["agents"][aid]
+    if not (1 <= month <= 12):
+        return "Mois invalide", 400
     days_in_month = monthrange(year, month)[1]
     remarks = data.get("remarks", {}).get(aid, {})
     worked_days = []
