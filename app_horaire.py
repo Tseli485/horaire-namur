@@ -2095,6 +2095,18 @@ select:focus,input:focus{border-color:var(--accent)}
 .day-remark{font-size:9px;color:var(--accent);opacity:.9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;margin-top:1px}
 .badge-decale{display:inline-block;font-size:8px;font-weight:800;background:#374151;color:#fbbf24;border-radius:4px;padding:1px 4px;margin-top:2px;letter-spacing:.3px}
 .remark-dot{display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--accent);margin-right:2px;vertical-align:middle;flex-shrink:0}
+/* Remarques : épingle visible (tous appareils) + popup au survol + alerte modal */
+.cal-day{position:relative}
+.rem-pin{position:absolute;top:2px;right:3px;font-size:11px;line-height:1;z-index:2;pointer-events:none}
+.week-card{position:relative}
+.wc-pin{position:absolute;top:4px;right:6px;font-size:12px;z-index:2;pointer-events:none}
+#rem-pop{position:fixed;z-index:10001;max-width:240px;background:#1e293b;color:#f1f5f9;
+  border:1px solid #f59e0b;border-radius:10px;padding:9px 12px;font-size:12.5px;line-height:1.4;
+  box-shadow:0 8px 24px rgba(0,0,0,.5);display:none;pointer-events:none}
+#rem-pop .rp-h{font-size:10px;font-weight:800;color:#fbbf24;text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px}
+.dm-remark-alert{background:rgba(245,158,11,.15);border:1px solid #f59e0b;border-radius:10px;
+  padding:10px 12px;margin:0 0 12px;font-size:13px;color:var(--text);display:flex;gap:8px;align-items:flex-start}
+.dm-remark-alert .rp-h{color:#f59e0b;font-weight:800;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:2px}
 .n-red    .day-reason{color:#f87171}
 .n-orange .day-reason{color:#fb923c}
 .n-green  .day-reason{color:#4ade80}
@@ -2863,6 +2875,7 @@ select:focus,input:focus{border-color:var(--accent)}
       </div>
     </div>
     <div class="dm-body">
+      <div id="dm-remark-alert" style="display:none"></div>
       <div class="dm-top">
         <div class="dm-shift-block" id="dm-shift-block"></div>
         <div class="dm-week-strip" id="dm-week-strip"></div>
@@ -3612,10 +3625,14 @@ async function renderWeekView() {
     }
 
     const todayCls = isToday ? 'wc-today' : '';
-    const remarkHtml = (day.remark && day.remark.trim())
+    const hasRem = day.remark && day.remark.trim();
+    const remarkHtml = hasRem
       ? `<div class="wc-remark"><span class="remark-dot" style="flex-shrink:0"></span>${day.remark}</div>` : '';
+    const remAttr = hasRem ? ` data-rem="${encodeURIComponent(day.remark)}"` : '';
+    const pinHtml = hasRem ? '<span class="wc-pin">📌</span>' : '';
 
-    cardsHtml += `<div class="week-card ${bCls} ${cCls} ${todayCls}" onclick="openDayModal('${dt}')">
+    cardsHtml += `<div class="week-card ${bCls} ${cCls} ${todayCls}" onclick="openDayModal('${dt}')"${remAttr}>
+      ${pinHtml}
       <div class="wc-date">
         <div class="wc-dow">${WV_DOW[i]}</div>
         <div class="wc-num${isToday?' wc-num-today':''}">${dn}</div>
@@ -4005,9 +4022,12 @@ function renderGrid(cal) {
       ? '<div class="badge-decale">38h &#8595;</div>'
       : (day.decale_r ? '<div class="badge-decale">R &#8595;</div>' : '');
 
+    const remAttr = hasRemark ? ' data-rem="'+encodeURIComponent(day.remark)+'"' : '';
+    const pinHtml = hasRemark ? '<span class="rem-pin">📌</span>' : '';
     html+='<div class="cal-day '+bCls+' '+cCls+' '+nCls+' '+todayCls+' '+weCls+'"'
-        +' onclick="openDayModal('+dataStr+')"'
+        +' onclick="openDayModal('+dataStr+')"'+remAttr
         +' title="'+day.day_name+' '+day.day_num+' — '+pillTxt+(reasonTxt?' : '+reasonTxt:'')+(hasRemark?' | Note: '+day.remark:'')+'">'
+        +pinHtml
         +'<div class="day-top">'
         +'<span class="day-abbr">'+day.day_name+'</span>'
         +'<span class="shift-pill '+pCls+'">'+pillTxt+'</span>'
@@ -4213,6 +4233,16 @@ async function renderDayModal(dateStr) {
   // Remarque
   const remEl = document.getElementById('dm-remark-area');
   if(remEl) remEl.value = d.remark || '';
+  // Alerte remarque en haut du modal (visible surtout sur mobile)
+  const alertEl = document.getElementById('dm-remark-alert');
+  if(alertEl){
+    if(d.remark && d.remark.trim()){
+      alertEl.style.display=''; alertEl.className='dm-remark-alert';
+      alertEl.innerHTML='<span style="font-size:17px;line-height:1">📌</span>'
+        +'<div><div class="rp-h">Remarque du jour</div><span id="dm-ra-txt"></span></div>';
+      const t=document.getElementById('dm-ra-txt'); if(t) t.textContent=d.remark;
+    } else { alertEl.style.display='none'; alertEl.innerHTML=''; }
+  }
 
   // Shift override buttons — surligner le poste actuel
   const curBase = d.base; // poste effectif (peut être override)
@@ -4552,6 +4582,33 @@ async function deleteExchange(eid){
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){
   document.querySelectorAll('.modal-overlay.open').forEach(m=>m.classList.remove('open'));
 }});
+
+// ── Popup remarque au survol (PC uniquement ; sur mobile = alerte dans le modal) ──
+(function(){
+  const canHover = window.matchMedia('(hover:hover)').matches;
+  if(!canHover) return;
+  let pop=null;
+  function ensure(){
+    if(!pop){ pop=document.createElement('div'); pop.id='rem-pop';
+      pop.innerHTML='<div class="rp-h">📌 Remarque</div><div class="rp-body"></div>';
+      document.body.appendChild(pop); }
+    return pop;
+  }
+  document.addEventListener('mouseover',e=>{
+    const el=e.target.closest && e.target.closest('[data-rem]'); if(!el) return;
+    const p=ensure();
+    p.querySelector('.rp-body').textContent=decodeURIComponent(el.getAttribute('data-rem'));
+    const r=el.getBoundingClientRect();
+    const pw=Math.min(240,window.innerWidth-16);
+    let left=r.left; if(left+pw>window.innerWidth-8) left=window.innerWidth-8-pw; if(left<8) left=8;
+    let top=r.bottom+6; p.style.display='block';
+    if(top+p.offsetHeight>window.innerHeight-8) top=r.top-p.offsetHeight-6;
+    p.style.left=left+'px'; p.style.top=top+'px';
+  });
+  document.addEventListener('mouseout',e=>{
+    if(e.target.closest && e.target.closest('[data-rem]') && pop) pop.style.display='none';
+  });
+})();
 
 // ── AUTH PAR AGENT ────────────────────────────────────────────
 let _authMode = 'login';
