@@ -1841,25 +1841,19 @@ def _google_sync_events(aid):
 
         color_id = GOOGLE_COLOR_ID.get(info["color"], "8")
         hours = None if code else shift_hours_of(eff)
-        transparency = "opaque" if hours else "transparent"   # busy si poste travaillé, libre sinon
         if hours:
-            h1, h2 = [x.strip() for x in hours.split("–")]
-            end_date = (cur + timedelta(1)) if h2 <= h1 else cur
-            body = {
-                "summary": title,
-                "colorId": color_id,
-                "transparency": transparency,
-                "start": {"dateTime": f"{cur.isoformat()}T{h1}:00", "timeZone": "Europe/Brussels"},
-                "end":   {"dateTime": f"{end_date.isoformat()}T{h2}:00", "timeZone": "Europe/Brussels"},
-            }
-        else:
-            body = {
-                "summary": title,
-                "colorId": color_id,
-                "transparency": transparency,
-                "start": {"date": cur.isoformat()},
-                "end":   {"date": (cur + timedelta(1)).isoformat()},
-            }
+            # Poste travaillé : horaires intégrés au titre (l'info reste visible)
+            title = f"{title} · {hours}"
+        # TOUS les jours en JOURNÉE ENTIÈRE : la case du mois est remplie d'une
+        # bande à la couleur du poste (présentation demandée), tout reste lisible.
+        # transparency=transparent -> purement visuel, ne bloque pas la dispo.
+        body = {
+            "summary": title,
+            "colorId": color_id,
+            "transparency": "transparent",
+            "start": {"date": cur.isoformat()},
+            "end":   {"date": (cur + timedelta(1)).isoformat()},
+        }
         post_reqs.append({"method": "POST", "path": f"/calendar/v3/calendars/{q}/events", "body": body})
         cur += timedelta(1)
 
