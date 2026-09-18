@@ -2154,7 +2154,8 @@ def export_ical(aid):
 @app.route("/api/leaves_catalog")
 def api_catalog():
     return jsonify({k: {"label": v["label"], "category": v["category"],
-                        "days": v.get("days"), "note": v.get("note","")}
+                        "days": v.get("days"), "annual_days": v.get("annual_days"),
+                        "note": v.get("note",""), "base_ref": v.get("base_ref","")}
                     for k,v in LEAVE_CATALOG.items()})
 
 @app.route("/api/day/<aid>/<date_str>")
@@ -4690,6 +4691,94 @@ function _frhFmtHM(m){ const sg=m<0?'−':''; m=Math.abs(m); return sg+String(Ma
 function _frhFmtDate(iso){ const [y,mo,d]=iso.split('-'); return `${d}/${mo}/${y}`; }
 function _frhCls(v){ return v<0?'frh-neg':(v>0?'frh-pos':''); }
 
+// Rubriques "jours" de la fiche RH à cumuler dans le décompte (hors heures supp., à part)
+const FRH_KPI_RUBRIQUES = [
+  {key:'CONGE',        icon:'🏖️', label:'Vacances'},
+  {key:'COMPENSATION', icon:'🔁', label:'Compensation'},
+  {key:'JOURS DE PONT',icon:'🌉', label:'Jours de pont'},
+  {key:'REPOS 38H',    icon:'😴', label:'Repos 38h'},
+  {key:'REPOS 36H',    icon:'😴', label:'Repos 36h'},
+  {key:'REPOS',        icon:'😴', label:'Repos'},
+  {key:'FERIES',       icon:'📅', label:'Fériés'},
+];
+// Codes du catalogue BOSA pour lesquels le "quota/an" du catalogue ne représente pas
+// un total annuel exploitable (ex: FERIE = 1 jour par férié, pas un quota) — on affiche
+// alors la note descriptive à la place d'un chiffre trompeur.
+const FRH_CATALOG_NO_NUM_QUOTA = new Set(['FERIE','PONT','COMPEN']);
+const FRH_CATALOG_ORDER = ['VACANCES','MALADIE','CIRCONSTANCE','FAMILIAL','FERIE','SPECIAL'];
+const FRH_CATALOG_CAT_LABEL = {
+  VACANCES:'🏖️ Vacances', MALADIE:'🤒 Maladie', CIRCONSTANCE:'🎗️ Congés de circonstance',
+  FAMILIAL:'👶 Congés familiaux', FERIE:'📅 Fériés & ponts', SPECIAL:'🗂️ Autres congés statutaires',
+};
+
+function _frhSyntheseHtml(R, reelle, ent, catalog, year){
+  // ── Décompte : ce qu'il reste à prendre, tous compteurs de la fiche RH ──
+  let totalJours = 0;
+  const kpis = [];
+  FRH_KPI_RUBRIQUES.forEach(cfg => {
+    const x = R[cfg.key]; if(!x || x.solde === undefined) return;
+    const rl = reelle[cfg.key];
+    const val = rl ? rl.solde_actualise : x.solde;
+    totalJours += (val || 0);
+    kpis.push(`<div style="padding:10px 14px;border-right:1px solid var(--border);border-bottom:1px solid var(--border);min-width:120px">
+      <div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">${cfg.icon} ${cfg.label.toUpperCase()}</div>
+      <div style="font-size:22px;font-weight:900" class="${_frhCls(val)}">${_frhFmtJ(val)}</div>
+      ${rl?'<div style="font-size:9px;color:var(--muted);margin-top:2px">réel actualisé</div>':''}
+    </div>`);
+  });
+  const hs = R['HEURES SUPP.'];
+  if(hs){
+    kpis.push(`<div style="padding:10px 14px;border-right:1px solid var(--border);border-bottom:1px solid var(--border);min-width:120px">
+      <div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">⏱️ HEURES SUPP.</div>
+      <div style="font-size:22px;font-weight:900" class="${_frhCls(hs.solde_final_min||0)}">${_frhFmtHM(hs.solde_final_min||0)}</div>
+    </div>`);
+  }
+  if(ent && ent.maladie){
+    const m = ent.maladie;
+    kpis.push(`<div style="padding:10px 14px;border-right:1px solid var(--border);border-bottom:1px solid var(--border);min-width:120px">
+      <div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">🤒 CAP. MALADIE</div>
+      <div style="font-size:22px;font-weight:900" class="${_frhCls(m.solde)}">${_frhFmtJ(m.solde)}</div>
+      ${!m.manual?'<div style="font-size:9px;color:var(--orange);margin-top:2px">à confirmer RH</div>':''}
+    </div>`);
+  }
+  let h = `<div class="card" style="margin-bottom:16px">
+    <h3>📊 Ce qu'il vous reste à prendre</h3>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:8px">Cumul des soldes « réels » (fiche RH + jours saisis dans l'app depuis l'impression). Les heures supp. et le capital maladie sont à part (pas des jours de congé classiques).</div>
+    <div style="display:flex;flex-wrap:wrap;border-top:1px solid var(--border);border-left:1px solid var(--border)">${kpis.join('')}</div>
+    <div style="margin-top:10px;font-size:13px"><b>Total jours de congé disponibles à planifier : <span class="${_frhCls(totalJours)}">${_frhFmtJ(totalJours)}</span></b></div>
+  </div>`;
+
+  // ── Catalogue complet des congés légaux BOSA ──
+  if(catalog && Object.keys(catalog).length){
+    const cd = (ent && ent.conges_detail) || {};
+    const cats = {};
+    Object.entries(catalog).forEach(([code, info]) => { (cats[info.category] = cats[info.category] || []).push({code, ...info}); });
+    let rowsHtml = '';
+    FRH_CATALOG_ORDER.filter(c => cats[c]).forEach(cat => {
+      rowsHtml += `<tr><td colspan="4" style="background:var(--card2);font-weight:700;color:var(--text);text-align:left">${FRH_CATALOG_CAT_LABEL[cat]||cat}</td></tr>`;
+      cats[cat].forEach(info => {
+        let quota = FRH_CATALOG_NO_NUM_QUOTA.has(info.code) ? null : (info.days ?? info.annual_days);
+        let used = cd[info.code]?.used || 0, pend = cd[info.code]?.pending || 0, dispo = null;
+        if(info.code === 'VAC' && ent){ quota = ent.vacances.droit_auto_tp; used = ent.vacances.utilise; dispo = ent.vacances.solde; }
+        else if(info.code === 'MAL' && ent){ quota = ent.maladie.capital_auto || ent.maladie.capital; used = ent.maladie.utilise; dispo = ent.maladie.solde; }
+        else if(quota != null){ dispo = Math.max(0, quota - used - pend); }
+        const quotaTxt = quota != null ? `${quota} j/an` : (info.note || 'variable');
+        rowsHtml += `<tr><td style="text-align:left"><b>${info.label}</b><div style="font-size:9px;color:var(--muted)">${info.base_ref||''}</div></td>
+          <td>${quotaTxt}</td>
+          <td>${used ? used+' j'+(pend?' (+'+pend+' att.)':'') : '—'}</td>
+          <td>${dispo!=null ? `<b class="${dispo>0?'frh-pos':''}">${dispo} j</b>` : '—'}</td></tr>`;
+      });
+    });
+    h += `<div class="card" style="margin-bottom:16px">
+      <details><summary style="cursor:pointer;font-weight:700;font-size:14px">📖 Tous les congés légaux BOSA auxquels vous avez droit (secteur public fédéral)</summary>
+      <div style="font-size:11px;color:var(--muted);margin:8px 0 10px">Catalogue officiel BOSA (AR 19/11/1998 et textes associés). Les congés « variables » ou « sur justification » dépendent de votre situation exacte — à vérifier auprès du service du personnel avant toute demande.</div>
+      <div style="overflow-x:auto"><table class="frh-table"><tr><th style="text-align:left">Type de congé</th><th>Droit/an</th><th>Pris ${year||''}</th><th>Disponible</th></tr>${rowsHtml}</table></div>
+      </details>
+    </div>`;
+  }
+  return h;
+}
+
 async function renderFicheRH(){
   const body=document.getElementById('frh-body');
   const sel=document.getElementById('frh-year');
@@ -4709,7 +4798,11 @@ async function renderFicheRH(){
   }
   const wanted=sel.value&&_frhYears.includes(sel.value)?sel.value:_frhYears[0];
   sel.innerHTML=_frhYears.map(y=>`<option value="${y}" ${y===wanted?'selected':''}>Fiche ${y}</option>`).join('');
-  const r=await fetch(`/api/fiche_rh/${curAgent}/${wanted}`);
+  const [r, ent, catalog] = await Promise.all([
+    fetch(`/api/fiche_rh/${curAgent}/${wanted}`),
+    fetch(`/api/entitlements/${curAgent}/${wanted}`).then(x=>x.json()).catch(()=>null),
+    fetch('/api/leaves_catalog').then(x=>x.json()).catch(()=>({})),
+  ]);
   if(!r.ok){ body.innerHTML='<div style="color:#f87171">Erreur de chargement.</div>'; return; }
   const p=await r.json(); const f=p.fiche, R=f.rubriques, info=p.rubriques_info, rap=p.rapprochement||{}, reelle=p.situation_reelle||{}, an=p.analyse;
   const per=f.periode&&f.periode[0]?`${_frhFmtDate(f.periode[0])} → ${_frhFmtDate(f.periode[1])}`:'—';
@@ -4724,6 +4817,8 @@ async function renderFicheRH(){
   if(f.inconnues&&f.inconnues.length) h+=`<div style="margin-top:8px;font-size:12px;color:#fdba74">⚠ Rubriques non reconnues (nouveau format ?) : ${f.inconnues.map(u=>u.titre).join(', ')} — conservées brutes, à signaler.</div>`;
   h+='</div>';
   _frhCurAnalyse=an;
+
+  h+=_frhSyntheseHtml(R, reelle, ent, catalog, wanted);
 
   // ── Tableau compteurs jours (5 colonnes) ──
   const five=['CONGE','FERIES','COMPENSATION','JOURS DE PONT','REPOS 38H','REPOS 36H','REPOS'].filter(k=>R[k]);
