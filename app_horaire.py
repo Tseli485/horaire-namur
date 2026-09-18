@@ -1562,6 +1562,7 @@ def _fiche_payload(aid, year, data):
     return {"fiche": f, "importee_le": entry.get("importee_le"),
             "historique": entry.get("historique", []),
             "rapprochement": rapp, "situation_reelle": reelle,
+            "analyse": entry.get("analyse"),
             "rubriques_info": _frh.RUBRIQUES_INFO}
 
 @app.route("/api/fiche_rh/<aid>")
@@ -1607,21 +1608,31 @@ def api_fiche_rh_import(aid):
         return jsonify({"error": f"Aucune fiche pour le matricule {mat} dans ce PDF "
                                  f"({len(parsed['agents'])} agent(s) trouvé(s))"}), 400
     year = _frh.fiche_year(fiche)
+    # Rapprochement + analyse sur la période PROPRE à cette fiche (cumulative
+    # depuis le 1er janvier) : couvre donc aussi tout ce qui a été saisi dans
+    # l'app entre le précédent import et celui-ci — c'est la vérification
+    # demandée à chaque nouvel import, pas seulement une comparaison locale.
+    p0, p1 = fiche.get("periode") or [None, None]
+    y0 = date.fromisoformat(p0) if p0 else date(year, 1, 1)
+    y1 = date.fromisoformat(p1) if p1 else date(year, 12, 31)
+    rapp = _frh.reconcile(fiche, _app_dates_by_code(aid, data, y0, y1))
+    analyse = _frh.resume_analyse(fiche, rapp)
     store = data.setdefault("fiches_rh", {}).setdefault(aid, {})
     prev = store.get(str(year))
     hist = list(prev.get("historique", [])) if prev else []
     if prev:   # même agent + même année : la nouvelle remplace, trace conservée
         hist.append({"importee_le": prev.get("importee_le"),
                      "imprimee_le": prev["fiche"].get("imprimee_le"),
-                     "periode": prev["fiche"].get("periode")})
+                     "periode": prev["fiche"].get("periode"),
+                     "analyse": prev.get("analyse")})
     store[str(year)] = {"fiche": fiche, "importee_le": date.today().isoformat(),
-                        "historique": hist[-12:]}
+                        "historique": hist[-12:], "analyse": analyse}
     save(data)
     return jsonify({"ok": True, "year": year, "periode": fiche.get("periode"),
                     "imprimee_le": fiche.get("imprimee_le"),
                     "nb_rubriques": len(fiche["rubriques"]),
                     "inconnues": [u["titre"] for u in fiche.get("inconnues", [])],
-                    "remplace": bool(prev)})
+                    "remplace": bool(prev), "analyse": analyse})
 
 @app.route("/api/fiche_rh/<aid>/<int:year>", methods=["DELETE"])
 def api_fiche_rh_delete(aid, year):
@@ -3224,6 +3235,16 @@ select:focus,input:focus{border-color:var(--accent)}
   </div>
 </div>
 
+<div class="modal-overlay" id="frh-analyse-modal">
+  <div class="modal" style="width:560px">
+    <h2>Vérification de l'import <span class="close" onclick="closeModal('frh-analyse-modal')">✕</span></h2>
+    <div id="frh-analyse-body" style="font-size:13px;line-height:1.6"></div>
+    <div class="modal-footer">
+      <button class="btn btn-primary" onclick="closeModal('frh-analyse-modal')">Fermer</button>
+    </div>
+  </div>
+</div>
+
 <div id="toast"></div>
 
 <script>
@@ -4690,17 +4711,19 @@ async function renderFicheRH(){
   sel.innerHTML=_frhYears.map(y=>`<option value="${y}" ${y===wanted?'selected':''}>Fiche ${y}</option>`).join('');
   const r=await fetch(`/api/fiche_rh/${curAgent}/${wanted}`);
   if(!r.ok){ body.innerHTML='<div style="color:#f87171">Erreur de chargement.</div>'; return; }
-  const p=await r.json(); const f=p.fiche, R=f.rubriques, info=p.rubriques_info, rap=p.rapprochement||{}, reelle=p.situation_reelle||{};
+  const p=await r.json(); const f=p.fiche, R=f.rubriques, info=p.rubriques_info, rap=p.rapprochement||{}, reelle=p.situation_reelle||{}, an=p.analyse;
   const per=f.periode&&f.periode[0]?`${_frhFmtDate(f.periode[0])} → ${_frhFmtDate(f.periode[1])}`:'—';
   let h=`<div class="card" style="margin-bottom:16px"><div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;align-items:center">
     <div style="font-size:13px;line-height:1.6"><b>${f.nom}</b> · matricule ${f.matricule}<br>
-    <span style="color:var(--muted)">Situation ${per} · imprimée le ${f.imprimee_le?_frhFmtDate(f.imprimee_le):'?'} · importée le ${p.importee_le?_frhFmtDate(p.importee_le):'?'}${p.historique&&p.historique.length?` · ${p.historique.length} import(s) précédent(s) remplacé(s)`:''}</span></div>
+    <span style="color:var(--muted)">Situation ${per} · imprimée le ${f.imprimee_le?_frhFmtDate(f.imprimee_le):'?'} · importée le ${p.importee_le?_frhFmtDate(p.importee_le):'?'}${p.historique&&p.historique.length?` · ${p.historique.length} import(s) précédent(s) remplacé(s)`:''}</span>
+    ${an?`<div style="margin-top:4px">${an.ok?'<span class="frh-badge ok">✓ vérifié à l\'import : conforme</span>':`<span class="frh-badge warn">⚠ ${an.nb_ecarts} écart(s) détecté(s) à l'import</span> <button type="button" class="btn btn-sm" style="padding:2px 8px;font-size:11px" onclick="_frhShowAnalyse()">Voir le détail</button>`}</div>`:''}</div>
     <div style="display:flex;gap:6px;flex-wrap:wrap">
       <button class="btn btn-green btn-sm" onclick="applyFicheRH('${wanted}')" title="Recopie le droit vacances RH dans le quota manuel de l'app (avec confirmation)">✔ Appliquer le quota vacances RH</button>
       <button class="btn btn-danger btn-sm" onclick="deleteFicheRH('${wanted}')">🗑 Retirer cette fiche</button>
     </div></div>`;
   if(f.inconnues&&f.inconnues.length) h+=`<div style="margin-top:8px;font-size:12px;color:#fdba74">⚠ Rubriques non reconnues (nouveau format ?) : ${f.inconnues.map(u=>u.titre).join(', ')} — conservées brutes, à signaler.</div>`;
   h+='</div>';
+  _frhCurAnalyse=an;
 
   // ── Tableau compteurs jours (5 colonnes) ──
   const five=['CONGE','FERIES','COMPENSATION','JOURS DE PONT','REPOS 38H','REPOS 36H','REPOS'].filter(k=>R[k]);
@@ -4751,6 +4774,27 @@ async function renderFicheRH(){
   h+='</div>';
   body.innerHTML=h;
 }
+let _frhCurAnalyse=null;
+function _frhShowAnalyse(){
+  if(!_frhCurAnalyse) return;
+  document.getElementById('frh-analyse-body').innerHTML=
+    `<div style="margin-bottom:10px;color:var(--muted)">Rapprochement enregistré au moment du dernier import de cette fiche.</div>`
+    + _frhAnalyseHtml(_frhCurAnalyse);
+  openModal('frh-analyse-modal');
+}
+function _frhAnalyseHtml(analyse, dateStyle){
+  // dateStyle: fonction (date)=>label, permet de réutiliser hors modale
+  if(!analyse) return '';
+  if(analyse.ok) return '<div style="color:#4ade80">✓ Aucun écart : tout ce qui est saisi dans l\'app depuis le 1er janvier correspond à la fiche RH.</div>';
+  return analyse.details.map(d=>{
+    const cls=d.type==='manquant_app'?'frh-fixbtn':'frh-fixbtn extra';
+    const tip=d.type==='manquant_app'
+      ? "Sur la fiche RH, absente de l'app — cliquez pour ouvrir ce jour et ajouter/corriger l'événement"
+      : "Dans l'app, absente de la fiche RH — cliquez pour vérifier/corriger ce jour, ou contrôler auprès du service du personnel";
+    return `<div style="margin-bottom:12px"><b>${d.label}</b><div style="color:var(--muted);margin:2px 0 6px">${d.message}</div>`
+      +`<div class="frh-dates">${d.dates.map(dt=>`<button type="button" class="${cls}" onclick="openDayModal('${dt}')" title="${tip}">${_frhFmtDate(dt)}</button>`).join(' ')}</div></div>`;
+  }).join('');
+}
 async function importFicheRH(inp){
   const file=inp.files&&inp.files[0]; inp.value=''; if(!file) return;
   if(!curAgent){ toast('Sélectionnez un agent','error'); return; }
@@ -4762,6 +4806,11 @@ async function importFicheRH(inp){
   toast(`Fiche ${j.year} importée${j.remplace?' (ancienne version remplacée)':''} — ${j.nb_rubriques} rubriques`);
   document.getElementById('frh-year').value=String(j.year);
   renderFicheRH();
+  const a=j.analyse;
+  document.getElementById('frh-analyse-body').innerHTML=
+    `<div style="margin-bottom:10px;color:var(--muted)">Rapprochement de la fiche ${j.year} (période cumulée depuis le 1er janvier) avec tout ce qui est saisi dans l'app — y compris les congés/maladies entrés depuis le précédent import.</div>`
+    + _frhAnalyseHtml(a);
+  openModal('frh-analyse-modal');
 }
 async function applyFicheRH(year){
   const p=await fetch(`/api/fiche_rh/${curAgent}/${year}`).then(r=>r.json());

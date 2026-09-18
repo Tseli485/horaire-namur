@@ -170,6 +170,36 @@ def test_situation_reelle_ignore_dates_dans_la_periode(fiche):
     assert fiche_rh.situation_reelle(f, app, today="2025-12-23") == {}
 
 
+def test_resume_analyse_conforme(fiche):
+    f = fiche["agents"]["012345"]
+    app = {"VAC": {"2025-01-21", "2025-01-23", "2025-01-24"},
+           "MAL": {"2025-01-08"}, "MSC": {"2025-02-12", "2025-02-13"},
+           "__38": {"2025-01-29", "2025-02-21"}, "__36": {"2025-03-26"}}
+    r = fiche_rh.reconcile(f, app)
+    an = fiche_rh.resume_analyse(f, r)
+    assert an == {"ok": True, "nb_ecarts": 0, "details": []}
+
+
+def test_resume_analyse_ecarts_detailles(fiche):
+    # Cas de l'utilisateur : entre deux imports, des congés/maladies ont été
+    # saisis dans l'app sans correspondre à ce que dit la nouvelle fiche RH.
+    f = fiche["agents"]["012345"]
+    app = {"VAC": {"2025-01-21", "2025-02-01"},   # 23,24/01 manquent ; 01/02 en trop
+           "MAL": {"2025-01-08"},                  # 12,13/02 manquent
+           "__38": {"2025-01-29", "2025-02-21"}, "__36": {"2025-03-26"}}  # repos OK
+    r = fiche_rh.reconcile(f, app)
+    an = fiche_rh.resume_analyse(f, r)
+    assert an["ok"] is False
+    assert an["nb_ecarts"] == 5   # CONGE : 2 manquant_app + 1 manquant_fiche ; MALADIE : 2 manquant_app
+    conge = [d for d in an["details"] if d["rubrique"] == "CONGE"]
+    assert {d["type"] for d in conge} == {"manquant_app", "manquant_fiche"}
+    m_app = next(d for d in conge if d["type"] == "manquant_app")
+    assert m_app["dates"] == ["2025-01-23", "2025-01-24"]
+    m_fiche = next(d for d in conge if d["type"] == "manquant_fiche")
+    assert m_fiche["dates"] == ["2025-02-01"]
+    assert "fiche RH" in m_app["message"] and "app" in m_fiche["message"]
+
+
 # ── routes Flask (parse_pdf simulé : pas de PDF dans le dépôt) ──
 @pytest.fixture
 def client(tmp_path, monkeypatch):

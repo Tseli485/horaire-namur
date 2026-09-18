@@ -233,6 +233,40 @@ def reconcile(fiche, app_dates_by_code):
     return out
 
 
+def resume_analyse(fiche, rapprochement):
+    """Synthèse lisible du rapprochement `reconcile(...)`, pour affichage
+    immédiat juste après un import (bandeau/modale) — sans devoir aller
+    consulter l'onglet Fiche RH. Comme la période d'une fiche RH est
+    cumulative depuis le 1er janvier, ce rapprochement porte déjà sur TOUT
+    ce qui a été saisi dans l'app depuis le début de l'année, y compris les
+    congés/maladies entrés entre deux imports : c'est la vérification
+    demandée à chaque nouvel import. Ne modifie rien, purement informatif.
+    Retourne {"ok": bool, "nb_ecarts": int, "details": [...]} — jamais
+    d'erreur si tout est concordant (details vide)."""
+    details = []
+    for sec, rp in rapprochement.items():
+        label = RUBRIQUES_INFO.get(sec, {}).get("label", sec)
+        if rp["rh_seulement"]:
+            details.append({
+                "rubrique": sec, "label": label, "type": "manquant_app",
+                "dates": rp["rh_seulement"],
+                "message": f"{len(rp['rh_seulement'])} jour(s) « {label} » figurent sur la "
+                           f"fiche RH mais aucun événement correspondant n'est saisi dans "
+                           f"l'app — à ajouter si oublié, sinon à vérifier.",
+            })
+        if rp["app_seulement"]:
+            details.append({
+                "rubrique": sec, "label": label, "type": "manquant_fiche",
+                "dates": rp["app_seulement"],
+                "message": f"{len(rp['app_seulement'])} jour(s) « {label} » saisis dans "
+                           f"l'app et couverts par la période de cette fiche, mais absents "
+                           f"de la fiche RH — à vérifier auprès du service du personnel, ou "
+                           f"à corriger dans l'app si la saisie était erronée.",
+            })
+    nb = sum(len(d["dates"]) for d in details)
+    return {"ok": nb == 0, "nb_ecarts": nb, "details": details}
+
+
 def situation_reelle(fiche, app_dates_by_code, today=None):
     """Prolonge les compteurs RH avec les jours pris dans l'app APRÈS la fin
     de la période couverte par la fiche (donc depuis son impression) : congés,
