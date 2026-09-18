@@ -10,6 +10,7 @@ Port local : 5050. (`render.yaml` / `Procfile` = anciens essais Render, service 
 app_horaire.py      # Flask app principale (127 KB) — routes + HTML inline
 horaire_agent.py    # Moteur de cycle (56 jours, 8 équipes), extraction PDF
 conges_bosa.py      # Catalogue congés BOSA, jours fériés, reliquats
+fiche_rh.py         # Parseur PDF « Fiche de congé (Après RT) » (RH DG EPI) + rapprochement
 agenda_agent.py     # Sync Google Agenda / flux iCal
 lib/                # Dépendances vendorisées (flask, werkzeug, jinja2…)
 agenda_data.json    # Store JSON persistant (agents, events, congés)
@@ -27,9 +28,33 @@ render.yaml         # Config Render (disk /data 1 GB, env DATA_DIR=/data)
   "capitals":       { "<aid>": { "sick_capital": int } },
   "exchanges":      [ { "id", "aid1", "aid2", "date1", "date2", "status" } ],
   "remarks":        { "<aid>_<date>": "texte" },
-  "shift_overrides":{ "<aid>_<date>": "M|S|R|…" }
+  "shift_overrides":{ "<aid>_<date>": "M|S|R|…" },
+  "fiches_rh":      { "<aid>": { "<year>": { "fiche", "importee_le", "historique" } } }
 }
 ```
+`agents.<id>.matricule` (optionnel) : numéro de matricule SPF Justice, clé de
+correspondance avec la fiche RH.
+
+## Fiche RH (PDF « Fiche de congé (Après RT) »)
+
+- Onglet **Fiche RH** : import du PDF remis par le service du personnel (Crystal
+  Reports, 1 fiche = 3 pages par agent, un PDF peut contenir plusieurs agents).
+  Seule la fiche dont le matricule = `agent.matricule` est conservée.
+- Rubriques 5 colonnes (Réserve/Report/Droit/Pris/Solde) : CONGE, FERIES,
+  COMPENSATION, JOURS DE PONT, REPOS 38H, REPOS 36H, REPOS.
+  **Solde = Réserve + Report + Droit − Pris − Réduction**. « Réduction 19 j. abs »
+  = 1 jour de repos 36h/38h retiré par tranche de 19 j d'absence (proratisé).
+- HEURES SUPP. : Solde final = Réserve + Report N-1 + Σ mouvements (minutes).
+- Rapprochement dates RH ↔ app : CONGE↔VAC, MALADIE↔MAL/MSC/MAL_LONG,
+  REPOS 36H/38H ↔ jours `36`/`38` du planning (`get_day_info().base`).
+- **Additif** : l'import n'écrit jamais dans `events`, `capitals`, `reliquats`.
+  Seul `POST /api/fiche_rh/<aid>/<year>/apply` (bouton explicite + confirm)
+  recopie CONGE.droit → `capitals.vacances` et report+réserve → `reliquats`.
+- Ré-import même année : remplace, trace dans `historique` (max 12).
+- Rubrique inconnue (nouveau format PDF) → stockée brute dans `fiche.inconnues`
+  et signalée dans l'UI, jamais une erreur.
+- Nécessite `pdfplumber` (requirements.txt). Sur PythonAnywhere :
+  `pip install --user pdfplumber` si l'import renvoie « PDF illisible ».
 
 ## Logique métier clé
 
@@ -56,6 +81,10 @@ render.yaml         # Config Render (disk /data 1 GB, env DATA_DIR=/data)
 | POST | `/api/exchanges` | Créer un échange |
 | PATCH | `/api/exchanges/<eid>` | Valider/refuser échange |
 | GET | `/ical/<aid>.ics` | Flux iCal |
+| GET | `/api/fiche_rh/<aid>` | Années de fiches RH importées + matricule |
+| POST | `/api/fiche_rh/<aid>/import` | Import PDF (multipart `pdf`) |
+| GET/DELETE | `/api/fiche_rh/<aid>/<year>` | Fiche + rapprochement / retrait |
+| POST | `/api/fiche_rh/<aid>/<year>/apply` | Recopie explicite du quota vacances RH |
 
 ## Commandes utiles
 

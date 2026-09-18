@@ -148,7 +148,8 @@ def api_auth_me():
                     "team_offset": ag.get("team_offset", 0),
                     "regime_4_5": ag.get("regime_4_5"),
                     "birth_date": ag.get("birth_date"),
-                    "career_start": ag.get("career_start")})
+                    "career_start": ag.get("career_start"),
+                    "matricule": ag.get("matricule")})
 
 # ─────────────────────── ROOT + PWA ──────────────────────────
 @app.route("/")
@@ -205,7 +206,8 @@ def pwa_icon():
 
 # ─────────────────────── DATA HELPERS ────────────────────────
 _DEFAULTS = {"agents": {}, "events": [], "reliquats": {}, "capitals": {},
-             "exchanges": [], "remarks": {}, "shift_overrides": {}}
+             "exchanges": [], "remarks": {}, "shift_overrides": {},
+             "fiches_rh": {}}   # {aid: {year: fiche RH importée}} — additif, vide par défaut
 
 def load():
     if not DATA_FILE.exists():
@@ -471,6 +473,11 @@ def api_patch_agent(aid):
         data["agents"][aid]["birth_date"] = body["birth_date"] or None
     if "career_start" in body:
         data["agents"][aid]["career_start"] = body["career_start"] or None
+    if "matricule" in body:                   # numéro de matricule SPF Justice (fiche RH)
+        v = str(body["matricule"] or "").strip()
+        if v and not _re.fullmatch(r"\d{4,10}", v):
+            return jsonify({"error": "Matricule invalide (4 à 10 chiffres)"}), 400
+        data["agents"][aid]["matricule"] = v or None
     if "team_offset" in body:
         data["agents"][aid]["team_offset"] = int(body["team_offset"])
     if body.get("pin"):                       # changement de PIN
@@ -1512,6 +1519,139 @@ def api_capitals(aid, year):
     return jsonify({"ok": True, "capitals": caps})
 
 
+# ─────────────────────── FICHE RH (PDF « Fiche de congé ») ────
+# Import du PDF RH de la DG EPI. Additif : ne crée jamais d'événement et ne
+# modifie ni capitals ni reliquats — sauf via /apply, action explicite.
+import fiche_rh as _frh
+
+_FICHE_MAX_BYTES = 5 * 1024 * 1024
+
+def _app_dates_by_code(aid, data, y0, y1):
+    """{code: set(iso)} des jours ACCEPTÉS de l'agent (événements + repos 36/38
+    du planning) entre y0 et y1 inclus — pour le rapprochement."""
+    out = {}
+    for e in data["events"]:
+        if e["agent_id"] != aid or e.get("status", "accepte") == "demande":
+            continue
+        d, ee = date.fromisoformat(e["date_start"]), date.fromisoformat(e["date_end"])
+        while d <= ee:
+            if y0 <= d <= y1:
+                out.setdefault(e["code"], set()).add(d.isoformat())
+            d += timedelta(1)
+    d = y0
+    while d <= y1:
+        base = get_day_info(d, aid, data)["base"]
+        if base in ("36", "38"):
+            out.setdefault("__" + base, set()).add(d.isoformat())
+        d += timedelta(1)
+    return out
+
+def _fiche_payload(aid, year, data):
+    entry = data.get("fiches_rh", {}).get(aid, {}).get(str(year))
+    if not entry:
+        return None
+    f = entry["fiche"]
+    p0, p1 = f.get("periode") or [None, None]
+    y0 = date.fromisoformat(p0) if p0 else date(year, 1, 1)
+    y1 = date.fromisoformat(p1) if p1 else date(year, 12, 31)
+    rapp = _frh.reconcile(f, _app_dates_by_code(aid, data, y0, y1))
+    return {"fiche": f, "importee_le": entry.get("importee_le"),
+            "historique": entry.get("historique", []),
+            "rapprochement": rapp, "rubriques_info": _frh.RUBRIQUES_INFO}
+
+@app.route("/api/fiche_rh/<aid>")
+def api_fiche_rh_years(aid):
+    """Années pour lesquelles une fiche RH est importée."""
+    data = load()
+    yrs = sorted(data.get("fiches_rh", {}).get(aid, {}).keys(), reverse=True)
+    return jsonify({"years": yrs, "matricule": data["agents"].get(aid, {}).get("matricule")})
+
+@app.route("/api/fiche_rh/<aid>/<int:year>")
+def api_fiche_rh_get(aid, year):
+    data = load()
+    if aid not in data["agents"]:
+        return jsonify({"error": "Agent inconnu"}), 404
+    p = _fiche_payload(aid, year, data)
+    if p is None:
+        return jsonify({"error": "Aucune fiche RH importée pour cette année"}), 404
+    return jsonify(p)
+
+@app.route("/api/fiche_rh/<aid>/import", methods=["POST"])
+def api_fiche_rh_import(aid):
+    """Importe le PDF (champ 'pdf'). Ne conserve QUE la fiche dont le matricule
+    est celui de l'agent connecté ; les autres agents du PDF sont ignorés."""
+    data = load()
+    ag = data["agents"].get(aid)
+    if not ag:
+        return jsonify({"error": "Agent inconnu"}), 404
+    mat = ag.get("matricule")
+    if not mat:
+        return jsonify({"error": "Renseignez d'abord votre matricule (Mon compte)"}), 400
+    up = request.files.get("pdf")
+    if not up:
+        return jsonify({"error": "Aucun fichier PDF reçu"}), 400
+    raw = up.read(_FICHE_MAX_BYTES + 1)
+    if len(raw) > _FICHE_MAX_BYTES:
+        return jsonify({"error": "PDF trop volumineux (max 5 Mo)"}), 400
+    try:
+        parsed = _frh.parse_pdf(raw)
+    except Exception as ex:   # PDF illisible, pdfplumber absent…
+        return jsonify({"error": f"PDF illisible : {ex}"}), 400
+    fiche = parsed["agents"].get(mat)
+    if not fiche:
+        return jsonify({"error": f"Aucune fiche pour le matricule {mat} dans ce PDF "
+                                 f"({len(parsed['agents'])} agent(s) trouvé(s))"}), 400
+    year = _frh.fiche_year(fiche)
+    store = data.setdefault("fiches_rh", {}).setdefault(aid, {})
+    prev = store.get(str(year))
+    hist = list(prev.get("historique", [])) if prev else []
+    if prev:   # même agent + même année : la nouvelle remplace, trace conservée
+        hist.append({"importee_le": prev.get("importee_le"),
+                     "imprimee_le": prev["fiche"].get("imprimee_le"),
+                     "periode": prev["fiche"].get("periode")})
+    store[str(year)] = {"fiche": fiche, "importee_le": date.today().isoformat(),
+                        "historique": hist[-12:]}
+    save(data)
+    return jsonify({"ok": True, "year": year, "periode": fiche.get("periode"),
+                    "imprimee_le": fiche.get("imprimee_le"),
+                    "nb_rubriques": len(fiche["rubriques"]),
+                    "inconnues": [u["titre"] for u in fiche.get("inconnues", [])],
+                    "remplace": bool(prev)})
+
+@app.route("/api/fiche_rh/<aid>/<int:year>", methods=["DELETE"])
+def api_fiche_rh_delete(aid, year):
+    data = load()
+    removed = data.get("fiches_rh", {}).get(aid, {}).pop(str(year), None)
+    if removed is not None:
+        save(data)
+    return jsonify({"ok": True, "removed": removed is not None})
+
+@app.route("/api/fiche_rh/<aid>/<int:year>/apply", methods=["POST"])
+def api_fiche_rh_apply(aid, year):
+    """Action EXPLICITE : recopie le droit vacances RH dans le quota manuel
+    (capitals.vacances) et le report+réserve dans le reliquat de l'année.
+    C'est la seule écriture de la fiche RH vers les données existantes."""
+    data = load()
+    if aid not in data["agents"]:
+        return jsonify({"error": "Agent inconnu"}), 404
+    entry = data.get("fiches_rh", {}).get(aid, {}).get(str(year))
+    if not entry:
+        return jsonify({"error": "Aucune fiche RH pour cette année"}), 404
+    conge = entry["fiche"]["rubriques"].get("CONGE") or {}
+    if "droit" not in conge:
+        return jsonify({"error": "Rubrique CONGE absente de la fiche"}), 400
+    droit = int(round(conge["droit"]))
+    reliquat = max(0, int(round(conge.get("report", 0) + conge.get("reserve", 0))))
+    caps = data.setdefault("capitals", {}).setdefault(aid, {}).setdefault(str(year), {})
+    before = {"vacances": caps.get("vacances"),
+              "reliquat": data.get("reliquats", {}).get(aid, {}).get(str(year), 0)}
+    caps["vacances"] = droit
+    data.setdefault("reliquats", {}).setdefault(aid, {})[str(year)] = reliquat
+    save(data)
+    return jsonify({"ok": True, "avant": before,
+                    "apres": {"vacances": droit, "reliquat": reliquat}})
+
+
 # ─────────────────────── ÉCHANGES DE SERVICE ─────────────────
 @app.route("/api/exchanges/<aid>")
 def api_exchanges_list(aid):
@@ -2450,6 +2590,17 @@ select:focus,input:focus{border-color:var(--accent)}
 
 /* ── EXCHANGES VIEW ── */
 #exchanges-content{flex:1;padding:24px;overflow-y:auto;display:none}
+#ficherh-content{flex:1;padding:24px;overflow-y:auto;display:none}
+.frh-table{width:100%;border-collapse:collapse;font-size:12px}
+.frh-table th,.frh-table td{padding:6px 8px;border-bottom:1px solid var(--border);text-align:right;white-space:nowrap}
+.frh-table th{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+.frh-table td:first-child,.frh-table th:first-child{text-align:left;white-space:normal}
+.frh-neg{color:#f87171;font-weight:700}.frh-pos{color:#86efac;font-weight:700}
+.frh-dates{font-size:11px;color:var(--muted);line-height:1.7;word-break:break-word}
+.frh-badge{display:inline-block;padding:1px 7px;border-radius:10px;font-size:10px;font-weight:700;margin-left:6px}
+.frh-badge.ok{background:#14532d;color:#86efac}.frh-badge.warn{background:#7c2d12;color:#fdba74}
+.frh-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px}
+
 .exch-balance-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:12px;margin-bottom:20px}
 .exch-balance-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px 16px}
 .exch-balance-card .ebc-title{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;font-weight:700;margin-bottom:6px}
@@ -2475,6 +2626,8 @@ select:focus,input:focus{border-color:var(--accent)}
 .exr-actions{display:flex;gap:6px;margin-left:auto}
 @media(max-width:640px){
   #exchanges-content{padding:12px}
+  #ficherh-content{padding:12px}
+  .frh-grid{grid-template-columns:1fr}
   .exch-row{gap:8px}
   .exr-note{display:none}
 }
@@ -2666,6 +2819,10 @@ select:focus,input:focus{border-color:var(--accent)}
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 16V4m0 0L3 8m4-4l4 4M17 8v12m0 0l4-4m-4 4l-4-4"/></svg>
     Échanges
   </button>
+  <button class="nav-btn" onclick="showView('ficherh')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="16" y2="17"/></svg>
+    Fiche RH
+  </button>
   <button class="nav-btn" onclick="openAgentModal()">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
     Mon compte
@@ -2847,6 +3004,22 @@ select:focus,input:focus{border-color:var(--accent)}
     </div>
     <div class="exch-list" id="exch-list"></div>
   </div>
+
+  <!-- FICHE RH VIEW -->
+  <div id="ficherh-content">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px">
+      <div>
+        <div style="font-size:15px;font-weight:700;color:var(--text)">Fiche RH — « Fiche de congé (Après RT) »</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:2px">Import du PDF du service du personnel : compteurs officiels + rapprochement avec l'app. Lecture seule : rien n'est modifié sans votre action.</div>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <select id="frh-year" onchange="renderFicheRH()" style="padding:7px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px"></select>
+        <input type="file" id="frh-file" accept="application/pdf,.pdf" style="display:none" onchange="importFicheRH(this)">
+        <button class="btn btn-primary" onclick="document.getElementById('frh-file').click()">📥 Importer un PDF</button>
+      </div>
+    </div>
+    <div id="frh-body"></div>
+  </div>
 </div>
 
 <!-- MODAL CONGÉ -->
@@ -2894,6 +3067,15 @@ select:focus,input:focus{border-color:var(--accent)}
         <div class="form-note">Sert au calcul du capital maladie (21j × années de service)</div>
       </div>
       <div class="form-group"><label>&nbsp;</label><button class="btn btn-primary" onclick="saveCareer()">Enregistrer</button></div>
+    </div>
+    <hr style="border-color:var(--border);margin:16px 0">
+    <div style="font-size:13px;font-weight:600;margin-bottom:10px">🪪 Numéro de matricule (SPF Justice)</div>
+    <div class="form-row">
+      <div class="form-group">
+        <input id="acc-matricule" inputmode="numeric" maxlength="10" placeholder="ex. 083734">
+        <div class="form-note">Sert à retrouver VOTRE fiche dans le PDF « Fiche de congé » importé (onglet Fiche RH)</div>
+      </div>
+      <div class="form-group"><label>&nbsp;</label><button class="btn btn-primary" onclick="saveMatricule()">Enregistrer</button></div>
     </div>
     <hr style="border-color:var(--border);margin:16px 0">
     <div style="font-size:13px;font-weight:600;margin-bottom:10px">🔒 Changer mon code PIN</div>
@@ -3452,6 +3634,14 @@ async function saveCareer(){
   if(r.ok){ toast('Date de carrière enregistrée'); loadAgents(); }
   else toast('Erreur','error');
 }
+async function saveMatricule(){
+  const matricule = document.getElementById('acc-matricule').value.trim();
+  const r = await fetch(`/api/agents/${curAgent}`,{method:'PATCH',
+    headers:{'Content-Type':'application/json'}, body:JSON.stringify({matricule})});
+  const j = await r.json().catch(()=>({}));
+  if(r.ok){ toast(matricule?'Matricule enregistré':'Matricule effacé'); loadAgents(); }
+  else toast(j.error||'Erreur','error');
+}
 async function deleteMyAccount(){
   if(!confirm('⚠️ Supprimer DÉFINITIVEMENT ton compte et toutes tes données ?')) return;
   if(!confirm('Dernière confirmation : cette action est irréversible.')) return;
@@ -3519,11 +3709,12 @@ function showView(v) {
   document.getElementById('week-view').classList.toggle('wv-active', calMobile);
   document.getElementById('annual-content').style.display    = v==='annuel'    ? 'block' : 'none';
   document.getElementById('exchanges-content').style.display = v==='exchanges' ? 'block' : 'none';
-  const titles={calendar:'Calendrier',annuel:'Vue annuelle',exchanges:'Échanges de service'};
+  document.getElementById('ficherh-content').style.display   = v==='ficherh'   ? 'block' : 'none';
+  const titles={calendar:'Calendrier',annuel:'Vue annuelle',exchanges:'Échanges de service',ficherh:'Fiche RH'};
   document.getElementById('view-title').textContent = titles[v]||v;
   document.querySelectorAll('.nav-btn').forEach((b,i)=>{
     b.classList.toggle('active',
-      (i===0&&v==='calendar')||(i===1&&v==='annuel')||(i===2&&v==='exchanges'));
+      (i===0&&v==='calendar')||(i===1&&v==='annuel')||(i===2&&v==='exchanges')||(i===3&&v==='ficherh'));
   });
   refresh();
 }
@@ -3533,6 +3724,7 @@ function refresh() {
     else renderCalendar();
   } else if(curView==='annuel') renderAnnual();
   else if(curView==='exchanges') renderExchanges();
+  else if(curView==='ficherh') renderFicheRH();
   updateWeekToggleBtn();
 }
 
@@ -4426,6 +4618,8 @@ function openAgentModal(){
   loadAgents();
   const c=document.getElementById('acc-career');
   if(c && _allAgents[curAgent]) c.value = _allAgents[curAgent].career_start || '';
+  const mEl=document.getElementById('acc-matricule');
+  if(mEl && _allAgents[curAgent]) mEl.value = _allAgents[curAgent].matricule || '';
   // Version installée : permet de vérifier qu'on a bien la dernière mise à jour
   const gEl=document.getElementById('acc-google');
   if(gEl){
@@ -4457,6 +4651,110 @@ function toast(msg,type='ok'){
   const el=document.getElementById('toast');
   el.textContent=msg; el.className='show'+(type==='error'?' error':'');
   setTimeout(()=>el.className='',2500);
+}
+
+// ─────────────── FICHE RH (PDF « Fiche de congé ») ───────────────
+let _frhYears = null;   // années disponibles (cache par agent)
+function _frhFmtJ(v){ if(v===undefined||v===null) return '—'; const s=(Math.round(v*100)/100).toLocaleString('fr-BE'); return s+' j'; }
+function _frhFmtHM(m){ const sg=m<0?'−':''; m=Math.abs(m); return sg+String(Math.floor(m/60)).padStart(2,'0')+'h'+String(m%60).padStart(2,'0'); }
+function _frhFmtDate(iso){ const [y,mo,d]=iso.split('-'); return `${d}/${mo}/${y}`; }
+function _frhCls(v){ return v<0?'frh-neg':(v>0?'frh-pos':''); }
+
+async function renderFicheRH(){
+  const body=document.getElementById('frh-body');
+  const sel=document.getElementById('frh-year');
+  if(!curAgent){ body.innerHTML='<div style="color:var(--muted);padding:20px 0">Sélectionnez un agent.</div>'; return; }
+  const yr=await fetch(`/api/fiche_rh/${curAgent}`).then(r=>r.json()).catch(()=>({years:[]}));
+  _frhYears=yr.years||[];
+  if(!yr.matricule){
+    sel.innerHTML='';
+    body.innerHTML='<div class="card"><h3>Matricule requis</h3><div style="font-size:13px;line-height:1.6">Renseignez d\'abord votre <b>numéro de matricule</b> dans <b>Mon compte</b> : il permet de retrouver votre fiche dans le PDF (qui peut contenir plusieurs agents — seule la vôtre est conservée).</div>'
+      +'<button class="btn btn-primary btn-sm" style="margin-top:10px" onclick="openAgentModal()">⚙ Mon compte</button></div>';
+    return;
+  }
+  if(!_frhYears.length){
+    sel.innerHTML='';
+    body.innerHTML='<div class="card"><h3>Aucune fiche importée</h3><div style="font-size:13px;line-height:1.6">Cliquez sur <b>📥 Importer un PDF</b> et choisissez le fichier « Fiche de congé (Après RT) » remis par le service du personnel. Matricule attendu : <b>'+yr.matricule+'</b>.</div></div>';
+    return;
+  }
+  const wanted=sel.value&&_frhYears.includes(sel.value)?sel.value:_frhYears[0];
+  sel.innerHTML=_frhYears.map(y=>`<option value="${y}" ${y===wanted?'selected':''}>Fiche ${y}</option>`).join('');
+  const r=await fetch(`/api/fiche_rh/${curAgent}/${wanted}`);
+  if(!r.ok){ body.innerHTML='<div style="color:#f87171">Erreur de chargement.</div>'; return; }
+  const p=await r.json(); const f=p.fiche, R=f.rubriques, info=p.rubriques_info, rap=p.rapprochement||{};
+  const per=f.periode&&f.periode[0]?`${_frhFmtDate(f.periode[0])} → ${_frhFmtDate(f.periode[1])}`:'—';
+  let h=`<div class="card" style="margin-bottom:16px"><div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;align-items:center">
+    <div style="font-size:13px;line-height:1.6"><b>${f.nom}</b> · matricule ${f.matricule}<br>
+    <span style="color:var(--muted)">Situation ${per} · imprimée le ${f.imprimee_le?_frhFmtDate(f.imprimee_le):'?'} · importée le ${p.importee_le?_frhFmtDate(p.importee_le):'?'}${p.historique&&p.historique.length?` · ${p.historique.length} import(s) précédent(s) remplacé(s)`:''}</span></div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap">
+      <button class="btn btn-green btn-sm" onclick="applyFicheRH('${wanted}')" title="Recopie le droit vacances RH dans le quota manuel de l'app (avec confirmation)">✔ Appliquer le quota vacances RH</button>
+      <button class="btn btn-danger btn-sm" onclick="deleteFicheRH('${wanted}')">🗑 Retirer cette fiche</button>
+    </div></div>`;
+  if(f.inconnues&&f.inconnues.length) h+=`<div style="margin-top:8px;font-size:12px;color:#fdba74">⚠ Rubriques non reconnues (nouveau format ?) : ${f.inconnues.map(u=>u.titre).join(', ')} — conservées brutes, à signaler.</div>`;
+  h+='</div>';
+
+  // ── Tableau compteurs jours (5 colonnes) ──
+  const five=['CONGE','FERIES','COMPENSATION','JOURS DE PONT','REPOS 38H','REPOS 36H','REPOS'].filter(k=>R[k]);
+  h+='<div class="card" style="margin-bottom:16px"><h3>Compteurs (jours)</h3><div style="overflow-x:auto"><table class="frh-table"><tr><th>Rubrique</th><th>Réserve</th><th>Report</th><th>Droit</th><th>Pris</th><th>Réduction</th><th>Solde</th></tr>';
+  five.forEach(k=>{ const x=R[k]; const adj=x.ajustements||{}; const red=Object.entries(adj).filter(([n])=>n.startsWith('Réduction 19')).reduce((a,[,v])=>a+v,0);
+    const adjTxt=Object.entries(adj).filter(([,v])=>v).map(([n,v])=>`${n} ${_frhFmtJ(v)}`).join(' · ');
+    h+=`<tr><td><b>${(info[k]||{}).label||k}</b>${adjTxt?`<div style="font-size:10px;color:var(--muted)">${adjTxt}</div>`:''}</td><td>${_frhFmtJ(x.reserve)}</td><td class="${_frhCls(x.report)}">${_frhFmtJ(x.report)}</td><td>${_frhFmtJ(x.droit)}</td><td>${_frhFmtJ(x.pris)}</td><td>${red?_frhFmtJ(red):'—'}</td><td class="${_frhCls(x.solde)}">${_frhFmtJ(x.solde)}</td></tr>`; });
+  const three=['EPARGNE-TEMPS','FORMATION','PROMO. SOCIALE'].filter(k=>R[k]);
+  three.forEach(k=>{ const x=R[k]; const fm=x.unite==='min'?_frhFmtHM:_frhFmtJ;
+    h+=`<tr><td><b>${(info[k]||{}).label||k}</b></td><td>—</td><td>—</td><td>${fm(x.droit)}</td><td>${fm(x.pris)}</td><td>—</td><td class="${_frhCls(x.solde)}">${fm(x.solde)}</td></tr>`; });
+  const totals=Object.keys(R).filter(k=>R[k].total!==undefined);
+  totals.forEach(k=>{ const x=R[k]; h+=`<tr><td><b>${(info[k]||{}).label||k}</b></td><td colspan="3"></td><td>${_frhFmtJ(x.total)}</td><td colspan="2"></td></tr>`; });
+  h+='</table></div><div style="font-size:10px;color:var(--muted);margin-top:8px">Solde = Réserve + Report + Droit − Pris − Réduction. « Réduction 19 j. abs » = 1 jour de repos 36h/38h retiré par tranche de 19 jours d\'absence (proratisé au régime).</div></div>';
+
+  // ── Heures supp ──
+  const hs=R['HEURES SUPP.'];
+  if(hs){ h+=`<div class="card" style="margin-bottom:16px"><h3>Heures supplémentaires</h3><div style="display:flex;gap:18px;flex-wrap:wrap;font-size:13px">
+      <div>Report N-1 <b>${_frhFmtHM(hs.report_n1_min||0)}</b></div><div>Réserve <b>${_frhFmtHM(hs.reserve_min||0)}</b></div>
+      <div>Solde final <b class="${_frhCls(hs.solde_final_min||0)}">${_frhFmtHM(hs.solde_final_min||0)}</b></div></div>`;
+    if(hs.mouvements&&hs.mouvements.length) h+=`<div class="frh-dates" style="margin-top:8px">${hs.mouvements.map(m=>`${_frhFmtDate(m.date)} <span class="${_frhCls(m.minutes)}">${m.minutes>0?'+':''}${_frhFmtHM(m.minutes)}</span>`).join(' · ')}</div>`;
+    h+='</div>'; }
+
+  // ── Rapprochement + dates ──
+  h+='<div class="frh-grid">';
+  Object.keys(R).forEach(k=>{ const x=R[k]; if(!x.dates||!x.dates.length) return; const rp=rap[k];
+    let badge='';
+    if(rp){ const nMiss=rp.rh_seulement.length, nExtra=rp.app_seulement.length;
+      badge=(nMiss||nExtra)?`<span class="frh-badge warn">${nMiss} manquant(s) dans l'app · ${nExtra} en trop</span>`:`<span class="frh-badge ok">✓ concordance ${rp.communes}/${rp.nb_rh}</span>`; }
+    h+=`<div class="card"><h3>${(info[k]||{}).label||k} — ${x.dates.length} date(s)${badge}</h3>`;
+    h+=`<div class="frh-dates">${x.dates.map(d=>{ const miss=rp&&rp.rh_seulement.includes(d.date); return `<span style="${miss?'color:#fdba74;font-weight:700':''}">${_frhFmtDate(d.date)}${d.jours!==1?' ('+d.jours+'j)':''}</span>`; }).join(' · ')}</div>`;
+    if(rp&&rp.app_seulement.length) h+=`<div style="font-size:11px;margin-top:8px;color:var(--muted)">Dans l'app mais pas sur la fiche : <span style="color:#fca5a5">${rp.app_seulement.map(_frhFmtDate).join(' · ')}</span></div>`;
+    if(rp&&rp.rh_seulement.length) h+=`<div style="font-size:10px;margin-top:6px;color:var(--muted)">En orange : dates RH absentes de l'app (${k.startsWith('REPOS')?'repos 36/38 du planning':'congés acceptés'}).</div>`;
+    h+='</div>'; });
+  h+='</div>';
+  body.innerHTML=h;
+}
+async function importFicheRH(inp){
+  const file=inp.files&&inp.files[0]; inp.value=''; if(!file) return;
+  if(!curAgent){ toast('Sélectionnez un agent','error'); return; }
+  const fd=new FormData(); fd.append('pdf',file);
+  toast('Lecture du PDF…');
+  const r=await fetch(`/api/fiche_rh/${curAgent}/import`,{method:'POST',body:fd});
+  const j=await r.json().catch(()=>({error:'Réponse invalide'}));
+  if(!r.ok){ toast(j.error||'Import impossible','error'); return; }
+  toast(`Fiche ${j.year} importée${j.remplace?' (ancienne version remplacée)':''} — ${j.nb_rubriques} rubriques`);
+  document.getElementById('frh-year').value=String(j.year);
+  renderFicheRH();
+}
+async function applyFicheRH(year){
+  const p=await fetch(`/api/fiche_rh/${curAgent}/${year}`).then(r=>r.json());
+  const c=(p.fiche.rubriques||{}).CONGE||{};
+  if(c.droit===undefined){ toast('Rubrique CONGE absente','error'); return; }
+  const rel=Math.max(0,Math.round((c.report||0)+(c.reserve||0)));
+  if(!confirm(`Recopier dans l'app pour ${year} :\n• Quota vacances = ${Math.round(c.droit)} j (droit RH)\n• Reliquat = ${rel} j (report + réserve RH)\n\nCela remplace les valeurs saisies manuellement. Continuer ?`)) return;
+  const r=await fetch(`/api/fiche_rh/${curAgent}/${year}/apply`,{method:'POST'});
+  const j=await r.json().catch(()=>({}));
+  if(r.ok){ toast(`Quota ${j.apres.vacances} j / reliquat ${j.apres.reliquat} j appliqués (visibles dans le calendrier)`); }
+  else toast(j.error||'Erreur','error');
+}
+async function deleteFicheRH(year){
+  if(!confirm(`Retirer la fiche RH ${year} de l'app ? (le PDF n'est pas touché, vos congés non plus)`)) return;
+  await fetch(`/api/fiche_rh/${curAgent}/${year}`,{method:'DELETE'});
+  document.getElementById('frh-year').value=''; renderFicheRH();
 }
 
 // ─────────────── ÉCHANGES DE SERVICE ───────────────
