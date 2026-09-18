@@ -4743,6 +4743,11 @@ async function renderFicheRH(){
     if(rp&&rp.app_seulement.length) h+=`<div style="font-size:11px;margin-top:8px;color:var(--muted)">Dans l'app mais pas sur la fiche : ${rp.app_seulement.map(dt=>`<button type="button" class="frh-fixbtn extra" onclick="openDayModal('${dt}')" title="Enregistré dans l'app, absent de la fiche RH — normal si postérieur à l'impression (voir « réel » ci-dessus), sinon cliquez pour corriger">${_frhFmtDate(dt)}</button>`).join(' ')}</div>`;
     if(rp&&rp.rh_seulement.length) h+=`<div style="font-size:10px;margin-top:6px;color:var(--muted)">⚠ dates de la fiche RH sans événement correspondant dans l'app (${k.startsWith('REPOS')?'repos 36/38 du planning':'congés acceptés'}) — cliquez une date pour ouvrir ce jour et corriger manuellement.</div>`;
     h+='</div>'; });
+  Object.keys(reelle).forEach(k=>{ const rl=reelle[k]; if(!rl.dates_depuis||!rl.dates_depuis.length) return;
+    h+=`<div class="card"><h3>${(info[k]||{}).label||k} — depuis l'impression <span class="frh-badge warn">${rl.jours_depuis} jour(s)</span></h3>`;
+    h+=`<div class="frh-dates">${rl.dates_depuis.map(dt=>`<button type="button" class="frh-fixbtn extra" onclick="openDayModal('${dt}')" title="Saisi dans l'app après la fin de période de cette fiche — cliquez pour vérifier ou corriger ce jour">${_frhFmtDate(dt)}</button>`).join(' ')}</div>`;
+    h+=`<div style="font-size:10px;margin-top:6px;color:var(--muted)">Jours pris dans l'app depuis la fin de période de la fiche (le PDF ne les couvre pas encore) — vérifiez chaque date, corrigez si besoin.</div>`;
+    h+='</div>'; });
   h+='</div>';
   body.innerHTML=h;
 }
