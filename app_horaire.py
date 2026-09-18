@@ -2604,6 +2604,10 @@ select:focus,input:focus{border-color:var(--accent)}
 .frh-dates{font-size:11px;color:var(--muted);line-height:1.7;word-break:break-word}
 .frh-badge{display:inline-block;padding:1px 7px;border-radius:10px;font-size:10px;font-weight:700;margin-left:6px}
 .frh-badge.ok{background:#14532d;color:#86efac}.frh-badge.warn{background:#7c2d12;color:#fdba74}
+.frh-fixbtn{font:inherit;font-size:11px;font-weight:700;background:#7c2d12;color:#fdba74;border:1px solid #9a3412;border-radius:6px;padding:1px 7px;cursor:pointer}
+.frh-fixbtn:hover{background:#9a3412}
+.frh-fixbtn.extra{background:#7f1d1d;color:#fca5a5;border-color:#991b1b}
+.frh-fixbtn.extra:hover{background:#991b1b}
 .frh-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px}
 
 .exch-balance-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:12px;margin-bottom:20px}
@@ -4731,9 +4735,13 @@ async function renderFicheRH(){
     if(rp){ const nMiss=rp.rh_seulement.length, nExtra=rp.app_seulement.length;
       badge=(nMiss||nExtra)?`<span class="frh-badge warn">${nMiss} manquant(s) dans l'app · ${nExtra} en trop</span>`:`<span class="frh-badge ok">✓ concordance ${rp.communes}/${rp.nb_rh}</span>`; }
     h+=`<div class="card"><h3>${(info[k]||{}).label||k} — ${x.dates.length} date(s)${badge}</h3>`;
-    h+=`<div class="frh-dates">${x.dates.map(d=>{ const miss=rp&&rp.rh_seulement.includes(d.date); return `<span style="${miss?'color:#fdba74;font-weight:700':''}">${_frhFmtDate(d.date)}${d.jours!==1?' ('+d.jours+'j)':''}</span>`; }).join(' · ')}</div>`;
-    if(rp&&rp.app_seulement.length) h+=`<div style="font-size:11px;margin-top:8px;color:var(--muted)">Dans l'app mais pas sur la fiche : <span style="color:#fca5a5">${rp.app_seulement.map(_frhFmtDate).join(' · ')}</span></div>`;
-    if(rp&&rp.rh_seulement.length) h+=`<div style="font-size:10px;margin-top:6px;color:var(--muted)">En orange : dates RH absentes de l'app (${k.startsWith('REPOS')?'repos 36/38 du planning':'congés acceptés'}).</div>`;
+    h+=`<div class="frh-dates">${x.dates.map(d=>{ const miss=rp&&rp.rh_seulement.includes(d.date);
+      return miss
+        ? `<button type="button" class="frh-fixbtn" onclick="openDayModal('${d.date}')" title="Sur la fiche RH, absente de l'app — cliquez pour ouvrir ce jour et ajouter/corriger l'événement">⚠ ${_frhFmtDate(d.date)}${d.jours!==1?' ('+d.jours+'j)':''}</button>`
+        : `<span>${_frhFmtDate(d.date)}${d.jours!==1?' ('+d.jours+'j)':''}</span>`;
+    }).join(' ')}</div>`;
+    if(rp&&rp.app_seulement.length) h+=`<div style="font-size:11px;margin-top:8px;color:var(--muted)">Dans l'app mais pas sur la fiche : ${rp.app_seulement.map(dt=>`<button type="button" class="frh-fixbtn extra" onclick="openDayModal('${dt}')" title="Enregistré dans l'app, absent de la fiche RH — normal si postérieur à l'impression (voir « réel » ci-dessus), sinon cliquez pour corriger">${_frhFmtDate(dt)}</button>`).join(' ')}</div>`;
+    if(rp&&rp.rh_seulement.length) h+=`<div style="font-size:10px;margin-top:6px;color:var(--muted)">⚠ dates de la fiche RH sans événement correspondant dans l'app (${k.startsWith('REPOS')?'repos 36/38 du planning':'congés acceptés'}) — cliquez une date pour ouvrir ce jour et corriger manuellement.</div>`;
     h+='</div>'; });
   h+='</div>';
   body.innerHTML=h;
