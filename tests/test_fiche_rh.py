@@ -146,6 +146,30 @@ def test_reconcile(fiche):
     assert "FERIES" not in r   # pas d'équivalent app → pas de rapprochement
 
 
+def test_situation_reelle_rien_apres_periode(fiche):
+    f = fiche["agents"]["012345"]
+    assert fiche_rh.situation_reelle(f, {}, today="2025-12-20") == {}
+
+
+def test_situation_reelle_evenements_apres_impression(fiche):
+    f = fiche["agents"]["012345"]
+    app = {"MAL": {"2025-12-20", "2025-12-22"}, "VAC": {"2025-12-18"}}
+    r = fiche_rh.situation_reelle(f, app, today="2025-12-23")
+    assert r["MALADIE"]["jours_depuis"] == 2
+    assert r["MALADIE"]["dates_depuis"] == ["2025-12-20", "2025-12-22"]
+    assert r["MALADIE"]["total_actualise"] == 5.0        # 3,00 j (fiche) + 2 pris depuis
+    conge = f["rubriques"]["CONGE"]
+    assert r["CONGE"]["jours_depuis"] == 1
+    assert r["CONGE"]["pris_actualise"] == round(conge["pris"] + 1, 2)
+    assert r["CONGE"]["solde_actualise"] == round(conge["solde"] - 1, 2)
+
+
+def test_situation_reelle_ignore_dates_dans_la_periode(fiche):
+    f = fiche["agents"]["012345"]
+    app = {"VAC": {"2025-01-21"}}   # déjà couvert par la fiche → ne doit pas re-compter
+    assert fiche_rh.situation_reelle(f, app, today="2025-12-23") == {}
+
+
 # ── routes Flask (parse_pdf simulé : pas de PDF dans le dépôt) ──
 @pytest.fixture
 def client(tmp_path, monkeypatch):

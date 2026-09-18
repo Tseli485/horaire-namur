@@ -1555,9 +1555,14 @@ def _fiche_payload(aid, year, data):
     y0 = date.fromisoformat(p0) if p0 else date(year, 1, 1)
     y1 = date.fromisoformat(p1) if p1 else date(year, 12, 31)
     rapp = _frh.reconcile(f, _app_dates_by_code(aid, data, y0, y1))
+    today = date.today()
+    reelle = {}
+    if today > y1:   # fiche imprimée dans le passé : y a-t-il du nouveau dans l'app depuis ?
+        reelle = _frh.situation_reelle(f, _app_dates_by_code(aid, data, y1 + timedelta(1), today))
     return {"fiche": f, "importee_le": entry.get("importee_le"),
             "historique": entry.get("historique", []),
-            "rapprochement": rapp, "rubriques_info": _frh.RUBRIQUES_INFO}
+            "rapprochement": rapp, "situation_reelle": reelle,
+            "rubriques_info": _frh.RUBRIQUES_INFO}
 
 @app.route("/api/fiche_rh/<aid>")
 def api_fiche_rh_years(aid):
@@ -4681,7 +4686,7 @@ async function renderFicheRH(){
   sel.innerHTML=_frhYears.map(y=>`<option value="${y}" ${y===wanted?'selected':''}>Fiche ${y}</option>`).join('');
   const r=await fetch(`/api/fiche_rh/${curAgent}/${wanted}`);
   if(!r.ok){ body.innerHTML='<div style="color:#f87171">Erreur de chargement.</div>'; return; }
-  const p=await r.json(); const f=p.fiche, R=f.rubriques, info=p.rubriques_info, rap=p.rapprochement||{};
+  const p=await r.json(); const f=p.fiche, R=f.rubriques, info=p.rubriques_info, rap=p.rapprochement||{}, reelle=p.situation_reelle||{};
   const per=f.periode&&f.periode[0]?`${_frhFmtDate(f.periode[0])} → ${_frhFmtDate(f.periode[1])}`:'—';
   let h=`<div class="card" style="margin-bottom:16px"><div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;align-items:center">
     <div style="font-size:13px;line-height:1.6"><b>${f.nom}</b> · matricule ${f.matricule}<br>
@@ -4698,13 +4703,18 @@ async function renderFicheRH(){
   h+='<div class="card" style="margin-bottom:16px"><h3>Compteurs (jours)</h3><div style="overflow-x:auto"><table class="frh-table"><tr><th>Rubrique</th><th>Réserve</th><th>Report</th><th>Droit</th><th>Pris</th><th>Réduction</th><th>Solde</th></tr>';
   five.forEach(k=>{ const x=R[k]; const adj=x.ajustements||{}; const red=Object.entries(adj).filter(([n])=>n.startsWith('Réduction 19')).reduce((a,[,v])=>a+v,0);
     const adjTxt=Object.entries(adj).filter(([,v])=>v).map(([n,v])=>`${n} ${_frhFmtJ(v)}`).join(' · ');
-    h+=`<tr><td><b>${(info[k]||{}).label||k}</b>${adjTxt?`<div style="font-size:10px;color:var(--muted)">${adjTxt}</div>`:''}</td><td>${_frhFmtJ(x.reserve)}</td><td class="${_frhCls(x.report)}">${_frhFmtJ(x.report)}</td><td>${_frhFmtJ(x.droit)}</td><td>${_frhFmtJ(x.pris)}</td><td>${red?_frhFmtJ(red):'—'}</td><td class="${_frhCls(x.solde)}">${_frhFmtJ(x.solde)}</td></tr>`; });
+    const rl=reelle[k];
+    const soldeTxt=rl?`${_frhFmtJ(x.solde)}<div style="font-size:10px;color:var(--muted)">réel : <b class="${_frhCls(rl.solde_actualise)}">${_frhFmtJ(rl.solde_actualise)}</b> (${rl.jours_depuis} j pris dans l'app depuis${rl.approx?', réduction non recalculée':''})</div>`:_frhFmtJ(x.solde);
+    h+=`<tr><td><b>${(info[k]||{}).label||k}</b>${adjTxt?`<div style="font-size:10px;color:var(--muted)">${adjTxt}</div>`:''}</td><td>${_frhFmtJ(x.reserve)}</td><td class="${_frhCls(x.report)}">${_frhFmtJ(x.report)}</td><td>${_frhFmtJ(x.droit)}</td><td>${_frhFmtJ(x.pris)}</td><td>${red?_frhFmtJ(red):'—'}</td><td class="${_frhCls(x.solde)}">${soldeTxt}</td></tr>`; });
   const three=['EPARGNE-TEMPS','FORMATION','PROMO. SOCIALE'].filter(k=>R[k]);
   three.forEach(k=>{ const x=R[k]; const fm=x.unite==='min'?_frhFmtHM:_frhFmtJ;
     h+=`<tr><td><b>${(info[k]||{}).label||k}</b></td><td>—</td><td>—</td><td>${fm(x.droit)}</td><td>${fm(x.pris)}</td><td>—</td><td class="${_frhCls(x.solde)}">${fm(x.solde)}</td></tr>`; });
   const totals=Object.keys(R).filter(k=>R[k].total!==undefined);
-  totals.forEach(k=>{ const x=R[k]; h+=`<tr><td><b>${(info[k]||{}).label||k}</b></td><td colspan="3"></td><td>${_frhFmtJ(x.total)}</td><td colspan="2"></td></tr>`; });
-  h+='</table></div><div style="font-size:10px;color:var(--muted);margin-top:8px">Solde = Réserve + Report + Droit − Pris − Réduction. « Réduction 19 j. abs » = 1 jour de repos 36h/38h retiré par tranche de 19 jours d\'absence (proratisé au régime).</div></div>';
+  totals.forEach(k=>{ const x=R[k]; const rl=reelle[k];
+    const totTxt=rl?`${_frhFmtJ(x.total)}<div style="font-size:10px;color:var(--muted)">réel : <b>${_frhFmtJ(rl.total_actualise)}</b> (+${rl.jours_depuis} j depuis)</div>`:_frhFmtJ(x.total);
+    h+=`<tr><td><b>${(info[k]||{}).label||k}</b></td><td colspan="3"></td><td>${totTxt}</td><td colspan="2"></td></tr>`; });
+  h+='</table></div><div style="font-size:10px;color:var(--muted);margin-top:8px">Solde = Réserve + Report + Droit − Pris − Réduction. « Réduction 19 j. abs » = 1 jour de repos 36h/38h retiré par tranche de 19 jours d\'absence (proratisé au régime).'
+    +(Object.keys(reelle).length?' « réel » = compteur RH + jours saisis dans l\'app depuis la fin de période de cette fiche (recalculé à chaque affichage).':'')+'</div></div>';
 
   // ── Heures supp ──
   const hs=R['HEURES SUPP.'];

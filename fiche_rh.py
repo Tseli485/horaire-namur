@@ -231,3 +231,39 @@ def reconcile(fiche, app_dates_by_code):
             "nb_rh": len(rh), "nb_app": len(app),
         }
     return out
+
+
+def situation_reelle(fiche, app_dates_by_code, today=None):
+    """Prolonge les compteurs RH avec les jours pris dans l'app APRÈS la fin
+    de la période couverte par la fiche (donc depuis son impression) : congés,
+    maladies, etc. saisis dans l'app mais pas encore sur un PDF officiel.
+    `app_dates_by_code` doit couvrir la plage depuis la fin de période jusqu'à
+    `today` (le filtrage exact est fait ici). Purement informatif — ne modifie
+    jamais `fiche` ni les données de l'app."""
+    p0, p1 = fiche.get("periode") or [None, None]
+    if not p1:
+        return {}
+    today = today or date.today().isoformat()
+    out = {}
+    for sec, rub in fiche["rubriques"].items():
+        info = RUBRIQUES_INFO.get(sec, {})
+        codes = info.get("app_codes")
+        if not codes:
+            continue
+        app = set()
+        for c in codes:
+            app |= app_dates_by_code.get(c, set())
+        depuis = sorted(d for d in app if p1 < d <= today)
+        if not depuis:
+            continue
+        nb = len(depuis)
+        entry = {"jours_depuis": nb, "dates_depuis": depuis}
+        if "solde" in rub:
+            entry["pris_actualise"] = round(rub["pris"] + nb, 2)
+            entry["solde_actualise"] = round(rub["solde"] - nb, 2)
+            if sec in ("REPOS 38H", "REPOS 36H"):
+                entry["approx"] = True   # réduction 19j. abs non recalculée
+        elif "total" in rub:
+            entry["total_actualise"] = round(rub["total"] + nb, 2)
+        out[sec] = entry
+    return out
