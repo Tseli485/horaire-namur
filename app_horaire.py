@@ -1555,6 +1555,29 @@ def _app_dates_by_code(aid, data, y0, y1):
         d += timedelta(1)
     return out
 
+_RUBRIQUES_APP_CODES = {c for info in _frh.RUBRIQUES_INFO.values()
+                         for c in (info.get("app_codes") or [])}
+
+def _autres_depuis(aid, data, y1, today):
+    """Tout code de congé/absence saisi dans l'app depuis la fin de période de
+    la fiche (y1) qui n'a PAS de rubrique RH correspondante (ex. Grève, ou tout
+    nouveau code futur) — pour ne rien perdre dans le récap Fiche RH, même ce
+    que le PDF officiel ne couvre pas et ne couvrira jamais."""
+    by_code = _app_dates_by_code(aid, data, y1 + timedelta(1), today)
+    out = {}
+    for code, dates in by_code.items():
+        if code.startswith("__") or code in _RUBRIQUES_APP_CODES:
+            continue
+        depuis = sorted(dates)
+        if not depuis:
+            continue
+        out[code] = {
+            "label": LEAVE_CATALOG.get(code, {}).get("label", code),
+            "jours_depuis": len(depuis),
+            "dates_depuis": depuis,
+        }
+    return out
+
 def _fiche_payload(aid, year, data):
     entry = data.get("fiches_rh", {}).get(aid, {}).get(str(year))
     if not entry:
@@ -1565,12 +1588,14 @@ def _fiche_payload(aid, year, data):
     y1 = date.fromisoformat(p1) if p1 else date(year, 12, 31)
     rapp = _frh.reconcile(f, _app_dates_by_code(aid, data, y0, y1))
     today = date.today()
-    reelle = {}
+    reelle, autres = {}, {}
     if today > y1:   # fiche imprimée dans le passé : y a-t-il du nouveau dans l'app depuis ?
         reelle = _frh.situation_reelle(f, _app_dates_by_code(aid, data, y1 + timedelta(1), today))
+        autres = _autres_depuis(aid, data, y1, today)
     return {"fiche": f, "importee_le": entry.get("importee_le"),
             "historique": entry.get("historique", []),
             "rapprochement": rapp, "situation_reelle": reelle,
+            "autres_depuis": autres,
             "analyse": entry.get("analyse"),
             "rubriques_info": _frh.RUBRIQUES_INFO}
 
@@ -3403,32 +3428,32 @@ async function syncGoogleCal() {
     + 'avec votre horaire actuel (1 mois passé + 4 mois à venir). Votre agenda personnel '
     + 'n\'est jamais modifié. Continuer ?');
   if(!ok) return;
-  const btn  = document.getElementById('btn-gcal');
-  const info = document.getElementById('gcal-info');
-  info.style.display = 'block';
-  info.textContent = 'Synchronisation en cours…';
-  if(btn) btn.disabled = true;
+  const btns  = [document.getElementById('btn-gcal')].filter(Boolean);
+  const infos = [document.getElementById('gcal-info'), document.getElementById('gcal-info-acc')].filter(Boolean);
+  const setInfo = txt => infos.forEach(el => { el.style.display = 'block'; el.textContent = txt; });
+  setInfo('Synchronisation en cours…');
+  btns.forEach(b => b.disabled = true);
   try {
     const r = await fetch('/api/google/sync', {method:'POST'});
     const body = await r.json().catch(()=>({}));
     if(!r.ok){
       if(/connect/i.test(body.error||'')){
-        info.textContent = 'Non connecté à Google Agenda.';
+        setInfo('Non connecté à Google Agenda.');
         toast('Connectez d\'abord votre compte Google (⚙ Mon compte → Google Agenda)','error');
       } else {
-        info.textContent = 'Erreur : ' + (body.error || 'inconnue');
+        setInfo('Erreur : ' + (body.error || 'inconnue'));
         toast('Échec de la synchronisation','error');
       }
       return;
     }
-    info.textContent = `✅ Synchronisé : ${body.created} événement(s) écrit(s) `
-      + `(${body.deleted} ancien(s) supprimé(s)).`;
+    setInfo(`✅ Synchronisé : ${body.created} événement(s) écrit(s) `
+      + `(${body.deleted} ancien(s) supprimé(s)).`);
     toast('Google Agenda synchronisé ✅','ok');
   } catch(e) {
-    info.textContent = 'Erreur réseau.';
+    setInfo('Erreur réseau.');
     toast('Échec de la synchronisation','error');
   } finally {
-    if(btn) btn.disabled = false;
+    btns.forEach(b => b.disabled = false);
   }
 }
 
@@ -4694,7 +4719,9 @@ function openAgentModal(){
         gEl.innerHTML='<span style="color:#f59e0b">⚠ Non configuré côté serveur (variables d\'environnement Google manquantes).</span>';
       } else if(s.connected){
         gEl.innerHTML='<span style="color:var(--green,#16a34a)">✅ Connecté à Google Agenda.</span>'
-          +' <button class="btn btn-sm" style="background:var(--card2);margin-left:6px" onclick="location.href=\'/oauth/google/start\'">Reconnecter</button>';
+          +' <button class="btn btn-sm btn-primary" style="margin-left:6px" onclick="syncGoogleCal()">📅 Synchroniser maintenant</button>'
+          +' <button class="btn btn-sm" style="background:var(--card2);margin-left:6px" onclick="location.href=\'/oauth/google/start\'">Reconnecter</button>'
+          +'<div id="gcal-info-acc" style="margin-top:8px;font-size:11px;color:var(--muted);line-height:1.5"></div>';
       } else {
         gEl.innerHTML='<button class="btn btn-sm btn-primary" onclick="location.href=\'/oauth/google/start\'">🔗 Connecter mon Google Agenda</button>';
       }
@@ -4845,7 +4872,7 @@ async function renderFicheRH(){
     fetch('/api/leaves_catalog').then(x=>x.json()).catch(()=>({})),
   ]);
   if(!r.ok){ body.innerHTML='<div style="color:#f87171">Erreur de chargement.</div>'; return; }
-  const p=await r.json(); const f=p.fiche, R=f.rubriques, info=p.rubriques_info, rap=p.rapprochement||{}, reelle=p.situation_reelle||{}, an=p.analyse;
+  const p=await r.json(); const f=p.fiche, R=f.rubriques, info=p.rubriques_info, rap=p.rapprochement||{}, reelle=p.situation_reelle||{}, autres=p.autres_depuis||{}, an=p.analyse;
   const per=f.periode&&f.periode[0]?`${_frhFmtDate(f.periode[0])} → ${_frhFmtDate(f.periode[1])}`:'—';
   let h=`<div class="card" style="margin-bottom:16px"><div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;align-items:center">
     <div style="font-size:13px;line-height:1.6"><b>${f.nom}</b> · matricule ${f.matricule}<br>
@@ -4906,6 +4933,11 @@ async function renderFicheRH(){
     h+=`<div class="card"><h3>${(info[k]||{}).label||k} — depuis l'impression <span class="frh-badge warn">${rl.jours_depuis} jour(s)</span></h3>`;
     h+=`<div class="frh-dates">${rl.dates_depuis.map(dt=>`<button type="button" class="frh-fixbtn extra" onclick="openDayModal('${dt}')" title="Saisi dans l'app après la fin de période de cette fiche — cliquez pour vérifier ou corriger ce jour">${_frhFmtDate(dt)}</button>`).join(' ')}</div>`;
     h+=`<div style="font-size:10px;margin-top:6px;color:var(--muted)">Jours pris dans l'app depuis la fin de période de la fiche (le PDF ne les couvre pas encore) — vérifiez chaque date, corrigez si besoin.</div>`;
+    h+='</div>'; });
+  Object.keys(autres).forEach(code=>{ const rl=autres[code]; if(!rl.dates_depuis||!rl.dates_depuis.length) return;
+    h+=`<div class="card"><h3>${rl.label} — depuis l'impression <span class="frh-badge warn">${rl.jours_depuis} jour(s)</span></h3>`;
+    h+=`<div class="frh-dates">${rl.dates_depuis.map(dt=>`<button type="button" class="frh-fixbtn extra" onclick="openDayModal('${dt}')" title="Saisi dans l'app après la fin de période de cette fiche — sans rubrique officielle sur le PDF RH — cliquez pour vérifier ou corriger ce jour">${_frhFmtDate(dt)}</button>`).join(' ')}</div>`;
+    h+=`<div style="font-size:10px;margin-top:6px;color:var(--muted)">Sans rubrique correspondante sur la fiche RH officielle (ex. Grève) — jours saisis dans l'app depuis la fin de période, à titre informatif.</div>`;
     h+='</div>'; });
   h+='</div>';
   body.innerHTML=h;
