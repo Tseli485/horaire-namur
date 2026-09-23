@@ -256,6 +256,19 @@ LEAVE_CATALOG = {
         "impacts_sick_balance": False,
     },
 
+    # --- GREVE ---
+    "GREVE": {
+        "label": "Greve",
+        "category": "GREVE",
+        "color": "#16a34a",
+        "base_ref": "Droit de greve - art. 27 Constitution",
+        "note": "Journee non prestee suite a un mouvement de greve : absence, non decomptee comme jour de travail",
+        "days": None,
+        "fractional": True,
+        "requires_approval": False,
+        "impacts_sick_balance": False,
+    },
+
     # --- AUTRES CONGES ---
     "SYNDI": {
         "label": "Conge syndical",

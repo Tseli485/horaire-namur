@@ -676,26 +676,34 @@ def print_month(aid, year, month):
         return "Mois invalide", 400
     days_in_month = monthrange(year, month)[1]
     remarks = data.get("remarks", {}).get(aid, {})
-    worked_days = []
+    worked_days = []   # jours réellement prestés (comptés)
+    greve_days  = []   # jours de grève (affichés, jamais comptés comme prestation)
     for d in range(1, days_in_month + 1):
         day_info = get_day_info(date(year, month, d), aid, data)
         day_info["remark"] = remarks.get(day_info["date"], "")
+        if day_info["code"] == "GREVE":
+            # Absence pour grève : affichée sur la fiche mais jamais un jour presté
+            greve_days.append(day_info)
         # Jour presté = poste travaillé (M/S/N/12H/08H/décalé), sans congé/événement posé
-        if is_worked_shift(day_info["base"]) and day_info["code"] is None:
+        elif is_worked_shift(day_info["base"]) and day_info["code"] is None:
             worked_days.append(day_info)
+    display_days = sorted(worked_days + greve_days, key=lambda x: x["day_num"])
     month_name = MONTH_NAMES_FR[month - 1]
     matin_count = sum(1 for d in worked_days if d["base"] == "M")
     soir_count  = sum(1 for d in worked_days if d["base"] == "S")
     day_names_full = {"Lun": "Lundi", "Mar": "Mardi", "Mer": "Mercredi",
                       "Jeu": "Jeudi", "Ven": "Vendredi", "Sam": "Samedi", "Dim": "Dimanche"}
     rows_html = ""
-    for i, day in enumerate(worked_days, 1):
+    for i, day in enumerate(display_days, 1):
         _pill = {"M": ("MATIN", "#dbeafe", "#1e40af"),
                  "S": ("SOIR",  "#ffedd5", "#9a3412"),
                  "N": ("NUIT",  "#e0e7ff", "#3730a3"),
                  "12H": ("12H", "#ede9fe", "#6d28d9"),
                  "08H": ("08H", "#ccfbf1", "#0f766e")}
-        pill_label, pill_bg, pill_color = _pill.get(day["base"], (day["base"], "#ccfbf1", "#0f766e"))
+        if day["code"] == "GREVE":
+            pill_label, pill_bg, pill_color = ("GRÈVE", "#dcfce7", "#166534")
+        else:
+            pill_label, pill_bg, pill_color = _pill.get(day["base"], (day["base"], "#ccfbf1", "#0f766e"))
         remark_txt = day.get("remark", "")
         full_name  = day_names_full.get(day["day_name"], day["day_name"])
         rows_html += (
@@ -750,7 +758,8 @@ def print_month(aid, year, month):
         '  <div class="sbox"><div class="val">' + str(len(worked_days)) + '</div><div class="lbl">Jours prestés</div></div>'
         '  <div class="sbox"><div class="val">' + str(matin_count) + '</div><div class="lbl">Postes Matin</div></div>'
         '  <div class="sbox soir"><div class="val">' + str(soir_count) + '</div><div class="lbl">Postes Soir</div></div>'
-        '</div>'
+        + ('  <div class="sbox" style="border-color:#16a34a"><div class="val" style="color:#16a34a">' + str(len(greve_days)) + '</div><div class="lbl">Jours de grève</div></div>' if greve_days else '')
+        + '</div>'
         '<table>'
         '  <thead><tr><th>#</th><th>Date</th><th>Poste</th><th>Remarque</th></tr></thead>'
         '  <tbody>' + rows_html + '</tbody>'
@@ -2164,13 +2173,17 @@ def api_day(aid, date_str):
     if aid not in data["agents"]:
         return jsonify({"error": "Agent inconnu"}), 404
     d = date.fromisoformat(date_str)
+    remarks = data.get("remarks", {}).get(aid, {})
     info = get_day_info(d, aid, data)
+    info["remark"] = remarks.get(date_str, "")
     agent = data["agents"][aid]
     offset = agent["team_offset"]
     delta = (d - ANCHOR).days
     cycle_pos = (delta - offset) % CYCLE_LEN
     mon = d - timedelta(days=d.weekday())
     week = [get_day_info(mon + timedelta(i), aid, data) for i in range(7)]
+    for wd in week:
+        wd["remark"] = remarks.get(wd["date"], "")
     shift_hours = shift_hours_of(info["base"]) or "Hors service"
     shift_overridden = date_str in data.get("shift_overrides", {}).get(aid, {})
     return jsonify({**info,
@@ -4705,10 +4718,11 @@ const FRH_KPI_RUBRIQUES = [
 // un total annuel exploitable (ex: FERIE = 1 jour par férié, pas un quota) — on affiche
 // alors la note descriptive à la place d'un chiffre trompeur.
 const FRH_CATALOG_NO_NUM_QUOTA = new Set(['FERIE','PONT','COMPEN']);
-const FRH_CATALOG_ORDER = ['VACANCES','MALADIE','CIRCONSTANCE','FAMILIAL','FERIE','SPECIAL'];
+const FRH_CATALOG_ORDER = ['VACANCES','MALADIE','CIRCONSTANCE','FAMILIAL','FERIE','GREVE','SPECIAL'];
 const FRH_CATALOG_CAT_LABEL = {
   VACANCES:'🏖️ Vacances', MALADIE:'🤒 Maladie', CIRCONSTANCE:'🎗️ Congés de circonstance',
-  FAMILIAL:'👶 Congés familiaux', FERIE:'📅 Fériés & ponts', SPECIAL:'🗂️ Autres congés statutaires',
+  FAMILIAL:'👶 Congés familiaux', FERIE:'📅 Fériés & ponts', GREVE:'📢 Grève',
+  SPECIAL:'🗂️ Autres congés statutaires',
 };
 
 function _frhSyntheseHtml(R, reelle, ent, catalog, year){
@@ -4741,9 +4755,15 @@ function _frhSyntheseHtml(R, reelle, ent, catalog, year){
       ${!m.manual?'<div style="font-size:9px;color:var(--orange);margin-top:2px">à confirmer RH</div>':''}
     </div>`);
   }
+  const greveUsed = (ent && ent.conges_detail && ent.conges_detail.GREVE && ent.conges_detail.GREVE.used) || 0;
+  kpis.push(`<div style="padding:10px 14px;border-right:1px solid var(--border);border-bottom:1px solid var(--border);min-width:120px">
+    <div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">📢 GRÈVE ${year||''}</div>
+    <div style="font-size:22px;font-weight:900;color:#16a34a">${greveUsed}<span style="font-size:11px;color:var(--muted)"> j</span></div>
+    <div style="font-size:9px;color:var(--muted);margin-top:2px">jours d'absence pour grève, non comptés</div>
+  </div>`);
   let h = `<div class="card" style="margin-bottom:16px">
     <h3>📊 Ce qu'il vous reste à prendre</h3>
-    <div style="font-size:11px;color:var(--muted);margin-bottom:8px">Cumul des soldes « réels » (fiche RH + jours saisis dans l'app depuis l'impression). Les heures supp. et le capital maladie sont à part (pas des jours de congé classiques).</div>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:8px">Cumul des soldes « réels » (fiche RH + jours saisis dans l'app depuis l'impression). Les heures supp., le capital maladie et les jours de grève sont à part (pas des jours de congé classiques).</div>
     <div style="display:flex;flex-wrap:wrap;border-top:1px solid var(--border);border-left:1px solid var(--border)">${kpis.join('')}</div>
     <div style="margin-top:10px;font-size:13px"><b>Total jours de congé disponibles à planifier : <span class="${_frhCls(totalJours)}">${_frhFmtJ(totalJours)}</span></b></div>
   </div>`;
