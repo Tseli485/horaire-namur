@@ -2690,6 +2690,7 @@ select:focus,input:focus{border-color:var(--accent)}
 .shift-btn.sb-h12{border-color:#8b5cf6;color:#c4b5fd}
 .shift-btn.sb-h08{border-color:#14b8a6;color:#5eead4}
 .shift-btn.sb-repos{border-color:#22c55e;color:#86efac}
+.shift-btn.sb-greve{border-color:#16a34a;color:#4ade80}
 .shift-btn.sb-reset{border-color:var(--muted);color:var(--muted);font-size:11px}
 .shift-btn.sb-active{opacity:1;font-size:14px}
 .shift-btn:not(.sb-active){opacity:.55}
@@ -3162,6 +3163,7 @@ select:focus,input:focus{border-color:var(--accent)}
         <button class="shift-btn sb-h12" id="sb-12H" onclick="setShiftOverride('12H')">🕛 12H</button>
         <button class="shift-btn sb-h08" id="sb-08H" onclick="setShiftOverride('08H')">🕗 08H</button>
         <button class="shift-btn sb-repos" id="sb-R" onclick="setShiftOverride('R')">🛌 REPOS</button>
+        <button class="shift-btn sb-greve" id="sb-GREVE" onclick="toggleGreve()" title="Journée de grève : absence, comptée en vert, jamais comme un jour presté">📢 GRÈVE</button>
         <button class="shift-btn sb-reset" id="sb-reset" onclick="resetShiftOverride()" title="Restaurer le poste original du cycle">↩ Original</button>
       </div>
       <select id="sb-decale" onchange="if(this.value)setShiftOverride(this.value)" title="Horaire décalé : shift de 8h, la fin est calculée automatiquement (nuit = 22h-06h30 via NUIT)" style="margin-top:8px;width:100%;padding:8px;border:2px solid var(--border);border-radius:8px;background:var(--card2);color:var(--text);font-weight:700;font-size:13px;cursor:pointer">
@@ -4424,6 +4426,7 @@ function renderMiniMonth(cal) {
 
 // ── DAY MODAL ──
 let _dayDate=null;
+let _dayInfo=null;   // dernière réponse /api/day chargée (pour le bouton GRÈVE)
 
 const COLOR_MAP={
   red:   {bg:'rgba(239,68,68,.15)',border:'#ef4444',text:'#fca5a5'},
@@ -4452,6 +4455,7 @@ async function renderDayModal(dateStr) {
   const d=await fetch(`/api/day/${curAgent}/${dateStr}`).then(r=>r.json());
   if(d.error){toast(d.error,'error');return;}
   _dayDate=dateStr;
+  _dayInfo=d;
 
   // Nav buttons
   document.getElementById('dm-prev').onclick=()=>renderDayModal(d.prev_date);
@@ -4541,6 +4545,8 @@ async function renderDayModal(dateStr) {
     const btn=document.getElementById('sb-'+s);
     if(btn) btn.classList.toggle('sb-active', curBase===s);
   });
+  const greveBtn=document.getElementById('sb-GREVE');
+  if(greveBtn) greveBtn.classList.toggle('sb-active', d.code==='GREVE');
   // Sélecteur d'horaire décalé (shift 8h : fin = début + 8h)
   initDecaleSelect();
   const dsel=document.getElementById('sb-decale');
@@ -4577,6 +4583,21 @@ async function setShiftOverride(shift) {
     await renderDayModal(_dayDate);
     renderCalendar();
   } else toast('Erreur','error');
+}
+
+async function toggleGreve() {
+  // Bouton "poste" à un clic pour la Grève — techniquement toujours une absence
+  // (événement GREVE), jamais une surcharge de poste : verte, non comptée comme
+  // jour presté, visible en Fiche RH et sur la fiche du mois.
+  if(!curAgent||!_dayDate) return;
+  if(_dayInfo && _dayInfo.code==='GREVE'){
+    const ev=(_dayInfo.events||[]).find(e=>e.code==='GREVE');
+    if(ev){ await removeEvent(ev.agent_id, ev.date_start, 'GREVE'); return; }
+  }
+  const r=await fetch('/api/events',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({agent_id:curAgent,code:'GREVE',date_start:_dayDate,date_end:_dayDate,status:'accepte'})});
+  if(r.ok){ toast('Journée marquée Grève','ok'); await renderDayModal(_dayDate); renderCalendar(); }
+  else { const j=await r.json().catch(()=>({})); toast(j.error||'Erreur','error'); }
 }
 
 async function resetShiftOverride() {
