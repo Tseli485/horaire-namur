@@ -77,19 +77,26 @@ def test_dev_version(client):
     assert r.status_code == 200
     assert "v" in r.get_json()
 
-def test_api_agents_empty(client):
+def _register(client, aid="AGENT-TEST-001"):
+    """Cree un compte agent (PIN) : ouvre la session du client de test."""
+    r = client.post("/api/auth/register",
+                    json={"id": aid, "name": "Test Agent", "pin": "1234", "offset": 0})
+    assert r.status_code == 200
+    return r.get_json()["id"]
+
+def test_api_agents_requires_login(client):
+    r = client.get("/api/agents")
+    assert r.status_code == 401
+    assert r.get_json().get("login_required") is True
+
+def test_register_and_delete_agent(client):
+    aid = _register(client)
+
     r = client.get("/api/agents")
     assert r.status_code == 200
-    assert r.get_json() == {}
-
-def test_create_and_delete_agent(client):
-    payload = {"id": "agent-test-001", "name": "Test Agent", "offset": 0}
-    r = client.post("/api/agents", json=payload)
-    assert r.status_code == 200
-    aid = r.get_json()["id"]
-
-    r = client.get("/api/agents")
-    assert aid in r.get_json()
+    agents = r.get_json()
+    assert list(agents) == [aid]
+    assert "pin_hash" not in agents[aid]
 
     r = client.delete(f"/api/agents/{aid}")
     assert r.status_code == 200
@@ -103,6 +110,7 @@ def test_icon_svg(client):
     assert b"<svg" in r.data
 
 def test_leaves_catalog(client):
+    _register(client)
     r = client.get("/api/leaves_catalog")
     assert r.status_code == 200
     catalog = r.get_json()
