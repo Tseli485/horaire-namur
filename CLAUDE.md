@@ -81,6 +81,8 @@ correspondance avec la fiche RH.
 | POST | `/api/exchanges` | Créer un échange |
 | PATCH | `/api/exchanges/<eid>` | Valider/refuser échange |
 | GET | `/ical/<aid>.ics` | Flux iCal |
+| GET | `/api/medex/status` | État de la liaison MEDEX |
+| POST/DELETE | `/api/medex/link` | Relier / délier MEDEX |
 | GET | `/api/fiche_rh/<aid>` | Années de fiches RH importées + matricule |
 | POST | `/api/fiche_rh/<aid>/import` | Import PDF (multipart `pdf`) |
 | GET/DELETE | `/api/fiche_rh/<aid>/<year>` | Fiche + rapprochement / retrait |
@@ -121,3 +123,37 @@ pip install -r requirements.txt
 Ce projet utilise le MCP `code-review-graph`. Toujours faire
 `detect_changes` + `get_impact_radius` avant de modifier `horaire_agent.py`
 ou `conges_bosa.py` — ils sont importés par `app_horaire.py`.
+
+## Liaison MEDEX Manager (calendrier commun) — depuis le 25/09/2026
+
+- **Facultative, par agent** : Mon compte → « Liaison MEDEX Manager » (e-mail + mot de passe
+  du compte MEDEX, jamais stocké). Sans liaison, comportement strictement inchangé.
+- **Store commun** : créé à la première liaison (champ `pid` = profil MEDEX propriétaire) ;
+  tant qu'il n'existe pas, MEDEX garde son agenda habituel. Supabase MEDEX, table `donnees_agent`, collection `calendrier_commun`
+  `{evenements[], remarques{}, postes{}, echanges[], version}` — la même que MEDEX lit/écrit.
+  Clé anon `MEDEX_SB_KEY` (publique, RLS par utilisateur) ; jeton de rafraîchissement stocké
+  dans `agenda_data.json` → `agents[aid].medex` (rotation gérée par `_medex_access`).
+- **`load()` / `save()`** : `load()` superpose le commun sur les events/remarks/overrides de
+  l'agent lié (`medex_superposer`, cache 10 s) ; `save()` pousse le diff (`medex_pousser`,
+  instantané `g.medex_snap`) appliqué à une version FRAÎCHE du commun (`_appliquer` : une
+  entrée supprimée ailleurs n'est pas ressuscitée).
+- **Hors ligne / MEDEX injoignable** : lecture sur la copie locale, écriture calendrier
+  REFUSÉE (`MedexIndisponible` → 503 JSON, rien n'est enregistré). Pas de file d'attente.
+  Coupe-circuit : 60 s sans nouvel essai après une panne ; timeout réseau 4 s.
+  Jeton révoqué → `agents[aid].medex.a_refaire` → l'agent doit « Relier à nouveau »
+  (même compte MEDEX = pas de nouvelle fusion).
+- **Secrets** : `_SECRETS_AGENT = (pin_hash, google, medex)` jamais renvoyés au navigateur.
+- **Ids uniques** : chaque event lié porte `uid` (= id commun). Préfixes : `h-…` créé dans HM,
+  `doc-cert-…` / `doc-dem-…` / `doc-soins-…` = document MEDEX (champ `doc`).
+- **Anti-doublon** : première liaison = fusion clé (code, début, fin) ; `POST /api/events`
+  refuse un event identique (409). Côté MEDEX, la partie d'une absence simple couverte par
+  un document de la même famille est MASQUÉE (`rattache_a` = id du document), jamais
+  supprimée : elle réapparaît si le document disparaît/raccourcit. HM n'affiche pas les
+  entrées `rattache_a` et ne les modifie jamais.
+- **Events `doc`** : suppression / confirmation refusées dans HM (400) → à gérer dans MEDEX.
+- **Délier** : retire `doc`, `_commun`, `uid` des events de l'agent (redeviennent normaux).
+- Routes : `GET /api/medex/status`, `POST|DELETE /api/medex/link`.
+- Tests bout-en-bout HM⇄MEDEX : `outils_captures_horaire.py` (dépôt MEDEX) les rejoue avec un
+  Supabase simulé en mémoire et régénère les captures du mode d'emploi.
+- Mode d'emploi HoraireManager : `partage/HoraireManager_Mode_emploi.pdf` du dépôt MEDEX,
+  servi sur https://medex-manager.onrender.com/download/mode-emploi-horaire.pdf.

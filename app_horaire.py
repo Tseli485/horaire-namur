@@ -13,7 +13,7 @@ from datetime import date, timedelta
 from calendar import monthrange, isleap
 from pathlib import Path
 
-from flask import Flask, jsonify, request, Response, session, redirect
+from flask import Flask, jsonify, request, Response, session, redirect, g, has_request_context
 from werkzeug.security import generate_password_hash, check_password_hash
 
 from horaire_agent import get_shift, MONTH_NAMES_FR, DAY_NAMES_FR, CYCLE_LEN, ANCHOR
@@ -210,6 +210,14 @@ _DEFAULTS = {"agents": {}, "events": [], "reliquats": {}, "capitals": {},
              "fiches_rh": {}}   # {aid: {year: fiche RH importée}} — additif, vide par défaut
 
 def load():
+    data = _load_fichier()
+    try:
+        medex_superposer(data)
+    except Exception:
+        pass
+    return data
+
+def _load_fichier():
     if not DATA_FILE.exists():
         return json.loads(json.dumps(_DEFAULTS))
     data = json.loads(DATA_FILE.read_text(encoding="utf-8-sig"))
@@ -230,6 +238,20 @@ def load():
     return data
 
 def save(data):
+    # Agent relié à MEDEX : ses changements de calendrier partent d'abord dans
+    # le calendrier commun. Si c'est impossible, MedexIndisponible est levée et
+    # RIEN n'est enregistré (pas de divergence entre les deux programmes).
+    # Agent non relié : medex_pousser ne fait rien.
+    medex_pousser(data)
+    # Le jeton MEDEX change à chaque rafraîchissement : ne jamais réécrire
+    # dans le fichier un jeton déjà consommé.
+    for _aid, _ag in (data.get("agents") or {}).items():
+        _l = _ag.get("medex") if isinstance(_ag, dict) else None
+        if isinstance(_l, dict) and _MEDEX_REFRESH.get(_aid):
+            _l["refresh"] = _MEDEX_REFRESH[_aid]
+    _save_fichier(data)
+
+def _save_fichier(data):
     _data_dir.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(data, ensure_ascii=False, indent=2, default=str)
     tmp_path = DATA_FILE.with_suffix(DATA_FILE.suffix + ".tmp")
@@ -243,6 +265,382 @@ def save(data):
             last_err = _e
             time.sleep(0.05)
     raise last_err
+
+# ─────────────── LIAISON MEDEX : CALENDRIER COMMUN ───────────────
+# Un agent peut relier son compte HoraireManager à son compte MEDEX Manager
+# (Mon compte → Relier à MEDEX). Ses congés, remarques et postes modifiés
+# vivent alors dans UN calendrier commun (base en ligne de MEDEX, collection
+# « calendrier_commun ») que les deux programmes lisent et écrivent :
+# - à la lecture (load), la partie de l'agent relié est remplacée par le
+#   calendrier commun ;
+# - à l'écriture (save), seules les différences faites pendant la requête
+#   sont reportées dans le calendrier commun (jamais d'écrasement global).
+# Chaque absence a un identifiant unique (uid) : pas de doublon possible.
+# Sans liaison, rien ne change. Si MEDEX est injoignable, l'agent relié voit
+# sa dernière copie locale mais ne peut pas modifier son calendrier (message
+# clair) : aucune file d'attente, donc aucune donnée périmée rejouée plus tard.
+MEDEX_SB_URL = "https://qzpnfzveszatcijosgmp.supabase.co"
+MEDEX_SB_KEY = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InF6cG5menZlc3phdGNpam9zZ21wIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU0MjIxMTcsImV4cCI6MjEwMDk5ODExN30.V_hjA0XfqlcHNbs4WGoPNcgYjWc-qwiqZhfgl4kiIKs")
+MEDEX_WEB = "https://medex-manager.onrender.com"
+_SECRETS_AGENT = ("pin_hash", "google", "medex")   # jamais envoyés au navigateur
+_MEDEX_TOKENS = {}     # aid -> (access_token, expiration)
+_MEDEX_REFRESH = {}    # aid -> dernier refresh_token (rotatif)
+_MEDEX_CACHE = {}      # aid -> (horodatage, calendrier commun)
+_MEDEX_ETAT = {}       # aid -> {"ok": bool, "erreur": str, "quand": "HH:MM"}
+_MEDEX_PANNE = {}      # aid -> horodatage jusqu'auquel on ne réessaie pas
+_MEDEX_DELAI = 4       # secondes max par appel réseau (un seul worker)
+_MEDEX_PAUSE = 60      # après une panne, pas de nouvel essai pendant 60 s
+
+
+class MedexIndisponible(Exception):
+    """Modification du calendrier refusée : calendrier commun inaccessible."""
+
+
+class MedexARefaire(Exception):
+    """Le jeton MEDEX a été révoqué : la liaison doit être refaite."""
+
+
+@app.errorhandler(MedexIndisponible)
+def _medex_indisponible(e):
+    return jsonify({"error": str(e)}), 503
+
+
+def _sb_http(method, path, token=None, body=None, prefer=None):
+    req = urllib.request.Request(MEDEX_SB_URL + path,
+                                 data=json.dumps(body).encode() if body is not None else None,
+                                 method=method)
+    req.add_header("apikey", MEDEX_SB_KEY)
+    req.add_header("Authorization", "Bearer " + (token or MEDEX_SB_KEY))
+    req.add_header("Content-Type", "application/json")
+    if prefer:
+        req.add_header("Prefer", prefer)
+    with urllib.request.urlopen(req, timeout=_MEDEX_DELAI) as r:
+        txt = r.read().decode("utf-8")
+    return json.loads(txt) if txt.strip() else None
+
+
+def medex_connexion(email, mot_de_passe):
+    """Identifiants MEDEX -> (user_id, refresh_token, access_token, durée)."""
+    try:
+        d = _sb_http("POST", "/auth/v1/token?grant_type=password",
+                     body={"email": email, "password": mot_de_passe})
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 401):
+            raise ValueError("E-mail ou mot de passe MEDEX incorrect")
+        raise
+    return d["user"]["id"], d["refresh_token"], d["access_token"], d.get("expires_in", 3600)
+
+
+def _medex_lien(data, aid):
+    ag = (data.get("agents") or {}).get(aid) or {}
+    lien = ag.get("medex")
+    return lien if isinstance(lien, dict) and lien.get("uid") else None
+
+
+def _medex_persister(aid, **champs):
+    """Met à jour la liaison dans le fichier (hors du flux load/save)."""
+    brut = _load_fichier()
+    lien = (brut.get("agents", {}).get(aid) or {}).get("medex")
+    if isinstance(lien, dict):
+        lien.update(champs)
+        for k, v in list(lien.items()):
+            if v is None:
+                lien.pop(k)
+        _save_fichier(brut)
+
+
+def _medex_access(aid, lien):
+    tok = _MEDEX_TOKENS.get(aid)
+    if tok and tok[1] > time.time() + 60:
+        return tok[0]
+    refresh = _MEDEX_REFRESH.get(aid) or lien.get("refresh")
+    try:
+        d = _sb_http("POST", "/auth/v1/token?grant_type=refresh_token", body={"refresh_token": refresh})
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 401):
+            _MEDEX_TOKENS.pop(aid, None); _MEDEX_REFRESH.pop(aid, None)
+            _medex_persister(aid, a_refaire=True)
+            lien["a_refaire"] = True
+            raise MedexARefaire("Liaison MEDEX expirée")
+        raise
+    _MEDEX_TOKENS[aid] = (d["access_token"], time.time() + int(d.get("expires_in", 3600)))
+    _MEDEX_REFRESH[aid] = d["refresh_token"]
+    # Le jeton de rafraîchissement change à chaque usage : on le conserve.
+    _medex_persister(aid, refresh=d["refresh_token"])
+    return d["access_token"]
+
+
+def _commun_lire(aid, lien, force=False):
+    c = _MEDEX_CACHE.get(aid)
+    if c and not force and time.time() - c[0] < 10:
+        return json.loads(json.dumps(c[1]))
+    tok = _medex_access(aid, lien)
+    rows = _sb_http("GET", "/rest/v1/donnees_agent?collection=eq.calendrier_commun&select=payload", tok)
+    com = rows[0]["payload"] if rows else None
+    if com is not None:
+        _MEDEX_CACHE[aid] = (time.time(), com)
+    return json.loads(json.dumps(com)) if com is not None else None
+
+
+def _commun_ecrire(aid, lien, com):
+    tok = _medex_access(aid, lien)
+    _sb_http("POST", "/rest/v1/donnees_agent", tok,
+             body={"user_id": lien["uid"], "collection": "calendrier_commun", "payload": com},
+             prefer="resolution=merge-duplicates,return=minimal")
+    _MEDEX_CACHE[aid] = (time.time(), json.loads(json.dumps(com)))
+
+
+def _commun_normaliser(c):
+    c = c or {}
+    for k, v in (("evenements", []), ("remarques", {}), ("postes", {}), ("echanges", [])):
+        if not isinstance(c.get(k), type(v)):
+            c[k] = v
+    return c
+
+
+def _entree_vers_event(e, aid):
+    ev = {"agent_id": aid, "code": e.get("code"),
+          "label": e.get("label") or LEAVE_CATALOG.get(e.get("code"), {}).get("label", e.get("code")),
+          "category": e.get("categorie") or LEAVE_CATALOG.get(e.get("code"), {}).get("category", ""),
+          "date_start": e.get("debut"), "date_end": e.get("fin") or e.get("debut"),
+          "note": e.get("note", ""), "status": e.get("statut", "accepte"),
+          "created": (e.get("cree_le") or "")[:10], "uid": e.get("id"),
+          "_commun": e}
+    if e.get("doc"):
+        ev["doc"] = e["doc"]
+    return ev
+
+
+def _event_vers_entree(ev):
+    base = dict(ev.get("_commun") or {})
+    cat = LEAVE_CATALOG.get(ev.get("code"), {})
+    base.update({"id": ev.get("uid"), "code": ev.get("code"), "label": ev.get("label"),
+                 "categorie": ev.get("category") or cat.get("category", ""),
+                 "couleur": base.get("couleur") or cat.get("color", "#888"),
+                 "debut": ev.get("date_start"), "fin": ev.get("date_end") or ev.get("date_start"),
+                 "note": ev.get("note", ""), "statut": ev.get("status", "accepte"),
+                 "origine": base.get("origine") or "horaire",
+                 "cree_le": base.get("cree_le") or ev.get("created") or date.today().isoformat()})
+    return base
+
+
+def _vue_agent(data, aid):
+    """Partie synchronisée de l'agent : {evts: {uid: entrée}, rem: {}, postes: {}}."""
+    evs = [e for e in data.get("events", []) if e.get("agent_id") == aid]
+    vus = set()
+    for e in sorted(evs, key=lambda x: (x.get("date_start") or "")):
+        if not e.get("uid") or e["uid"] in vus:
+            # nouvel événement, ou morceau issu d'une confirmation partielle
+            e["uid"] = (e.get("uid") or "h") + "-" + _uuid.uuid4().hex[:8]
+        vus.add(e["uid"])
+    return {"evts": {e["uid"]: _event_vers_entree(e) for e in evs},
+            "rem": dict((data.get("remarks") or {}).get(aid, {})),
+            "postes": dict((data.get("shift_overrides") or {}).get(aid, {}))}
+
+
+def _appliquer(com, diff):
+    """Applique à la version FRAÎCHE du calendrier commun les changements de
+    la requête. Une absence modifiée ici mais supprimée entre-temps dans MEDEX
+    n'est pas ressuscitée ; les entrées masquées (rattachées à un document)
+    ne sont jamais touchées."""
+    com = _commun_normaliser(com)
+    evts = [e for e in com["evenements"] if e.get("id") not in diff["suppr"]]
+    idx = {e.get("id"): i for i, e in enumerate(evts)}
+    for e in diff["maj"]:
+        if e["id"] in idx:
+            ancien = evts[idx[e["id"]]]
+            if ancien.get("rattache_a"):
+                e = dict(e, rattache_a=ancien["rattache_a"])
+            evts[idx[e["id"]]] = e
+        elif e["id"] in diff.get("nouveaux", ()):
+            parent = diff.get("parents", {}).get(e["id"])
+            if parent and parent not in idx:
+                continue          # morceau d'une absence supprimée entre-temps
+            evts.append(e)
+    com["evenements"] = evts
+    for k, v in diff["rem"].items():
+        if v is None:
+            com["remarques"].pop(k, None)
+        else:
+            com["remarques"][k] = v
+    for k, v in diff["postes"].items():
+        if v is None:
+            com["postes"].pop(k, None)
+        else:
+            com["postes"][k] = v
+    com["maj"] = date.today().isoformat()
+    return com
+
+
+def medex_superposer(data, aid=None):
+    """Remplace la partie de l'agent connecté par le calendrier commun."""
+    if not has_request_context():
+        return
+    aid = aid or current_aid()
+    lien = _medex_lien(data, aid) if aid else None
+    if not lien:
+        return
+    if _MEDEX_REFRESH.get(aid):
+        lien["refresh"] = _MEDEX_REFRESH[aid]
+    com, en_ligne = None, False
+    if lien.get("a_refaire"):
+        _MEDEX_ETAT[aid] = {"ok": False, "erreur": "Liaison MEDEX expirée", "quand": time.strftime("%H:%M")}
+    elif _MEDEX_PANNE.get(aid, 0) > time.time():
+        pass                      # panne récente : pas de nouvel essai tout de suite
+    else:
+        try:
+            com = _commun_lire(aid, lien)
+            en_ligne = True
+            _MEDEX_ETAT[aid] = {"ok": True, "erreur": "", "quand": time.strftime("%H:%M")}
+        except MedexARefaire:
+            _MEDEX_ETAT[aid] = {"ok": False, "erreur": "Liaison MEDEX expirée", "quand": time.strftime("%H:%M")}
+        except Exception as e:
+            _MEDEX_PANNE[aid] = time.time() + _MEDEX_PAUSE
+            _MEDEX_ETAT[aid] = {"ok": False, "erreur": str(e)[:120], "quand": time.strftime("%H:%M")}
+    if en_ligne and com is not None:
+        com = _commun_normaliser(com)
+        data["events"] = [e for e in data.get("events", []) if e.get("agent_id") != aid] + \
+                         [_entree_vers_event(e, aid) for e in com["evenements"]
+                          if e.get("debut") and not e.get("rattache_a")]
+        data.setdefault("remarks", {})[aid] = dict(com["remarques"])
+        data.setdefault("shift_overrides", {})[aid] = dict(com["postes"])
+    # Instantané de référence : les changements de la requête seront
+    # calculés par rapport à lui (en ligne : le commun ; sinon : la copie locale).
+    g.medex_snap = (aid, json.loads(json.dumps(_vue_agent(data, aid))), en_ligne)
+
+
+def medex_pousser(data):
+    """Reporte dans le calendrier commun les modifications de la requête.
+    Lève MedexIndisponible si c'est impossible (rien n'est alors enregistré)."""
+    if not has_request_context() or not getattr(g, "medex_snap", None):
+        return
+    aid, avant, en_ligne = g.medex_snap
+    lien = _medex_lien(data, aid)
+    if not lien:
+        return
+    apres = _vue_agent(data, aid)
+    diff = {"suppr": [k for k in avant["evts"] if k not in apres["evts"]],
+            "maj": [v for k, v in apres["evts"].items() if avant["evts"].get(k) != v],
+            "nouveaux": [k for k in apres["evts"] if k not in avant["evts"]],
+            "parents": {k: p for k in apres["evts"] if k not in avant["evts"]
+                        for p in avant["evts"] if k.startswith(p + "-")},
+            "rem": {k: apres["rem"].get(k) for k in set(avant["rem"]) | set(apres["rem"])
+                    if avant["rem"].get(k) != apres["rem"].get(k)},
+            "postes": {k: apres["postes"].get(k) for k in set(avant["postes"]) | set(apres["postes"])
+                       if avant["postes"].get(k) != apres["postes"].get(k)}}
+    if not (diff["suppr"] or diff["maj"] or diff["rem"] or diff["postes"]):
+        return
+    if lien.get("a_refaire"):
+        raise MedexIndisponible("Liaison MEDEX expirée : Mon compte → Liaison MEDEX Manager → "
+                                "Relier à nouveau. Rien n'a été enregistré.")
+    if not en_ligne:
+        raise MedexIndisponible("MEDEX est momentanément injoignable : réessayez dans une minute. "
+                                "Rien n'a été enregistré.")
+    if _MEDEX_REFRESH.get(aid):
+        lien["refresh"] = _MEDEX_REFRESH[aid]
+    try:
+        com = _commun_lire(aid, lien, force=True)
+        _commun_ecrire(aid, lien, _appliquer(com, diff))
+        _MEDEX_ETAT[aid] = {"ok": True, "erreur": "", "quand": time.strftime("%H:%M")}
+    except MedexARefaire:
+        raise MedexIndisponible("Liaison MEDEX expirée : Mon compte → Liaison MEDEX Manager → "
+                                "Relier à nouveau. Rien n'a été enregistré.")
+    except Exception as e:
+        _MEDEX_PANNE[aid] = time.time() + _MEDEX_PAUSE
+        _MEDEX_ETAT[aid] = {"ok": False, "erreur": str(e)[:120], "quand": time.strftime("%H:%M")}
+        raise MedexIndisponible("MEDEX est momentanément injoignable : réessayez dans une minute. "
+                                "Rien n'a été enregistré.")
+    g.medex_snap = (aid, json.loads(json.dumps(apres)), True)
+
+
+@app.route("/api/medex/status")
+def api_medex_status():
+    aid = current_aid()
+    data = load()
+    lien = _medex_lien(data, aid)
+    et = _MEDEX_ETAT.get(aid, {})
+    return jsonify({"lie": bool(lien), "email": (lien or {}).get("email", ""),
+                    "a_refaire": bool((lien or {}).get("a_refaire")),
+                    "ok": et.get("ok", True), "erreur": et.get("erreur", ""),
+                    "quand": et.get("quand", ""), "medex_url": MEDEX_WEB})
+
+
+@app.route("/api/medex/link", methods=["POST", "DELETE"])
+def api_medex_link():
+    aid = current_aid()
+    # Délier : partir de la vue commune la plus récente (si MEDEX répond).
+    data = load() if request.method == "DELETE" else _load_fichier()
+    if aid not in data["agents"]:
+        return jsonify({"error": "Agent inconnu"}), 404
+    if request.method == "DELETE":
+        data["agents"][aid].pop("medex", None)
+        # Les absences restent dans HoraireManager, mais redeviennent des
+        # absences ordinaires (modifiables et supprimables ici).
+        for ev in data.get("events", []):
+            if ev.get("agent_id") == aid:
+                for k in ("doc", "_commun", "uid"):
+                    ev.pop(k, None)
+        _MEDEX_TOKENS.pop(aid, None); _MEDEX_REFRESH.pop(aid, None)
+        _MEDEX_CACHE.pop(aid, None); _MEDEX_PANNE.pop(aid, None); _MEDEX_ETAT.pop(aid, None)
+        _save_fichier(data)
+        return jsonify({"ok": True})
+    body = request.json or {}
+    email = (body.get("email") or "").strip()
+    try:
+        uid, refresh, access, exp = medex_connexion(email, body.get("password") or "")
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 403
+    except Exception as e:
+        return jsonify({"error": "MEDEX injoignable : " + str(e)[:100]}), 502
+    _MEDEX_TOKENS[aid] = (access, time.time() + int(exp))
+    _MEDEX_REFRESH[aid] = refresh
+    _MEDEX_PANNE.pop(aid, None)
+    ancien = _medex_lien(data, aid)
+    lien = {"email": email, "uid": uid, "refresh": refresh,
+            "lie_le": (ancien or {}).get("lie_le") or date.today().isoformat()}
+    if ancien and ancien.get("uid") == uid:
+        # Liaison renouvelée (jeton expiré) : même compte, rien à fusionner.
+        data["agents"][aid]["medex"] = lien
+        _save_fichier(data)
+        return jsonify({"ok": True, "email": email, "ajoutes": 0})
+    # Fusion initiale, une seule fois : calendrier commun existant (ou agenda
+    # MEDEX existant) + données HoraireManager de l'agent, sans doublon.
+    try:
+        com = _commun_lire(aid, lien, force=True)
+        prof = _sb_http("GET", "/rest/v1/donnees_agent?collection=eq.profiles&select=payload", access)
+        profs = (prof[0]["payload"] if prof else None) or []
+        if com is None:
+            com = {"evenements": [], "remarques": {}, "postes": {}, "echanges": []}
+            ag = _sb_http("GET", "/rest/v1/donnees_agent?collection=eq.agenda&select=payload", access)
+            if profs and ag:
+                base = (ag[0]["payload"] or {}).get(str(profs[0].get("id"))) or {}
+                com["evenements"] = list(base.get("evenements", []))
+                com["remarques"] = dict(base.get("remarques", {}))
+                com["postes"] = dict(base.get("postes", {}))
+                com["echanges"] = list(base.get("echanges", []))
+        com = _commun_normaliser(com)
+        if profs and not com.get("pid"):
+            com["pid"] = str(profs[0].get("id"))   # profil MEDEX propriétaire
+        cles = {(e.get("code"), e.get("debut"), e.get("fin") or e.get("debut")) for e in com["evenements"]}
+        ajoutes = 0
+        for ev in [e for e in data.get("events", []) if e.get("agent_id") == aid]:
+            k = (ev.get("code"), ev.get("date_start"), ev.get("date_end"))
+            if k in cles:
+                continue
+            ev["uid"] = ev.get("uid") or "h-" + _uuid.uuid4().hex[:10]
+            com["evenements"].append(_event_vers_entree(ev))
+            cles.add(k); ajoutes += 1
+        for k, v in (data.get("remarks") or {}).get(aid, {}).items():
+            com["remarques"].setdefault(k, v)
+        for k, v in (data.get("shift_overrides") or {}).get(aid, {}).items():
+            com["postes"].setdefault(k, v)
+        _commun_ecrire(aid, lien, com)
+    except Exception as e:
+        return jsonify({"error": "Liaison impossible : " + str(e)[:120]}), 502
+    data["agents"][aid]["medex"] = lien
+    _save_fichier(data)
+    return jsonify({"ok": True, "email": email, "ajoutes": ajoutes})
+
 
 def _get_week_shift(d: date, offset: int) -> str:
     """Poste dominant (M ou S) de la semaine contenant d.
@@ -427,8 +825,7 @@ def api_agents():
     ag  = load()["agents"].get(aid)
     if not ag:
         return jsonify({})
-    _hidden = ("pin_hash", "google")   # secrets jamais exposés au navigateur
-    return jsonify({aid: {k: v for k, v in ag.items() if k not in _hidden}})
+    return jsonify({aid: {k: v for k, v in ag.items() if k not in _SECRETS_AGENT}})
 
 @app.route("/api/reset", methods=["POST"])
 def api_reset():
@@ -486,7 +883,7 @@ def api_patch_agent(aid):
         data["agents"][aid]["pin_hash"] = generate_password_hash(str(body["pin"]))
     save(data)
     ag = {k: v for k, v in data["agents"][aid].items() if k != "pin_hash"}
-    return jsonify({"ok": True, "agent": ag})
+    return jsonify({"ok": True, "agent": {k: v for k, v in ag.items() if k not in _SECRETS_AGENT}})
 
 @app.route("/api/agents/<aid>", methods=["DELETE"])
 def api_del_agent(aid):
@@ -1189,6 +1586,12 @@ def api_add_event():
                    and e["date_start"][:4] == yr)
         if used >= 2:
             return jsonify({"error": f"Limite BOSA atteinte : 2 jours sans certificat déjà pris en {yr} — certificat médical requis"}), 400
+    # Pas de doublon : même type d'absence aux mêmes dates déjà encodé
+    # (ici ou dans MEDEX Manager via le calendrier commun).
+    if any(e["agent_id"] == aid and e["code"] == body["code"]
+           and e["date_start"] == body["date_start"] and e["date_end"] == body["date_end"]
+           for e in data["events"]):
+        return jsonify({"error": "Ce congé est déjà encodé à ces dates (pas de doublon)."}), 409
     status = body.get("status", "demande")
     if status not in ("demande", "accepte"):
         status = "demande"
@@ -1231,6 +1634,8 @@ def api_confirm_event():
             out.append(e)
     if target is None:
         return jsonify({"error": "Congé demandé introuvable"}), 404
+    if target.get("doc"):
+        return jsonify({"error": "Ce congé suit une demande MEDEX : encodez la décision dans MEDEX (Mes demandes → Réponse)"}), 400
 
     es, ee = date.fromisoformat(target["date_start"]), date.fromisoformat(target["date_end"])
     cs, ce = max(cs, es), min(ce, ee)
@@ -1256,6 +1661,10 @@ def api_confirm_event():
 def api_del_event():
     data = load()
     body = request.json
+    if any(e.get("doc") for e in data["events"]
+           if e["agent_id"] == body["agent_id"] and e["date_start"] == body["date_start"]
+           and e["code"] == body["code"]):
+        return jsonify({"error": "Cette absence vient d'un document MEDEX : supprimez-la dans MEDEX"}), 400
     before = len(data["events"])
     data["events"] = [e for e in data["events"]
                       if not (e["agent_id"] == body["agent_id"]
@@ -2080,6 +2489,10 @@ def api_ical_url():
 def export_ical(aid):
     """Flux iCal abonnable par Google Agenda / Apple Calendrier."""
     data = load()
+    try:
+        medex_superposer(data, aid)      # calendrier commun (liaison MEDEX)
+    except Exception:
+        pass
     if aid not in data["agents"]:
         return "Agent inconnu", 404
     agent = data["agents"][aid]
@@ -3144,6 +3557,9 @@ select:focus,input:focus{border-color:var(--accent)}
       <div class="form-group"><label>&nbsp;</label><button class="btn btn-primary" onclick="changePin()">Mettre à jour</button></div>
     </div>
     <hr style="border-color:var(--border);margin:16px 0">
+    <div style="font-size:13px;font-weight:600;margin-bottom:8px">🔗 Liaison MEDEX Manager</div>
+    <div id="acc-medex" style="font-size:12px;color:var(--muted);margin-bottom:6px">Chargement…</div>
+    <hr style="border-color:var(--border);margin:16px 0">
     <div style="font-size:13px;font-weight:600;margin-bottom:8px">🔗 Google Agenda</div>
     <div id="acc-google" style="font-size:12px;color:var(--muted)">Chargement…</div>
     <div id="acc-version" style="font-size:11px;color:var(--muted);text-align:center;margin-top:14px"></div>
@@ -3287,6 +3703,7 @@ select:focus,input:focus{border-color:var(--accent)}
 </div>
 
 <div id="toast"></div>
+<div id="medex-banner" style="display:none;position:fixed;bottom:10px;left:50%;transform:translateX(-50%);z-index:9000;background:#92400e;color:#fff;padding:8px 14px;border-radius:10px;font-size:12px;max-width:92vw"></div>
 
 <script>
 let curYear  = new Date().getFullYear();
@@ -3320,6 +3737,7 @@ async function init() {
   catalog = await fetch('/api/leaves_catalog').then(r=>r.json());
   populateCatalog();
   await loadAgents();   // ne renvoie QUE l'agent connecté -> curAgent = soi
+  chargerMedex();       // liaison MEDEX (calendrier commun) : état + bandeau
   // Mode mono-agent : masquer la sélection d'équipe et d'agent (un agent ne voit que lui)
   ['team-btns','mobile-team-bar','mobile-agent-bar','team-section-label'].forEach(id=>{
     const e=document.getElementById(id); if(e) e.style.display='none';
@@ -4532,10 +4950,13 @@ async function renderDayModal(dateStr) {
         ? '<span style="background:#fef3c7;color:#92400e;font-size:10px;font-weight:800;padding:2px 7px;border-radius:10px">⏳ DEMANDÉ</span>'
         : '<span style="background:#dcfce7;color:#166534;font-size:10px;font-weight:800;padding:2px 7px;border-radius:10px">✅ ACCEPTÉ</span>';
       const ident = `'${e.agent_id}','${e.code}','${e.date_start}','${e.date_end}'`;
-      const confirmBtns = st==='demande'
+      const docUrl = (!e.doc && _medex.lie) ? medexDocUrl(e) : null;
+      const confirmBtns = (st==='demande' && !e.doc
         ? `<button class="btn btn-sm" style="background:var(--green,#16a34a);color:#fff" onclick="confirmEvent(${ident},true)">✅ Tout accepter</button>
            <button class="btn btn-sm" style="background:var(--card2)" onclick="confirmEvent(${ident},false)">Partiel…</button>`
-        : '';
+        : '')
+        + (e.doc ? '<span style="background:#dbeafe;color:#1e40af;font-size:10px;font-weight:800;padding:2px 7px;border-radius:10px">📄 DOCUMENT MEDEX</span>' : '')
+        + (docUrl ? `<a class="btn btn-sm" style="background:#1a5276;color:#fff" target="_blank" href="${docUrl}">📄 Établir le document dans MEDEX</a>` : '');
       return `
       <div class="dm-event-row">
         <div>
@@ -4543,7 +4964,7 @@ async function renderDayModal(dateStr) {
           <div class="dm-ev-meta">${e.date_start} au ${e.date_end}${e.note?' · '+e.note:''}</div>
           <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">${confirmBtns}</div>
         </div>
-        <button class="btn btn-danger btn-sm" onclick="removeEvent('${e.agent_id}','${e.date_start}','${e.code}')">Suppr.</button>
+        ${e.doc ? '' : `<button class="btn btn-danger btn-sm" onclick="removeEvent('${e.agent_id}','${e.date_start}','${e.code}')">Suppr.</button>`}
       </div>`;}).join('');
   } else {
     evHTML+=`<div style="color:var(--muted);font-size:12px;padding:10px 0">Aucun congé enregistré pour ce jour.</div>`;
@@ -4678,7 +5099,7 @@ async function submitLeave() {
   const r=await fetch('/api/events',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({agent_id:curAgent,code,date_start:start,date_end:end,note,status})});
   if(r.ok){toast(status==='accepte'?'Congé accepté enregistré':'Demande de congé enregistrée');closeModal('leave-modal');renderCalendar();}
-  else toast('Erreur lors de l\'enregistrement','error');
+  else { const j=await r.json().catch(()=>({})); toast(j.error||'Erreur lors de l\'enregistrement','error'); }
 }
 
 async function confirmEvent(agent,code,start,end,full){
@@ -4699,6 +5120,7 @@ async function removeEvent(agent,start,code) {
   const r=await fetch('/api/events',{method:'DELETE',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({agent_id:agent,date_start:start,code})});
   if(r.ok){toast('Congé supprimé');renderCalendar();if(_dayDate) renderDayModal(_dayDate);}
+  else{const j=await r.json().catch(()=>({}));toast(j.error||'Suppression impossible','error');}
 }
 
 // ── MODALS ──
@@ -4727,6 +5149,7 @@ function openAgentModal(){
       }
     }).catch(()=>{ gEl.textContent='Indisponible.'; });
   }
+  renderMedexLien();
   const vEl=document.getElementById('acc-version');
   if(vEl){
     fetch('/dev-version',{cache:'no-store'}).then(r=>r.json()).then(d=>{
@@ -4736,6 +5159,60 @@ function openAgentModal(){
     }).catch(()=>{ vEl.textContent=''; });
   }
   openModal('agent-modal');
+}
+
+// ── LIAISON MEDEX (calendrier commun) ──
+let _medex = {lie:false, medex_url:'https://medex-manager.onrender.com'};
+// Modification refusée car MEDEX injoignable (503) : message explicite partout.
+(function(){ const f=window.fetch.bind(window);
+  window.fetch=async function(...a){ const r=await f(...a);
+    if(r.status===503) r.clone().json().then(j=>{ if(j&&j.error){ setTimeout(()=>toast(j.error,'error'),60); chargerMedex(); } }).catch(()=>{});
+    return r; }; })();
+async function chargerMedex(){
+  try{ _medex = await fetch('/api/medex/status').then(r=>r.json()); }catch(e){}
+  const b=document.getElementById('medex-banner');
+  if(b){ b.style.display = (_medex.lie && (_medex.ok===false || _medex.a_refaire)) ? '' : 'none';
+    b.textContent = _medex.a_refaire
+      ? '⚠ Liaison MEDEX expirée — Mon compte → Liaison MEDEX Manager → Relier à nouveau. En attendant, votre calendrier est en lecture seule.'
+      : '⚠ MEDEX momentanément injoignable — calendrier en lecture seule, réessayez dans une minute.'; }
+}
+function renderMedexLien(){
+  const el=document.getElementById('acc-medex'); if(!el) return;
+  chargerMedex().then(()=>{
+    if(_medex.lie && _medex.a_refaire){
+      el.innerHTML='<div style="color:#f59e0b;margin-bottom:6px">⚠ Liaison expirée ('+_medex.email+') : reconnectez-vous avec votre mot de passe MEDEX.</div>'
+        +'<div class="form-row"><div class="form-group"><input id="mx-email" type="email" value="'+_medex.email+'"></div>'
+        +'<div class="form-group"><input id="mx-pass" type="password" placeholder="Mot de passe MEDEX"></div></div>'
+        +'<button class="btn btn-primary btn-sm" onclick="relierMedex()">🔗 Relier à nouveau</button> '
+        +'<button class="btn btn-sm" style="background:var(--card2)" onclick="delierMedex()">Délier</button>';
+    } else if(_medex.lie){
+      el.innerHTML='<span style="color:var(--green,#16a34a)">✅ Relié à MEDEX ('+_medex.email+')</span>'
+        +(_medex.ok===false?'<div style="color:#f59e0b;margin-top:4px">⚠ MEDEX momentanément injoignable ('+(_medex.erreur||'réseau')+') : lecture seule.</div>':'')
+        +'<div style="margin-top:6px">Congés, maladies, grève, remarques et postes sont communs aux deux programmes.</div>'
+        +'<button class="btn btn-sm" style="background:var(--card2);margin-top:8px" onclick="delierMedex()">Délier</button>';
+    } else {
+      el.innerHTML='<div style="margin-bottom:6px">Reliez votre compte pour partager le même calendrier avec MEDEX Manager (certificats, demandes de congé, congés pour soins).</div>'
+        +'<div class="form-row"><div class="form-group"><input id="mx-email" type="email" placeholder="E-mail du compte MEDEX"></div>'
+        +'<div class="form-group"><input id="mx-pass" type="password" placeholder="Mot de passe MEDEX"></div></div>'
+        +'<button class="btn btn-primary btn-sm" onclick="relierMedex()">🔗 Relier à MEDEX</button>';
+    }
+  });
+}
+async function relierMedex(){
+  const email=document.getElementById('mx-email').value.trim(), password=document.getElementById('mx-pass').value;
+  if(!email||!password){ toast('E-mail et mot de passe MEDEX requis','error'); return; }
+  const r=await fetch('/api/medex/link',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password})});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok){ toast(j.error||'Liaison impossible','error'); return; }
+  toast('Relié à MEDEX ✔ — calendrier commun activé'); renderMedexLien(); renderCalendar(); chargerMedex();
+}
+async function delierMedex(){
+  if(!confirm('Délier MEDEX ? Votre calendrier HoraireManager garde son contenu actuel mais ne sera plus synchronisé.')) return;
+  await fetch('/api/medex/link',{method:'DELETE'}); toast('Liaison MEDEX retirée'); renderMedexLien(); renderCalendar();
+}
+function medexDocUrl(e){
+  const t={MAL:'certificat',MAL_LONG:'certificat',ACC_TRAV:'certificat',VAC:'demande',SOINS_FAM:'conge_soins'}[e.code];
+  return t ? (_medex.medex_url||'https://medex-manager.onrender.com')+'/?doc='+t+'&debut='+e.date_start+'&fin='+e.date_end : null;
 }
 
 // ── TOAST ──
@@ -5335,25 +5812,19 @@ window.APP_VERSION = null;
 <script>
 /* ── Avis de mise à jour : affiché UNE fois par version à chaque utilisateur ── */
 (function(){
-  const APP_VERSION='2026-07-17-msc';
+  const APP_VERSION='2026-09-25-medex';
   const NEWS=[
-    ['🤒','<b>Maladie 1 jour sans certificat</b> — nouveau type d\'absence dans « + Ajouter '
-        +'congé » (catégorie Maladie). Règle BOSA : maximum <b>2 absences d\'un jour par an</b> '
-        +'sans certificat médical — compteur visible dans la carte des soldes, blocage '
-        +'automatique au-delà de 2.'],
-    ['👤','<b>Régimes de travail</b> — nouvelle carte « Régime de travail » dans le panneau '
-        +'latéral du calendrier : <b>fixe Matin</b>, <b>fixe Soir</b>, <b>fixe Nuit</b> (Lun-Ven, '
-        +'week-end repos) ou <b>mi-temps 1 jour sur 2</b> (vous choisissez le premier jour '
-        +'travaillé et le poste). Le cycle d\'équipe reste le défaut — et vous pouvez toujours '
-        +'travailler en pause un jour donné via le détail du jour.'],
-    ['📄','<b>Fiche mensuelle</b> — nouveau bouton « 📄 Mois » : le mois de votre choix, '
-        +'même présentation que la fiche annuelle, avec <b>compteur de jours prestés</b> '
-        +'(M, S, N, 12H, 08H, horaires décalés) et <b>tableau de remboursement kilométrique</b> '
-        +'(km officiel × tarif €/km, comparaison avec le montant remboursé par l\'État).'],
-    ['🌙','<b>Poste NUIT</b> (22h00 – 06h30) : sélectionnable dans le détail d\'un jour, '
-        +'compté comme jour travaillé et synchronisé dans Google Agenda.'],
-    ['🕐','<b>Horaires décalés</b> : choisissez l\'heure de début dans le détail d\'un jour, '
-        +'la fin est calculée automatiquement (shift de 8h). Ex : 07H30 → 07:30-15:30.'],
+    ['🔗','<b>Calendrier commun avec MEDEX Manager</b> — si vous utilisez aussi MEDEX '
+        +'(certificats médicaux, demandes de congé) : <b>Mon compte → Liaison MEDEX Manager</b>. '
+        +'Congés, maladies, grèves, remarques et postes deviennent communs aux deux programmes, '
+        +'<b>sans doublon</b>. Facultatif : sans liaison, rien ne change.'],
+    ['📄','<b>Documents MEDEX</b> — une maladie ou des vacances posées ici proposent le lien '
+        +'« Établir le document dans MEDEX » (formulaire déjà rempli). Un certificat ou une '
+        +'demande établi dans MEDEX apparaît ici avec le badge <b>DOCUMENT MEDEX</b>.'],
+    ['🚫','<b>Pas de doublon</b> — un même congé ne peut plus être encodé deux fois aux mêmes dates.'],
+    ['💻','<b>Installation sur PC</b> — raccourci HoraireManager, MEDEX Manager, Gestion des '
+        +'Rapports et modes d\'emploi en un double-clic : '
+        +'<b>medex-manager.onrender.com/download/Installer_Programmes_Namur.bat</b>.'],
   ];
   function show(){
     if(localStorage.getItem('hm_seen_version')===APP_VERSION) return;
@@ -5365,7 +5836,7 @@ window.APP_VERSION = null;
       +'border:1px solid var(--border,#334155);border-radius:14px;max-width:540px;width:100%;'
       +'padding:22px;box-shadow:0 10px 40px rgba(0,0,0,.5);max-height:85vh;overflow-y:auto">'
       +'<div style="font-size:17px;font-weight:800;margin-bottom:4px">🆕 Mise à jour de l\'application</div>'
-      +'<div style="font-size:12px;color:var(--muted,#94a3b8);margin-bottom:14px">Nouveautés du 15/07/2026</div>'
+      +'<div style="font-size:12px;color:var(--muted,#94a3b8);margin-bottom:14px">Nouveautés du 25/09/2026</div>'
       +NEWS.map(n=>'<div style="display:flex;gap:10px;margin-bottom:12px;font-size:13.5px;line-height:1.5">'
         +'<div style="font-size:20px;flex-shrink:0">'+n[0]+'</div><div>'+n[1]+'</div></div>').join('')
       +'<button id="wn-ok" style="margin-top:6px;width:100%;padding:11px;border:none;border-radius:9px;'
