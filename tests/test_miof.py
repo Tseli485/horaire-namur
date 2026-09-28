@@ -13,7 +13,7 @@ def test_miof_in_leave_catalog():
     assert "MIOF" in LEAVE_CATALOG
     entry = LEAVE_CATALOG["MIOF"]
     assert entry["category"] == "FAMILIAL"
-    assert entry["base_ref"] == "AR 19/11/1998 art. 38-40 (stat) + Art 30bis loi 3/07/1978 (ctr)"
+    assert entry["base_ref"] == "AR 19/11/1998 art. 38-40 (stat/stag/mandataires) + AR 11/10/1991 (ctr, cong. raisons imperieuses)"
     assert entry["days"] == 20
 
 def test_miof_flags_match_business_rule():
@@ -67,7 +67,7 @@ def test_create_miof_event_reflected_in_day_info(client):
     assert day["label"] == LEAVE_CATALOG["MIOF"]["label"]
 
 
-# ── plafond annuel 20j (AR 19/11/1998 art. 38-40 + Art 30bis loi 3/07/1978) ──
+# ── plafond annuel 20j (AR 19/11/1998 art. 38-40 + AR 11/10/1991) ──
 def test_miof_short_request_within_quota_accepted(client):
     aid = _register(client)
     r = client.post("/api/events", json={
