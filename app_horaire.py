@@ -1567,6 +1567,22 @@ def fiche_month(aid, year, month):
     )
     return Response(html, mimetype='text/html; charset=utf-8')
 
+def _jours_conge_effectifs(aid, data, date_start, date_end):
+    """Nombre de jours ou l'agent est cense travailler (hors ferie/pont) dans
+    l'intervalle [date_start, date_end] — meme decompte que /api/entitlements,
+    utilise pour verifier les plafonds annuels (ex: MIOF 45j/an)."""
+    es, ee = date.fromisoformat(date_start), date.fromisoformat(date_end)
+    hols = {h[0] for h in get_public_holidays(es.year)}
+    if ee.year != es.year:
+        hols |= {h[0] for h in get_public_holidays(ee.year)}
+    n, d = 0, es
+    while d <= ee:
+        base = get_day_info(d, aid, data)["base"]
+        if is_worked_shift(base) and d not in hols:
+            n += 1
+        d += timedelta(1)
+    return n
+
 @app.route("/api/events", methods=["POST"])
 def api_add_event():
     data = load()
@@ -1586,6 +1602,18 @@ def api_add_event():
                    and e["date_start"][:4] == yr)
         if used >= 2:
             return jsonify({"error": f"Limite BOSA atteinte : 2 jours sans certificat déjà pris en {yr} — certificat médical requis"}), 400
+    # Motifs impérieux d'ordre familial : max 45j/an statutaires (AR 19/11/1998 art. 38-40)
+    if body["code"] == "MIOF":
+        quota = LEAVE_CATALOG["MIOF"].get("days") or 0
+        yr = body["date_start"][:4]
+        nouveaux = _jours_conge_effectifs(aid, data, body["date_start"], body["date_end"])
+        deja_pris = sum(
+            _jours_conge_effectifs(aid, data, e["date_start"], e["date_end"])
+            for e in data["events"]
+            if e["agent_id"] == aid and e["code"] == "MIOF" and e["date_start"][:4] == yr
+        )
+        if deja_pris + nouveaux > quota:
+            return jsonify({"error": f"Limite MIOF atteinte : {deja_pris}/{quota} j déjà pris en {yr} — cette demande de {nouveaux} j dépasse le plafond annuel"}), 400
     # Pas de doublon : même type d'absence aux mêmes dates déjà encodé
     # (ici ou dans MEDEX Manager via le calendrier commun).
     if any(e["agent_id"] == aid and e["code"] == body["code"]
@@ -4567,7 +4595,7 @@ const OTHER_CONFIG = [
   {code:'CONG_MAT',   label:'Congé de maternité (semaines)'},
   {code:'CONG_PAR',   label:'Congé parental'},
   {code:'SOINS_FAM',  label:'Soins à un proche'},
-  {code:'MIOF',       label:"Motifs impérieux d'ordre familial"},
+  {code:'MIOF',       label:"Motifs impérieux d'ordre familial", quota:45},
   {code:'SYNDI',      label:'Congé syndical'},
   {code:'FORM',       label:'Formation / examen'},
   {code:'RECUP',      label:'Récupération / compensé'},
@@ -4596,16 +4624,21 @@ function renderEntDetails(ent) {
     </div>`;
   });
 
-  // Autres congés utilisés cette année
+  // Autres congés utilisés cette année (+ décompte pris/reste pour celles à quota annuel fixe)
   let otherHtml = '';
   OTHER_CONFIG.forEach(cfg => {
     const u = (used[cfg.code]?.used || 0);
-    if(u === 0) return;
+    const q = cfg.quota;
+    if(u === 0 && !q) return;
+    const pct  = q ? Math.min(Math.round(u/q*100),100) : 0;
+    const col  = !q ? 'var(--green)' : (u>=q ? 'var(--red)' : u>0 ? 'var(--orange)' : 'var(--green)');
+    const solde = q ? `${u}/${q}j` : `${u}j`;
     otherHtml += `<div style="background:var(--bg);border-radius:6px;padding:8px 10px;border:1px solid var(--border)">
       <div style="display:flex;justify-content:space-between;align-items:center">
         <span style="font-size:11px;font-weight:600">${cfg.label}</span>
-        <span style="font-size:13px;font-weight:700;color:var(--green)">${u}j</span>
+        <span style="font-size:13px;font-weight:700;color:${col}">${solde}</span>
       </div>
+      ${q?`<div style="height:2px;background:var(--border);border-radius:1px;margin-top:5px;overflow:hidden"><div style="width:${pct}%;height:100%;background:${col};border-radius:1px"></div></div>`:''}
     </div>`;
   });
 
