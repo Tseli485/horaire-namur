@@ -1570,7 +1570,7 @@ def fiche_month(aid, year, month):
 def _jours_conge_effectifs(aid, data, date_start, date_end):
     """Nombre de jours ou l'agent est cense travailler (hors ferie/pont) dans
     l'intervalle [date_start, date_end] — meme decompte que /api/entitlements,
-    utilise pour verifier les plafonds annuels (ex: MIOF 45j/an)."""
+    utilise pour verifier les plafonds annuels (ex: MIOF 20j/an)."""
     es, ee = date.fromisoformat(date_start), date.fromisoformat(date_end)
     hols = {h[0] for h in get_public_holidays(es.year)}
     if ee.year != es.year:
@@ -1602,7 +1602,7 @@ def api_add_event():
                    and e["date_start"][:4] == yr)
         if used >= 2:
             return jsonify({"error": f"Limite BOSA atteinte : 2 jours sans certificat déjà pris en {yr} — certificat médical requis"}), 400
-    # Motifs impérieux d'ordre familial : max 45j/an statutaires (AR 19/11/1998 art. 38-40)
+    # Motifs impérieux d'ordre familial : max 20j/an, stat. et contractuels (AR 19/11/1998 art. 38-40 + Art 30bis loi 3/07/1978)
     if body["code"] == "MIOF":
         quota = LEAVE_CATALOG["MIOF"].get("days") or 0
         yr = body["date_start"][:4]
@@ -4595,7 +4595,7 @@ const OTHER_CONFIG = [
   {code:'CONG_MAT',   label:'Congé de maternité (semaines)'},
   {code:'CONG_PAR',   label:'Congé parental'},
   {code:'SOINS_FAM',  label:'Soins à un proche'},
-  {code:'MIOF',       label:"Motifs impérieux d'ordre familial", quota:45},
+  {code:'MIOF',       label:"Motifs impérieux d'ordre familial", quota:20},
   {code:'SYNDI',      label:'Congé syndical'},
   {code:'FORM',       label:'Formation / examen'},
   {code:'RECUP',      label:'Récupération / compensé'},
