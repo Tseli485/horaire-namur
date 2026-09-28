@@ -13,8 +13,8 @@ def test_miof_in_leave_catalog():
     assert "MIOF" in LEAVE_CATALOG
     entry = LEAVE_CATALOG["MIOF"]
     assert entry["category"] == "FAMILIAL"
-    assert entry["base_ref"] == "AR 19/11/1998 art. 38-40"
-    assert entry["days"] == 45
+    assert entry["base_ref"] == "AR 19/11/1998 art. 38-40 (stat) + Art 30bis loi 3/07/1978 (ctr)"
+    assert entry["days"] == 20
 
 def test_miof_flags_match_business_rule():
     """Fractionnable (jour/demi-jour), soumis a justification, sans impact
@@ -67,7 +67,7 @@ def test_create_miof_event_reflected_in_day_info(client):
     assert day["label"] == LEAVE_CATALOG["MIOF"]["label"]
 
 
-# ── plafond annuel 45j (AR 19/11/1998 art. 38-40) ────────────────
+# ── plafond annuel 20j (AR 19/11/1998 art. 38-40 + Art 30bis loi 3/07/1978) ──
 def test_miof_short_request_within_quota_accepted(client):
     aid = _register(client)
     r = client.post("/api/events", json={
@@ -80,7 +80,7 @@ def test_miof_over_quota_rejected(client):
     aid = _register(client)
     r = client.post("/api/events", json={
         "agent_id": aid, "code": "MIOF",
-        "date_start": "2026-01-01", "date_end": "2026-12-31",  # largement > 45j travailles
+        "date_start": "2026-01-01", "date_end": "2026-12-31",  # largement > 20j travailles
     })
     assert r.status_code == 400
     assert "MIOF" in r.get_json()["error"]
@@ -97,5 +97,5 @@ def test_miof_quota_visible_in_entitlements(client):
     r = client.get(f"/api/entitlements/{aid}/2026")
     assert r.status_code == 200
     detail = r.get_json()["conges_detail"]["MIOF"]
-    assert detail["quota"] == 45
+    assert detail["quota"] == 20
     assert 1 <= detail["used"] <= 7
