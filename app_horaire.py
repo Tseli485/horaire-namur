@@ -4567,6 +4567,7 @@ const OTHER_CONFIG = [
   {code:'CONG_MAT',   label:'Congé de maternité (semaines)'},
   {code:'CONG_PAR',   label:'Congé parental'},
   {code:'SOINS_FAM',  label:'Soins à un proche'},
+  {code:'MIOF',       label:"Motifs impérieux d'ordre familial"},
   {code:'SYNDI',      label:'Congé syndical'},
   {code:'FORM',       label:'Formation / examen'},
   {code:'RECUP',      label:'Récupération / compensé'},
@@ -5211,7 +5212,7 @@ async function delierMedex(){
   await fetch('/api/medex/link',{method:'DELETE'}); toast('Liaison MEDEX retirée'); renderMedexLien(); renderCalendar();
 }
 function medexDocUrl(e){
-  const t={MAL:'certificat',MAL_LONG:'certificat',ACC_TRAV:'certificat',VAC:'demande',SOINS_FAM:'conge_soins'}[e.code];
+  const t={MAL:'certificat',MAL_LONG:'certificat',ACC_TRAV:'certificat',VAC:'demande',SOINS_FAM:'conge_soins',MIOF:'miof'}[e.code];
   return t ? (_medex.medex_url||'https://medex-manager.onrender.com')+'/?doc='+t+'&debut='+e.date_start+'&fin='+e.date_end : null;
 }
 
