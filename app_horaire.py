@@ -1602,7 +1602,7 @@ def api_add_event():
                    and e["date_start"][:4] == yr)
         if used >= 2:
             return jsonify({"error": f"Limite BOSA atteinte : 2 jours sans certificat déjà pris en {yr} — certificat médical requis"}), 400
-    # Motifs impérieux d'ordre familial : max 20j/an, stat. et contractuels (AR 19/11/1998 art. 38-40 + Art 30bis loi 3/07/1978)
+    # Motifs impérieux d'ordre familial : max 20j/an, stat. et contractuels (AR 19/11/1998 art. 38-40 + AR 11/10/1991)
     if body["code"] == "MIOF":
         quota = LEAVE_CATALOG["MIOF"].get("days") or 0
         yr = body["date_start"][:4]
