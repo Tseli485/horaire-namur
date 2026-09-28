@@ -220,6 +220,17 @@ LEAVE_CATALOG = {
         "requires_approval": True,
         "impacts_sick_balance": False,
     },
+    "MIOF": {
+        "label": "Conge pour motifs imperieux d'ordre familial",
+        "category": "FAMILIAL",
+        "color": "#0e9f6e",
+        "base_ref": "AR 19/11/1998 art. 38-40",
+        "days": 45,
+        "note": "45j/an max (statutaires, 10j contractuels), reduit selon autres absences dans l'annee; non remunere mais assimile a une periode d'activite de service; justification du motif imperieux requise",
+        "fractional": True,
+        "requires_approval": True,
+        "impacts_sick_balance": False,
+    },
 
     # --- JOURS FERIES ET PONTS ---
     "FERIE": {
