@@ -65,3 +65,37 @@ def test_create_miof_event_reflected_in_day_info(client):
     day = r.get_json()
     assert day["code"] == "MIOF"
     assert day["label"] == LEAVE_CATALOG["MIOF"]["label"]
+
+
+# ── plafond annuel 45j (AR 19/11/1998 art. 38-40) ────────────────
+def test_miof_short_request_within_quota_accepted(client):
+    aid = _register(client)
+    r = client.post("/api/events", json={
+        "agent_id": aid, "code": "MIOF",
+        "date_start": "2026-03-02", "date_end": "2026-03-08",  # 1 semaine
+    })
+    assert r.status_code == 200
+
+def test_miof_over_quota_rejected(client):
+    aid = _register(client)
+    r = client.post("/api/events", json={
+        "agent_id": aid, "code": "MIOF",
+        "date_start": "2026-01-01", "date_end": "2026-12-31",  # largement > 45j travailles
+    })
+    assert r.status_code == 400
+    assert "MIOF" in r.get_json()["error"]
+
+def test_miof_quota_visible_in_entitlements(client):
+    aid = _register(client)
+    r = client.post("/api/events", json={
+        "agent_id": aid, "code": "MIOF",
+        "date_start": "2026-03-02", "date_end": "2026-03-08",
+        "status": "accepte",
+    })
+    assert r.status_code == 200
+
+    r = client.get(f"/api/entitlements/{aid}/2026")
+    assert r.status_code == 200
+    detail = r.get_json()["conges_detail"]["MIOF"]
+    assert detail["quota"] == 45
+    assert 1 <= detail["used"] <= 7
