@@ -80,7 +80,7 @@ def test_dev_version(client):
 def _register(client, aid="AGENT-TEST-001"):
     """Cree un compte agent (PIN) : ouvre la session du client de test."""
     r = client.post("/api/auth/register",
-                    json={"id": aid, "name": "Test Agent", "pin": "1234", "offset": 0})
+                    json={"id": aid, "name": "Test Agent", "pin": "1234", "offset": 0, "birth_date": "1980-05-15"})
     assert r.status_code == 200
     return r.get_json()["id"]
 

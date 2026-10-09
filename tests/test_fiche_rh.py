@@ -211,7 +211,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(app_horaire._frh, "parse_pdf",
                         lambda raw: fiche_rh.parse_pages([PAGE1, PAGE2, PAGE3, PAGE_OTHER]))
     c = app_horaire.app.test_client()
-    r = c.post("/api/auth/register", json={"id": "T1", "name": "Test", "pin": "1234", "offset": 14})
+    r = c.post("/api/auth/register", json={"id": "T1", "name": "Test", "pin": "1234", "offset": 14, "birth_date": "1980-05-15"})
     assert r.status_code == 200
     return c
 

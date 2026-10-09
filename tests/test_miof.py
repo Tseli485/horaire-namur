@@ -38,7 +38,7 @@ def client(tmp_path):
 
 def _register(client, aid="AGENT-MIOF-001"):
     r = client.post("/api/auth/register",
-                    json={"id": aid, "name": "Test MIOF", "pin": "1234", "offset": 0})
+                    json={"id": aid, "name": "Test MIOF", "pin": "1234", "offset": 0, "birth_date": "1980-05-15"})
     assert r.status_code == 200
     return r.get_json()["id"]
 
