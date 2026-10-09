@@ -77,6 +77,27 @@ def check_auth():
     if route_aid is not None and route_aid != aid:
         return jsonify({"error": "Accès interdit à l'horaire d'un autre agent"}), 403
 
+def parse_birth_date(v):
+    """Date de naissance ISO (AAAA-MM-JJ) validée : réelle, passée, âge 16-100 ans.
+    Retourne (iso, None) ou (None, message d'erreur)."""
+    v = str(v or "").strip()
+    if not v:
+        return None, "Date de naissance obligatoire (calcul correct de l'âge et des congés)"
+    try:
+        bd = date.fromisoformat(v)
+    except ValueError:
+        return None, "Date de naissance invalide"
+    age = age_exact(bd)
+    if bd > date.today() or age < 16 or age > 100:
+        return None, "Date de naissance invalide (âge hors limites)"
+    return bd.isoformat(), None
+
+def age_exact(bd, ref=None):
+    """Âge exact en années révolues à la date `ref` (aujourd'hui par défaut) :
+    tient compte du mois ET du jour (29/02 fêté le 01/03 les années non bissextiles)."""
+    ref = ref or date.today()
+    return ref.year - bd.year - (1 if (ref.month, ref.day) < (bd.month, bd.day) else 0)
+
 @app.route("/api/auth/register", methods=["POST"])
 def api_register():
     """Crée un compte agent avec son PIN et ouvre la session."""
@@ -93,10 +114,13 @@ def api_register():
         return jsonify({"error": "Nom obligatoire"}), 400
     if len(pin) < 4:
         return jsonify({"error": "PIN trop court (4 chiffres minimum)"}), 400
+    birth, err = parse_birth_date(body.get("birth_date"))
+    if err:
+        return jsonify({"error": err}), 400
     r45 = body.get("regime_4_5")
     data["agents"][aid] = {
         "name":         name,
-        "birth_date":   body.get("birth_date") or None,
+        "birth_date":   birth,
         "career_start": body.get("career_start") or None,
         "team_offset":  int(body.get("offset", 0)),
         "regime_4_5":   int(r45) if r45 not in (None, "") else None,
@@ -148,6 +172,8 @@ def api_auth_me():
                     "team_offset": ag.get("team_offset", 0),
                     "regime_4_5": ag.get("regime_4_5"),
                     "birth_date": ag.get("birth_date"),
+                    "age": (age_exact(date.fromisoformat(ag["birth_date"]))
+                            if ag.get("birth_date") else None),
                     "career_start": ag.get("career_start"),
                     "matricule": ag.get("matricule")})
 
@@ -207,7 +233,8 @@ def pwa_icon():
 # ─────────────────────── DATA HELPERS ────────────────────────
 _DEFAULTS = {"agents": {}, "events": [], "reliquats": {}, "capitals": {},
              "exchanges": [], "remarks": {}, "shift_overrides": {},
-             "fiches_rh": {}}   # {aid: {year: fiche RH importée}} — additif, vide par défaut
+             "fiches_rh": {},   # {aid: {year: fiche RH importée}} — additif, vide par défaut
+             "reprises_heures": []}   # journal des heures reprises (récupérées) — additif
 
 def load():
     data = _load_fichier()
@@ -687,17 +714,14 @@ def get_day_info(d: date, agent_id: str, data: dict) -> dict:
     # ou mi-temps peut toujours décider de travailler en pause un jour donné.
     work_regime = agent.get("work_regime")
     _fixed_regime = work_regime in ("fixe_M", "fixe_S", "fixe_N")
+    _fixed_letter = work_regime[-1] if _fixed_regime else None
     if _fixed_regime:
-        # Lun-Ven : poste fixe tous les jours ouvrables.
-        # Week-end : l'agent reste dans le roulement de son équipe (1 week-end
-        # sur 2 dans le cycle de 56 j) — il travaille alors SON poste fixe.
-        if d.weekday() < 5:
-            base = work_regime[-1]
-        else:
-            base = work_regime[-1] if is_worked_shift(raw_base) else 'R'
-        # Le 4/5 SE CUMULE avec un régime fixe : le jour désigné devient repos
-        # (traité dans le bloc 4/5 ci-dessous, sans déplacement de repos —
-        #  le cycle d'équipe ne fournit que le rythme des week-ends).
+        # Service fixe : la grille de l'équipe reste LA référence. Seules les
+        # plages travaillées (M / S) deviennent le poste fixe ; tous les repos
+        # de la grille (R, 36h, 38h) sont conservés tels quels.
+        # Le 4/5 SE CUMULE avec un régime fixe (bloc 4/5 ci-dessous, mêmes
+        # règles de décalage des repos que pour un agent « cycle »).
+        base = _fixed_letter if raw_base in ('M', 'S') else raw_base
     elif work_regime == "mi_temps":
         try:
             _anchor = date.fromisoformat(agent.get("mi_temps_anchor") or "")
@@ -733,10 +757,6 @@ def get_day_info(d: date, agent_id: str, data: dict) -> dict:
         if d == rest_day:
             # Ce jour EST le 4/5 — base R (repos), code géré plus bas
             base = 'R'
-        elif _fixed_regime:
-            # Régime fixe : poste identique chaque jour ouvrable, donc aucun
-            # repos de cycle (R/38h/36h) à déplacer. Rien à faire.
-            pass
         else:
             # Vérifier si un déplacement (R ou 38h) arrive sur ce jour
             # depuis la semaine courante OU la semaine précédente
@@ -759,7 +779,8 @@ def get_day_info(d: date, agent_id: str, data: dict) -> dict:
                         break
             # Si pas de déplacement : convertir 36h en pose de la semaine
             if not displaced and base == '36':
-                base = _get_week_shift(d, offset)
+                # Agent fixe : le 36h isolé redevient SA plage fixe.
+                base = _fixed_letter or _get_week_shift(d, offset)
 
     # ── OVERRIDE MANUEL ───────────────────────────────────────────────────────
     shift_ov = data.get("shift_overrides", {}).get(agent_id, {}).get(d.isoformat())
@@ -867,7 +888,10 @@ def api_patch_agent(aid):
         v = body["mi_temps_shift"]
         data["agents"][aid]["mi_temps_shift"] = v if v in ("M", "S", "N") else None
     if "birth_date" in body:
-        data["agents"][aid]["birth_date"] = body["birth_date"] or None
+        birth, err = parse_birth_date(body["birth_date"])
+        if err:
+            return jsonify({"error": err}), 400
+        data["agents"][aid]["birth_date"] = birth
     if "career_start" in body:
         data["agents"][aid]["career_start"] = body["career_start"] or None
     if "matricule" in body:                   # numéro de matricule SPF Justice (fiche RH)
@@ -890,6 +914,7 @@ def api_del_agent(aid):
     data = load()
     data["agents"].pop(aid, None)
     data["events"] = [e for e in data["events"] if e["agent_id"] != aid]
+    data["reprises_heures"] = [r for r in data.get("reprises_heures", []) if r.get("agent_id") != aid]
     save(data)
     return jsonify({"ok": True})
 
@@ -1014,10 +1039,12 @@ def api_calendar(aid, year, month):
     days_in_month = monthrange(year, month)[1]
     first_day_wd  = date(year, month, 1).weekday()   # 0=Lun
     remarks = data.get("remarks", {}).get(aid, {})
+    marks = _exchange_marks(data, aid)
     days = []
     for d in range(1, days_in_month + 1):
         day_info = get_day_info(date(year, month, d), aid, data)
         day_info["remark"] = remarks.get(day_info["date"], "")
+        day_info["echanges"] = marks.get(day_info["date"], [])
         days.append(day_info)
     return jsonify({"year": year, "month": month,
                     "month_name": MONTH_NAMES_FR[month-1],
@@ -2140,20 +2167,86 @@ def api_fiche_rh_apply(aid, year):
 
 
 # ─────────────────────── ÉCHANGES DE SERVICE ─────────────────
+# Deux natures d'échange :
+#  - « collegue »   : entre agents (donné / reçu), solde par collègue ;
+#  - « hierarchie » : entre l'agent et le PLANNING. Si le planning demande de
+#    travailler un jour où l'agent n'est pas censé travailler (repos R/36h/38h,
+#    jour 4/5, congé), ce jour est « à rendre » : il reste en attente, avec son
+#    ancienneté, jusqu'à ce que le planning ait rendu un jour (date_remboursement).
+def _echange_prevu(aid, d, data):
+    """Ce qui était PRÉVU ce jour-là (grille, service fixe, 4/5, congés), sans
+    tenir compte d'une surcharge manuelle du poste faite après coup."""
+    d2 = dict(data)
+    d2["shift_overrides"] = {}
+    info = get_day_info(d, aid, d2)
+    code = info["code"]
+    hors_service = code not in (None, "FERIE", "PONT")        # 4/5, repos décalé, congé…
+    repos = hors_service or not is_worked_shift(info["base"])
+    jour = code if hors_service else info["base"]
+    label = info["label"] if hors_service else SHIFT_LABELS.get(info["base"], info["base"])
+    return {"jour_prevu": jour, "prevu_repos": bool(repos), "label": label}
+
+def _ex_a_rendre(ex):
+    """Un échange hiérarchie compte comme « jour à rendre » sauf mention contraire
+    (anciens échanges, sans le champ : comportement historique = à rendre)."""
+    return ex.get("type") == "hierarchie" and ex.get("a_rendre", True) is not False
+
+def _ex_attente(ex):
+    """Jours écoulés depuis le service presté, tant que rien n'a été rendu."""
+    if ex.get("status") != "pending":
+        return None
+    try:
+        return max(0, (date.today() - date.fromisoformat(ex.get("date_service") or "")).days)
+    except ValueError:
+        return None
+
+def _exchange_marks(data, aid):
+    """{date ISO: [repères]} pour le calendrier : jour presté / jour rendu."""
+    marks = {}
+    for e in data.get("exchanges", []):
+        if e.get("agent_id") != aid:
+            continue
+        base = {"id": e.get("id"), "type": e.get("type"), "a_rendre": _ex_a_rendre(e),
+                "status": e.get("status"), "colleague": e.get("colleague", ""),
+                "direction": e.get("direction", ""), "note": e.get("note", ""),
+                "date_service": e.get("date_service"),
+                "date_remboursement": e.get("date_remboursement")}
+        if e.get("date_service"):
+            marks.setdefault(e["date_service"], []).append(dict(base, role="service"))
+        if e.get("date_remboursement"):
+            marks.setdefault(e["date_remboursement"], []).append(dict(base, role="rendu"))
+    return marks
+
 @app.route("/api/exchanges/<aid>")
 def api_exchanges_list(aid):
     data = load()
     exs  = sorted(
-        [e for e in data.get("exchanges", []) if e["agent_id"] == aid],
+        [dict(e) for e in data.get("exchanges", []) if e["agent_id"] == aid],
         key=lambda x: x.get("date_service",""), reverse=True
     )
+    for e in exs:
+        e["a_rendre"] = _ex_a_rendre(e)
+        e["attente_jours"] = _ex_attente(e) if e["a_rendre"] else None
     return jsonify(exs)
+
+@app.route("/api/exchanges/<aid>/preview/<date_str>")
+def api_exchanges_preview(aid, date_str):
+    """Ce qui était prévu ce jour-là : sert à savoir si le jour est « à rendre »."""
+    data = load()
+    if aid not in data["agents"]:
+        return jsonify({"error": "Agent inconnu"}), 404
+    try:
+        d = date.fromisoformat(date_str)
+    except ValueError:
+        return jsonify({"error": "Date invalide"}), 400
+    return jsonify(_echange_prevu(aid, d, data))
 
 @app.route("/api/exchanges/<aid>/balance")
 def api_exchanges_balance(aid):
     data = load()
     exs  = [e for e in data.get("exchanges", []) if e["agent_id"] == aid and e["status"] == "pending"]
-    hier_pending = sum(1 for e in exs if e["type"] == "hierarchie")
+    hier = [e for e in exs if _ex_a_rendre(e)]
+    ages = [a for a in (_ex_attente(e) for e in hier) if a is not None]
     cols: dict = {}
     for e in exs:
         if e["type"] != "collegue":
@@ -2166,7 +2259,9 @@ def api_exchanges_balance(aid):
         else:
             cols[c]["recu"] += 1
     return jsonify({
-        "hierarchie_pending": hier_pending,
+        "hierarchie_pending": len(hier),
+        "a_rendre": len(hier),
+        "plus_ancien_jours": max(ages) if ages else 0,
         "collegues": {
             c: {"donne": v["donne"], "recu": v["recu"], "balance": v["donne"] - v["recu"]}
             for c, v in cols.items()
@@ -2180,38 +2275,72 @@ def api_exchanges_create():
     aid  = body.get("agent_id")
     if not aid or aid not in data["agents"]:
         return jsonify({"error": "Agent inconnu"}), 400
+    typ  = body.get("type", "collegue")
+    if typ not in ("collegue", "hierarchie"):
+        return jsonify({"error": "Type d'échange invalide"}), 400
+    ds   = body.get("date_service", "")
     dr   = body.get("date_remboursement") or None
+    for champ in (ds, dr):
+        if champ:
+            try:
+                date.fromisoformat(champ)
+            except ValueError:
+                return jsonify({"error": "Date invalide"}), 400
     ex   = {
         "id":                  str(_uuid.uuid4())[:8],
         "agent_id":            aid,
-        "type":                body.get("type", "collegue"),
+        "type":                typ,
         "direction":           body.get("direction", "donne"),
-        "date_service":        body.get("date_service", ""),
+        "date_service":        ds,
         "poste_service":       body.get("poste_service", ""),
         "colleague":           body.get("colleague", ""),
         "date_remboursement":  dr,
         "poste_remboursement": body.get("poste_remboursement") or None,
         "note":                body.get("note", ""),
-        "status":              "done" if dr else "pending",
         "created":             date.today().isoformat(),
     }
+    if typ == "hierarchie":
+        prevu = {"jour_prevu": None, "prevu_repos": True}
+        if ds:
+            prevu = _echange_prevu(aid, date.fromisoformat(ds), data)
+        # Le planning a demandé de travailler un jour non prévu => jour à rendre.
+        # L'agent peut corriger (case à cocher) : « a_rendre » explicite prioritaire.
+        a_rendre = body.get("a_rendre")
+        a_rendre = bool(prevu["prevu_repos"]) if a_rendre is None else bool(a_rendre)
+        ex["jour_prevu"] = prevu["jour_prevu"]
+        ex["a_rendre"]   = a_rendre
+        ex["status"]     = "done" if (dr or not a_rendre) else "pending"
+    else:
+        ex["status"]     = "done" if dr else "pending"
     data.setdefault("exchanges", []).append(ex)
     save(data)
-    return jsonify({"ok": True, "id": ex["id"]})
+    return jsonify({"ok": True, "id": ex["id"], "a_rendre": ex.get("a_rendre"),
+                    "jour_prevu": ex.get("jour_prevu")})
 
 @app.route("/api/exchanges/<eid>", methods=["PATCH"])
 def api_exchanges_update(eid):
     data = load()
     for ex in data.get("exchanges", []):
         if ex["id"] == eid:
+            if ex.get("agent_id") != current_aid():
+                return jsonify({"error": "Accès interdit"}), 403
             body = request.json or {}
+            for f in ("date_service", "date_remboursement"):
+                if body.get(f):
+                    try:
+                        date.fromisoformat(body[f])
+                    except ValueError:
+                        return jsonify({"error": "Date invalide"}), 400
             for f in ("date_service", "poste_service", "colleague", "note", "direction"):
                 if f in body:
                     ex[f] = body[f]
             for f in ("date_remboursement", "poste_remboursement"):
                 if f in body:
                     ex[f] = body[f] or None
-            ex["status"] = "done" if ex.get("date_remboursement") else "pending"
+            if "a_rendre" in body and ex.get("type") == "hierarchie":
+                ex["a_rendre"] = bool(body["a_rendre"])
+            ex["status"] = "done" if (ex.get("date_remboursement")
+                                      or (ex.get("type") == "hierarchie" and not _ex_a_rendre(ex))) else "pending"
             save(data)
             return jsonify({"ok": True, "exchange": ex})
     return jsonify({"error": "Exchange not found"}), 404
@@ -2220,9 +2349,55 @@ def api_exchanges_update(eid):
 def api_exchanges_delete(eid):
     data   = load()
     before = len(data.get("exchanges", []))
-    data["exchanges"] = [e for e in data.get("exchanges", []) if e["id"] != eid]
+    data["exchanges"] = [e for e in data.get("exchanges", [])
+                         if not (e["id"] == eid and e.get("agent_id") == current_aid())]
     save(data)
     return jsonify({"removed": before - len(data["exchanges"])})
+
+# ─────────────────────── REPRISES D'HEURES ───────────────────
+# Journal des heures reprises (récupérées) par l'agent, avec totaux.
+# Données additives : clé « reprises_heures » (liste), jamais mêlée aux autres.
+def _totaux_reprises(items):
+    par_annee = {}
+    for r in items:
+        a = (r.get("date") or "")[:4]
+        par_annee[a] = par_annee.get(a, 0) + int(r.get("minutes") or 0)
+    return {"total_minutes": sum(par_annee.values()), "par_annee": par_annee}
+
+@app.route("/api/reprises/<aid>", methods=["GET", "POST"])
+def api_reprises(aid):
+    data = load()
+    if aid not in data["agents"]:
+        return jsonify({"error": "Agent inconnu"}), 404
+    if request.method == "POST":
+        body = request.json or {}
+        try:
+            d = date.fromisoformat(body.get("date") or "")
+        except ValueError:
+            return jsonify({"error": "Date invalide"}), 400
+        try:
+            minutes = int(body.get("heures") or 0) * 60 + int(body.get("minutes") or 0)
+        except (TypeError, ValueError):
+            return jsonify({"error": "Durée invalide"}), 400
+        if not (1 <= minutes <= 24 * 60):
+            return jsonify({"error": "Durée invalide (1 minute à 24 h)"}), 400
+        rep = {"id": str(_uuid.uuid4())[:8], "agent_id": aid, "date": d.isoformat(),
+               "minutes": minutes, "note": str(body.get("note") or "").strip()[:200],
+               "created": date.today().isoformat()}
+        data.setdefault("reprises_heures", []).append(rep)
+        save(data)
+    items = sorted([r for r in data.get("reprises_heures", []) if r.get("agent_id") == aid],
+                   key=lambda r: (r.get("date", ""), r.get("created", "")), reverse=True)
+    return jsonify(dict(_totaux_reprises(items), items=items))
+
+@app.route("/api/reprises/<aid>/<rid>", methods=["DELETE"])
+def api_reprises_delete(aid, rid):
+    data = load()
+    avant = len(data.get("reprises_heures", []))
+    data["reprises_heures"] = [r for r in data.get("reprises_heures", [])
+                               if not (r.get("id") == rid and r.get("agent_id") == aid)]
+    save(data)
+    return jsonify({"removed": avant - len(data["reprises_heures"])})
 
 # ── SYNC GOOGLE AGENDA (sens unique : programme -> calendrier dédié) ─────────
 GOOGLE_CLIENT_ID     = os.environ.get("GOOGLE_CLIENT_ID", "")
@@ -2642,6 +2817,7 @@ def api_day(aid, date_str):
     remarks = data.get("remarks", {}).get(aid, {})
     info = get_day_info(d, aid, data)
     info["remark"] = remarks.get(date_str, "")
+    info["echanges"] = _exchange_marks(data, aid).get(date_str, [])
     agent = data["agents"][aid]
     offset = agent["team_offset"]
     delta = (d - ANCHOR).days
@@ -2784,6 +2960,9 @@ select:focus,input:focus{border-color:var(--accent)}
 .day-reason{font-size:11px;font-weight:600;margin-top:auto;line-height:1.3;
   overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;opacity:.85;}
 .day-remark{font-size:9px;color:var(--accent);opacity:.9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;margin-top:1px}
+.badge-ech{display:inline-block;font-size:8px;font-weight:800;border-radius:4px;padding:1px 4px;margin-top:2px;letter-spacing:.3px}
+.ech-due{background:#7f1d1d;color:#fecaca}.ech-ok{background:#1e3a8a;color:#bfdbfe}.ech-back{background:#14532d;color:#bbf7d0}
+.nav-badge{display:inline-block;background:#dc2626;color:#fff;border-radius:10px;font-size:10px;font-weight:800;padding:1px 6px;margin-left:6px}
 .badge-decale{display:inline-block;font-size:8px;font-weight:800;background:#374151;color:#fbbf24;border-radius:4px;padding:1px 4px;margin-top:2px;letter-spacing:.3px}
 .remark-dot{display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--accent);margin-right:2px;vertical-align:middle;flex-shrink:0}
 /* Remarques : épingle visible (tous appareils) + popup au survol + alerte modal */
@@ -3030,6 +3209,7 @@ select:focus,input:focus{border-color:var(--accent)}
   .day-reason{font-size:7px;-webkit-line-clamp:1;margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .day-remark{display:none}
   .badge-decale{font-size:6px;padding:1px 2px}
+  .badge-ech{font-size:6px;padding:1px 2px}
 
   /* Entitlements scrollable */
   #entitlements-bar{padding:6px 8px}
@@ -3289,15 +3469,27 @@ select:focus,input:focus{border-color:var(--accent)}
         <option value="2">4/5 : Mercredi</option><option value="3">4/5 : Jeudi</option>
         <option value="4">4/5 : Vendredi</option>
       </select>
-      <input id="auth-birth" type="date" max="2007-12-31"
+      <input id="auth-birth" type="date" required max="2007-12-31"
         style="width:100%;padding:11px;border-radius:8px;border:1px solid #475569;background:#0f172a;color:#94a3b8;font-size:.9rem;box-sizing:border-box;margin-bottom:10px">
-      <div style="color:#64748b;font-size:.72rem;text-align:left;margin:-4px 0 10px">Date de naissance (calcul des congés selon l'âge) — optionnel</div>
+      <div style="color:#64748b;font-size:.72rem;text-align:left;margin:-4px 0 10px">Date de naissance <b>obligatoire</b> (jour, mois et année : calcul exact de l'âge et des congés)</div>
     </div>
     <button id="auth-submit" onclick="doAuth()"
       style="width:100%;padding:12px;border-radius:8px;background:#3b82f6;color:#fff;font-weight:700;font-size:1rem;border:none;cursor:pointer">
       Connexion
     </button>
     <p id="auth-error" style="color:#ef4444;font-size:.82rem;margin:10px 0 0;display:none"></p>
+  </div>
+</div>
+
+<!-- DATE DE NAISSANCE MANQUANTE (anciens comptes) -->
+<div id="birth-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.88);z-index:9998;align-items:center;justify-content:center">
+  <div style="background:#1e293b;border-radius:14px;padding:26px;width:min(92vw,360px);text-align:center;color:#f1f5f9">
+    <div style="font-size:1.1rem;font-weight:800;margin-bottom:6px">🎂 Date de naissance requise</div>
+    <div style="font-size:.8rem;color:#94a3b8;margin-bottom:14px">Elle sert au calcul exact de votre âge et de vos droits au congé annuel. Vos autres données ne sont pas modifiées.</div>
+    <input id="birth-input" type="date" max="2007-12-31"
+      style="width:100%;padding:11px;border-radius:8px;border:1px solid #475569;background:#0f172a;color:#f1f5f9;font-size:1rem;box-sizing:border-box;margin-bottom:10px">
+    <button onclick="saveBirthDate()" style="width:100%;padding:12px;border-radius:8px;background:#3b82f6;color:#fff;font-weight:700;font-size:1rem;border:none;cursor:pointer">Enregistrer</button>
+    <p id="birth-error" style="color:#ef4444;font-size:.82rem;margin:10px 0 0;display:none"></p>
   </div>
 </div>
 
@@ -3318,11 +3510,15 @@ select:focus,input:focus{border-color:var(--accent)}
   </button>
   <button class="nav-btn" onclick="showView('exchanges')">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 16V4m0 0L3 8m4-4l4 4M17 8v12m0 0l4-4m-4 4l-4-4"/></svg>
-    Échanges
+    Échanges<span class="nav-badge" id="nav-ech-badge" style="display:none"></span>
   </button>
   <button class="nav-btn" onclick="showView('ficherh')">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="16" y2="17"/></svg>
     Fiche RH
+  </button>
+  <button class="nav-btn" onclick="showView('heures')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg>
+    Heures reprises
   </button>
   <button class="nav-btn" onclick="openAgentModal()">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
@@ -3444,12 +3640,12 @@ select:focus,input:focus{border-color:var(--accent)}
       </div>
       <div class="card" id="card-regime">
         <h3>Régime de travail</h3>
-        <div style="font-size:11px;color:var(--muted);margin-bottom:10px">Cycle d'équipe par défaut. Un régime fixe ou mi-temps remplace le cycle — vous gardez la possibilité de changer le poste d'un jour donné (travail en pause) via le détail du jour.</div>
+        <div style="font-size:11px;color:var(--muted);margin-bottom:10px">Cycle d'équipe par défaut. Un service fixe remplace uniquement les plages M/S de la grille (tous les repos sont conservés) ; le mi-temps remplace le cycle — vous gardez la possibilité de changer le poste d'un jour donné (travail en pause) via le détail du jour.</div>
         <select id="wr-select" onchange="onWorkRegimeChange()" style="width:100%;padding:8px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px;margin-bottom:8px">
           <option value="">🔄 Cycle d'équipe (défaut)</option>
-          <option value="fixe_M">🌅 Fixe Matin — Lun-Ven</option>
-          <option value="fixe_S">🌆 Fixe Soir — Lun-Ven</option>
-          <option value="fixe_N">🌙 Fixe Nuit (22h-06h30) — Lun-Ven</option>
+          <option value="fixe_M">🌅 Fixe Matin — repos de la grille conservés</option>
+          <option value="fixe_S">🌆 Fixe Soir — repos de la grille conservés</option>
+          <option value="fixe_N">🌙 Fixe Nuit (22h-06h30) — repos de la grille conservés</option>
           <option value="mi_temps">½ Mi-temps — 1 jour sur 2</option>
         </select>
         <div id="wr-mitemps" style="display:none;flex-direction:column;gap:8px">
@@ -3493,7 +3689,7 @@ select:focus,input:focus{border-color:var(--accent)}
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;flex-wrap:wrap;gap:10px">
       <div>
         <div style="font-size:15px;font-weight:700;color:var(--text)">Échanges de service</div>
-        <div style="font-size:11px;color:var(--muted);margin-top:2px">Suivi des changements hiérarchie + échanges collègues</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:2px">Changements demandés par le planning (jours à rendre au plus vite) + échanges entre collègues</div>
       </div>
       <button class="btn btn-primary" onclick="openExchangeModal()">+ Nouvel échange</button>
     </div>
@@ -3504,6 +3700,31 @@ select:focus,input:focus{border-color:var(--accent)}
       <button onclick="filterExchanges('done',this)">✅ Soldés</button>
     </div>
     <div class="exch-list" id="exch-list"></div>
+  </div>
+
+  <!-- HEURES REPRISES VIEW -->
+  <div id="heures-content" style="flex:1;padding:24px;overflow-y:auto;display:none">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px">
+      <div>
+        <div style="font-size:15px;font-weight:700;color:var(--text)">Heures reprises</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:2px">Indiquez chaque fois que vous reprenez (récupérez) des heures : le total se calcule automatiquement.</div>
+      </div>
+    </div>
+    <div class="exch-balance-grid" id="hr-totaux"></div>
+    <div class="card" style="margin-bottom:16px">
+      <h3>Ajouter une reprise d'heures</h3>
+      <div class="form-row">
+        <div class="form-group"><label>Date de la reprise</label><input type="date" id="hr-date"></div>
+        <div class="form-group"><label>Durée reprise</label>
+          <div style="display:flex;gap:8px;align-items:center">
+            <input type="number" id="hr-h" min="0" max="24" value="0" style="width:80px"> h
+            <input type="number" id="hr-m" min="0" max="59" value="0" style="width:80px"> min
+          </div></div>
+      </div>
+      <div class="form-group"><label>Motif / remarque (facultatif)</label><input type="text" id="hr-note" maxlength="200" placeholder="Ex: récupération heures supplémentaires du 12/09"></div>
+      <button class="btn btn-primary" onclick="addReprise()">+ Enregistrer la reprise</button>
+    </div>
+    <div class="exch-list" id="hr-list"></div>
   </div>
 
   <!-- FICHE RH VIEW -->
@@ -3622,6 +3843,7 @@ select:focus,input:focus{border-color:var(--accent)}
         <div class="dm-week-strip" id="dm-week-strip"></div>
       </div>
       <div class="dm-events-section" id="dm-events"></div>
+      <div class="dm-events-section" id="dm-echanges"></div>
     </div>
     <div class="dm-shift-override">
       <div class="dm-sec-label">🔄 Changer le poste</div>
@@ -3654,6 +3876,23 @@ select:focus,input:focus{border-color:var(--accent)}
 </div>
 
 <!-- MODAL ÉCHANGE DE SERVICE -->
+<div class="modal-overlay" id="repay-modal">
+  <div class="modal" style="width:420px">
+    <h2>Jour rendu <span class="close" onclick="closeModal('repay-modal')">✕</span></h2>
+    <div class="form-row">
+      <div class="form-group"><label>Date du jour rendu / remboursé</label><input type="date" id="rp-date"></div>
+      <div class="form-group"><label>Poste</label>
+        <select id="rp-poste"><option value="R">🟢 Repos (R)</option><option value="">— Non précisé</option>
+          <option value="M">🔴 Matin (M)</option><option value="S">🟠 Soir (S)</option></select></div>
+    </div>
+    <label id="rp-cal-row" style="display:flex;gap:8px;align-items:center;font-size:12px;margin-bottom:12px"><input type="checkbox" id="rp-apply-cal" checked style="width:auto;flex:none;margin:0"> Mettre ce jour en repos dans mon calendrier</label>
+    <div class="modal-footer">
+      <button class="btn" style="background:var(--card2);color:var(--muted)" onclick="closeModal('repay-modal')">Annuler</button>
+      <button class="btn btn-primary" onclick="confirmRepay()">Enregistrer</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal-overlay" id="exchange-modal">
   <div class="modal" style="width:480px">
     <h2>Échange de service <span class="close" onclick="closeModal('exchange-modal')">✕</span></h2>
@@ -3661,7 +3900,7 @@ select:focus,input:focus{border-color:var(--accent)}
       <label>Type d'échange</label>
       <select id="ex-type" onchange="onExTypeChange()">
         <option value="collegue">Échange avec un collègue</option>
-        <option value="hierarchie">Changement imposé par la hiérarchie</option>
+        <option value="hierarchie">Demande du planning (travail sur un jour non prévu)</option>
       </select>
     </div>
     <div id="ex-collegue-section">
@@ -3682,17 +3921,23 @@ select:focus,input:focus{border-color:var(--accent)}
     <div class="form-row">
       <div class="form-group">
         <label>Date du service échangé</label>
-        <input type="date" id="ex-date-service">
+        <input type="date" id="ex-date-service" onchange="onExDateChange()">
       </div>
       <div class="form-group">
         <label>Poste ce jour-là</label>
         <select id="ex-poste-service">
           <option value="M">🔴 Matin (M)</option>
           <option value="S">🟠 Soir (S)</option>
+          <option value="N">🌙 Nuit (N)</option>
           <option value="R">🟢 Repos (R)</option>
           <option value="">— Non précisé</option>
         </select>
       </div>
+    </div>
+    <div id="ex-hier-section" style="display:none;margin-bottom:12px">
+      <div id="ex-prevu-hint" style="font-size:12px;padding:8px 10px;border-radius:8px;background:var(--card2);color:var(--muted);margin-bottom:8px"></div>
+      <label style="display:flex;gap:8px;align-items:center;font-size:12px;margin-bottom:6px"><input type="checkbox" id="ex-a-rendre" checked style="width:auto;flex:none;margin:0"> Jour à me rendre par le planning (le plus rapidement possible)</label>
+      <label style="display:flex;gap:8px;align-items:center;font-size:12px"><input type="checkbox" id="ex-apply-cal" checked style="width:auto;flex:none;margin:0"> Mettre mon calendrier à jour (poste presté ce jour-là)</label>
     </div>
     <div class="form-row">
       <div class="form-group">
@@ -3766,6 +4011,8 @@ async function init() {
   populateCatalog();
   await loadAgents();   // ne renvoie QUE l'agent connecté -> curAgent = soi
   chargerMedex();       // liaison MEDEX (calendrier commun) : état + bandeau
+  ensureBirthDate();    // date de naissance manquante (anciens comptes) : demandée
+  majBadgeEchanges(true); // jours à rendre par le planning : pastille + alerte
   // Mode mono-agent : masquer la sélection d'équipe et d'agent (un agent ne voit que lui)
   ['team-btns','mobile-team-bar','mobile-agent-bar','team-section-label'].forEach(id=>{
     const e=document.getElementById(id); if(e) e.style.display='none';
@@ -3914,8 +4161,7 @@ function updateAgentInfo(agents) {
   const a = agents[curAgent];
   let age_str = '';
   if(a.birth_date) {
-    const age = new Date().getFullYear() - parseInt(a.birth_date.split('-')[0]);
-    age_str = `${age} ans`;
+    age_str = `${ageExact(a.birth_date)} ans`;
   } else if(a.age) age_str = `${a.age} ans`;
   let info = age_str ? `${age_str} | ` : '';
   info += teamLabel(a.team_offset);
@@ -3929,9 +4175,9 @@ function updateAgentInfo(agents) {
 
 // ── RÉGIME DE TRAVAIL (fixe M/S/N, mi-temps 1j/2) ──
 const WR_LABELS={
-  fixe_M:'Fixe Matin (06:00-14:00, Lun-Ven, week-end repos)',
-  fixe_S:'Fixe Soir (14:00-22:00, Lun-Ven, week-end repos)',
-  fixe_N:'Fixe Nuit (22:00-06:30, Lun-Ven, week-end repos)',
+  fixe_M:'Fixe Matin (06:00-14:00 — repos R/36/38 de la grille conservés)',
+  fixe_S:'Fixe Soir (14:00-22:00 — repos R/36/38 de la grille conservés)',
+  fixe_N:'Fixe Nuit (22:00-06:30 — repos R/36/38 de la grille conservés)',
   mi_temps:'Mi-temps : 1 jour travaillé / 1 jour repos'
 };
 function onWorkRegimeChange(){
@@ -3955,17 +4201,22 @@ function fillWorkRegime(a){
   }
   // Interaction 4/5 <-> régime : le régime personnalisé suspend le 4/5 -> le dire clairement
   const c45=document.getElementById('card-45');
-  if(c45) c45.style.opacity = a.work_regime ? .5 : 1;
-  if(a.work_regime && a.regime_4_5 != null){
+  const _mt = a.work_regime==='mi_temps';
+  if(c45) c45.style.opacity = _mt ? .5 : 1;
+  if(a.regime_4_5 != null){
     const l45=document.getElementById('label-45');
-    if(l45) l45.textContent = "⚠ 4/5 suspendu : un régime de travail personnalisé est actif. Repassez sur « Cycle d'équipe » pour le réactiver.";
+    if(l45) l45.textContent = _mt
+      ? "⚠ 4/5 suspendu : le mi-temps est actif (incompatible). Repassez sur « Cycle d'équipe » ou un service fixe pour le réactiver."
+      : (a.work_regime
+          ? `Jour actif : ${WD_FR[a.regime_4_5]} — cumulé avec votre service fixe (repos de la grille décalés comme pour tout agent).`
+          : `Jour actif : ${WD_FR[a.regime_4_5]} — le 36/38 de la semaine est absorbé automatiquement.`);
   }
 }
 async function saveWorkRegime(){
   if(!curAgent){ toast('Sélectionnez un agent','error'); return; }
   const v=document.getElementById('wr-select').value;
-  if(v && document.querySelector('.btn-45.active')){
-    if(!confirm("Ce régime remplace le cycle d'équipe ET suspend votre 4/5 tant qu'il est actif. Continuer ?")) return;
+  if(v==='mi_temps' && document.querySelector('.btn-45.active')){
+    if(!confirm("Le mi-temps remplace le cycle d'équipe ET suspend votre 4/5 tant qu'il est actif. Continuer ?")) return;
   }
   const body={work_regime:v||null};
   if(v==='mi_temps'){
@@ -3999,8 +4250,8 @@ function refresh45UI(wd) {
 async function set45(wd) {
   if(!curAgent){ toast('Sélectionnez un agent','error'); return; }
   const _wr=document.getElementById('wr-select');
-  if(wd!=null && _wr && _wr.value){
-    if(!confirm("Un régime de travail personnalisé est actif : le 4/5 ne s'appliquera que si vous repassez sur « Cycle d'équipe ». Continuer ?")) return;
+  if(wd!=null && _wr && _wr.value==='mi_temps'){
+    if(!confirm("Le mi-temps est actif : le 4/5 ne s'appliquera que si vous repassez sur « Cycle d'équipe » ou un service fixe. Continuer ?")) return;
   }
   const r = await fetch(`/api/agents/${curAgent}`, {
     method:'PATCH',
@@ -4079,8 +4330,7 @@ function renderAgentList(agents) {
   el.innerHTML = Object.entries(agents).map(([id,a])=>{
     let meta = id;
     if(a.birth_date) {
-      const age = new Date().getFullYear() - parseInt(a.birth_date.split('-')[0]);
-      meta += ` · ${age} ans (né ${a.birth_date})`;
+      meta += ` · ${ageExact(a.birth_date)} ans (né ${a.birth_date})`;
     } else if(a.age) meta += ` · ${a.age} ans`;
     if(a.career_start) meta += ` · carrière depuis ${a.career_start}`;
     const warn = !a.birth_date ? ' <span style="color:#fb923c;font-size:10px">⚠ Ajouter date naissance</span>' : '';
@@ -4227,11 +4477,12 @@ function showView(v) {
   document.getElementById('annual-content').style.display    = v==='annuel'    ? 'block' : 'none';
   document.getElementById('exchanges-content').style.display = v==='exchanges' ? 'block' : 'none';
   document.getElementById('ficherh-content').style.display   = v==='ficherh'   ? 'block' : 'none';
-  const titles={calendar:'Calendrier',annuel:'Vue annuelle',exchanges:'Échanges de service',ficherh:'Fiche RH'};
+  document.getElementById('heures-content').style.display    = v==='heures'    ? 'block' : 'none';
+  const titles={calendar:'Calendrier',annuel:'Vue annuelle',exchanges:'Échanges de service',ficherh:'Fiche RH',heures:'Heures reprises'};
   document.getElementById('view-title').textContent = titles[v]||v;
   document.querySelectorAll('.nav-btn').forEach((b,i)=>{
     b.classList.toggle('active',
-      (i===0&&v==='calendar')||(i===1&&v==='annuel')||(i===2&&v==='exchanges')||(i===3&&v==='ficherh'));
+      (i===0&&v==='calendar')||(i===1&&v==='annuel')||(i===2&&v==='exchanges')||(i===3&&v==='ficherh')||(i===4&&v==='heures'));
   });
   refresh();
 }
@@ -4242,6 +4493,7 @@ function refresh() {
   } else if(curView==='annuel') renderAnnual();
   else if(curView==='exchanges') renderExchanges();
   else if(curView==='ficherh') renderFicheRH();
+  else if(curView==='heures') renderHeures();
   updateWeekToggleBtn();
 }
 
@@ -4792,6 +5044,12 @@ function renderGrid(cal) {
       ? '<div class="badge-decale">38h &#8595;</div>'
       : (day.decale_r ? '<div class="badge-decale">R &#8595;</div>' : '');
 
+    const echHtml = (day.echanges||[]).map(m=>{
+      if(m.role==='rendu') return '<div class="badge-ech ech-back">↩ jour rendu</div>';
+      if(m.type==='hierarchie') return (m.a_rendre && m.status==='pending')
+        ? '<div class="badge-ech ech-due">⚠ à rendre</div>' : '<div class="badge-ech ech-ok">🏛 planning</div>';
+      return '<div class="badge-ech ech-ok">↔ échange</div>';
+    }).join('');
     const remAttr = hasRemark ? ' data-rem="'+encodeURIComponent(day.remark)+'"' : '';
     const pinHtml = hasRemark ? '<span class="rem-pin">📌</span>' : '';
     html+='<div class="cal-day '+bCls+' '+cCls+' '+nCls+' '+todayCls+' '+weCls+'"'
@@ -4805,6 +5063,7 @@ function renderGrid(cal) {
         +'<div class="day-num">'+day.day_num+'</div>'
         +(reasonTxt?'<div class="day-reason">'+reasonTxt+'</div>':'')
         +decaleHtml
+        +echHtml
         +remarkHtml
         +'</div>';
   });
@@ -5004,6 +5263,21 @@ async function renderDayModal(dateStr) {
     evHTML+=`<div style="color:var(--muted);font-size:12px;padding:10px 0">Aucun congé enregistré pour ce jour.</div>`;
   }
   document.getElementById('dm-events').innerHTML=evHTML;
+  // Échanges de service liés à ce jour (jour presté / jour rendu)
+  const echs=d.echanges||[];
+  document.getElementById('dm-echanges').innerHTML = echs.length
+    ? '<div class="dm-sec-title">Échanges de service</div>'+echs.map(m=>{
+        const who = m.type==='hierarchie' ? 'Planning' : (m.colleague||'Collègue');
+        let txt;
+        if(m.role==='rendu') txt=`↩ Jour rendu par ${who}`+(m.date_service?` (en échange du ${fmtFR(m.date_service)})`:'');
+        else if(m.type==='hierarchie') txt = m.a_rendre
+            ? (m.status==='pending' ? '⚠ Travail demandé par le planning un jour non prévu — <b>jour à rendre au plus vite</b>'
+                                    : `✅ Demandé par le planning — rendu le ${fmtFR(m.date_remboursement)}`)
+            : '🏛 Changement de poste demandé par le planning';
+        else txt=`↔ Échange avec ${who} (${m.direction==='donne'?"j'ai travaillé pour lui/elle":"il/elle a travaillé pour moi"})`;
+        return `<div class="dm-event-row"><div><div class="dm-ev-label">${txt}</div>${m.note?`<div class="dm-ev-meta">${m.note}</div>`:''}</div></div>`;
+      }).join('')
+    : '';
 
   // Remarque
   const remEl = document.getElementById('dm-remark-area');
@@ -5532,11 +5806,12 @@ function renderExchangeBalance(balance) {
   const area = document.getElementById('exch-balance-area');
   let html = '<div class="exch-balance-grid">';
   // Hiérarchie
-  const hp = balance.hierarchie_pending || 0;
-  html += `<div class="exch-balance-card">
-    <div class="ebc-title">🏛 Hiérarchie</div>
-    <div class="ebc-num" style="color:${hp>0?'var(--orange)':'var(--green)'}">${hp}</div>
-    <div class="ebc-sub">compensation${hp>1?'s':''} à récupérer</div>
+  const hp = balance.a_rendre ?? balance.hierarchie_pending ?? 0;
+  const old = balance.plus_ancien_jours || 0;
+  html += `<div class="exch-balance-card" ${hp>0?'style="border-color:var(--red)"':''}>
+    <div class="ebc-title">🏛 Planning</div>
+    <div class="ebc-num" style="color:${hp>0?'var(--red)':'var(--green)'}">${hp}</div>
+    <div class="ebc-sub">jour${hp>1?'s':''} à rendre par le planning${hp>0?` — le plus ancien depuis ${old} j : à réclamer au plus vite`:''}</div>
   </div>`;
   // Collègues
   const cols = balance.collegues || {};
@@ -5582,9 +5857,9 @@ function renderExchangeList(exs, filter) {
     // Type badge
     const dir    = ex.direction;
     const typeCls= isHier?'hier':(dir==='donne'?'col-donne':'col-recu');
-    const typeTxt= isHier?'🏛 Hiérarchie':(dir==='donne'?'↗ J\'ai donné':'↙ J\'ai reçu');
+    const typeTxt= isHier?'🏛 Planning':(dir==='donne'?'↗ J\'ai donné':'↙ J\'ai reçu');
     // Who
-    const who    = isHier?'<span style="color:var(--muted);font-style:italic">Hiérarchie</span>'
+    const who    = isHier?'<span style="color:var(--muted);font-style:italic">Planning'+(ex.jour_prevu?' — prévu ce jour : '+ex.jour_prevu:'')+'</span>'
       :`<span style="font-weight:800">${ex.colleague||'?'}</span>`;
     // Remboursement
     let rembHtml = '';
@@ -5593,14 +5868,24 @@ function renderExchangeList(exs, filter) {
       const drf = dr.toLocaleDateString('fr-BE',{day:'2-digit',month:'2-digit',year:'numeric'});
       rembHtml  = `<span style="font-size:11px;color:var(--green);margin-left:10px">✅ rembours. ${drf}${ex.poste_remboursement?posteTag(ex.poste_remboursement):''}</span>`;
     }
+    let statusHtml = `<div class="exr-status ${ex.status}">${isDone?'✅ Soldé':'⏳ En attente'}</div>`;
+    if(isHier && ex.a_rendre!==false){
+      const att = ex.attente_jours;
+      const urgent = !isDone && att!==null && att>=14;
+      statusHtml = isDone
+        ? '<div class="exr-status done">✅ Jour rendu</div>'
+        : `<div class="exr-status pending" style="${urgent?'background:rgba(220,38,38,.25);color:#fecaca':''}">⚠ À rendre${att!==null?` · depuis ${att} j`:''}</div>`;
+    } else if(isHier){
+      statusHtml = '<div class="exr-status done">✅ Pas de jour à rendre</div>';
+    }
     return `<div class="exch-row">
       <div class="exr-date">${dsf}</div>
       <div class="exr-type ${typeCls}">${typeTxt}</div>
       <div class="exr-who">${who}${posteTag(ex.poste_service)}${rembHtml}</div>
       ${ex.note?`<div class="exr-note" title="${ex.note}">📝 ${ex.note}</div>`:''}
-      <div class="exr-status ${ex.status}">${isDone?'✅ Soldé':'⏳ En attente'}</div>
+      ${statusHtml}
       <div class="exr-actions">
-        ${!isDone?`<button class="btn btn-sm btn-green" onclick="markRepaid('${ex.id}')" title="Marquer remboursé">✓ Soldé</button>`:''}
+        ${!isDone?`<button class="btn btn-sm btn-green" onclick="markRepaid('${ex.id}')" title="Le planning m'a rendu un jour / échange remboursé">✓ Jour rendu</button>`:''}
         <button class="btn btn-sm btn-danger" onclick="deleteExchange('${ex.id}')" title="Supprimer">🗑</button>
       </div>
     </div>`;
@@ -5617,6 +5902,21 @@ function filterExchanges(f,btn){
 function onExTypeChange(){
   const t=document.getElementById('ex-type').value;
   document.getElementById('ex-collegue-section').style.display=t==='collegue'?'block':'none';
+  document.getElementById('ex-hier-section').style.display=t==='hierarchie'?'block':'none';
+  if(t==='hierarchie') onExDateChange();
+}
+// Ce qui était prévu ce jour-là : décide si le jour est « à rendre »
+async function onExDateChange(){
+  if(document.getElementById('ex-type').value!=='hierarchie') return;
+  const d=document.getElementById('ex-date-service').value;
+  const hint=document.getElementById('ex-prevu-hint');
+  if(!d||!curAgent){ hint.textContent=''; return; }
+  const r=await fetch(`/api/exchanges/${curAgent}/preview/${d}`).then(x=>x.json()).catch(()=>null);
+  if(!r||r.error){ hint.textContent=''; return; }
+  document.getElementById('ex-a-rendre').checked=!!r.prevu_repos;
+  hint.innerHTML = r.prevu_repos
+    ? `Ce jour-là, vous n'étiez <b>pas censé travailler</b> (${r.label}) : le planning doit vous le rendre au plus vite.`
+    : `Ce jour-là, vous deviez travailler (${r.label}) : simple changement de poste, rien à rendre (décochez/cochez si besoin).`;
 }
 
 function openExchangeModal(){
@@ -5629,6 +5929,8 @@ function openExchangeModal(){
   document.getElementById('ex-poste-remb').value    = '';
   document.getElementById('ex-note').value          = '';
   document.getElementById('ex-collegue-section').style.display='block';
+  document.getElementById('ex-hier-section').style.display='none';
+  document.getElementById('ex-prevu-hint').textContent='';
   document.getElementById('exchange-modal').classList.add('open');
 }
 
@@ -5650,29 +5952,97 @@ async function saveExchange(){
     poste_remboursement: document.getElementById('ex-poste-remb').value||null,
     note:                document.getElementById('ex-note').value.trim(),
   };
+  if(type==='hierarchie') payload.a_rendre = document.getElementById('ex-a-rendre').checked;
   const r = await fetch('/api/exchanges',{
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify(payload)
   });
-  if(r.ok){ closeModal('exchange-modal'); toast('Échange enregistré ✅'); renderExchanges(); }
+  if(r.ok){
+    // Le planning a demandé un poste : le calendrier montre ce poste (si coché)
+    if(type==='hierarchie' && document.getElementById('ex-apply-cal').checked
+       && ['M','S','N'].includes(payload.poste_service)){
+      await fetch(`/api/shift_override/${curAgent}/${dateService}`,{method:'PUT',
+        headers:{'Content-Type':'application/json'},body:JSON.stringify({shift:payload.poste_service})});
+    }
+    closeModal('exchange-modal'); toast('Échange enregistré ✅'); renderExchanges(); majBadgeEchanges();
+    if(curView==='calendar') refresh();
+  }
   else toast('Erreur','error');
 }
 
-async function markRepaid(eid){
-  const today = new Date().toISOString().slice(0,10);
-  const dateRemb = prompt('Date de remboursement :', today);
-  if(dateRemb===null) return;
-  const posteOpts = ['M — Matin','S — Soir','R — Repos',''];
-  const posteRemb = prompt('Poste remboursement (M / S / R ou laisser vide) :', '')
-  const r = await fetch(`/api/exchanges/${eid}`,{
+let _repayId=null;
+function markRepaid(eid){
+  const ex=_allExchanges.find(e=>e.id===eid); if(!ex) return;
+  _repayId=eid;
+  document.getElementById('rp-date').value=new Date().toISOString().slice(0,10);
+  document.getElementById('rp-poste').value=ex.type==='hierarchie'?'R':'';
+  document.getElementById('rp-cal-row').style.display=ex.type==='hierarchie'?'flex':'none';
+  document.getElementById('rp-apply-cal').checked=ex.type==='hierarchie';
+  document.getElementById('repay-modal').classList.add('open');
+}
+async function confirmRepay(){
+  const dateRemb=document.getElementById('rp-date').value;
+  if(!dateRemb){ toast('Date requise','error'); return; }
+  const posteRemb=document.getElementById('rp-poste').value;
+  const ex=_allExchanges.find(e=>e.id===_repayId);
+  const r = await fetch(`/api/exchanges/${_repayId}`,{
     method:'PATCH', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({
-      date_remboursement: dateRemb||null,
-      poste_remboursement: (posteRemb||'').toUpperCase()||null
-    })
+    body: JSON.stringify({date_remboursement: dateRemb, poste_remboursement: posteRemb||null})
   });
-  if(r.ok){ toast('Échange soldé ✅'); renderExchanges(); }
+  if(r.ok){
+    if(ex && ex.type==='hierarchie' && posteRemb==='R' && document.getElementById('rp-apply-cal').checked){
+      await fetch(`/api/shift_override/${curAgent}/${dateRemb}`,{method:'PUT',
+        headers:{'Content-Type':'application/json'},body:JSON.stringify({shift:'R'})});
+    }
+    closeModal('repay-modal'); toast('Jour rendu enregistré ✅'); renderExchanges(); majBadgeEchanges();
+    if(curView==='calendar') refresh();
+  }
   else toast('Erreur','error');
+}
+
+// Pastille d'alerte : jours à rendre par le planning
+async function majBadgeEchanges(first){
+  if(!curAgent) return;
+  const b=await fetch(`/api/exchanges/${curAgent}/balance`).then(r=>r.json()).catch(()=>null);
+  const el=document.getElementById('nav-ech-badge'); if(!el||!b) return;
+  const n=b.a_rendre||0;
+  el.style.display=n?'inline-block':'none'; el.textContent=n;
+  if(n && first) toast(`⚠ ${n} jour${n>1?'s':''} à rendre par le planning (le plus ancien depuis ${b.plus_ancien_jours} j)`,'error');
+}
+
+// ── HEURES REPRISES ──
+const fmtHM=m=>{m=parseInt(m)||0;return Math.floor(m/60)+' h '+String(m%60).padStart(2,'0');};
+const fmtFR=iso=>{if(!iso)return'';const p=iso.split('-');return p[2]+'/'+p[1]+'/'+p[0];};
+async function renderHeures(){
+  if(!curAgent) return;
+  const dt=document.getElementById('hr-date'); if(dt&&!dt.value) dt.value=new Date().toISOString().slice(0,10);
+  const j=await fetch(`/api/reprises/${curAgent}`).then(r=>r.json()).catch(()=>null);
+  if(!j) return;
+  const an=String(new Date().getFullYear());
+  let tot=`<div class="exch-balance-card"><div class="ebc-title">Total général repris</div><div class="ebc-num" style="color:var(--green)">${fmtHM(j.total_minutes)}</div><div class="ebc-sub">${j.items.length} reprise${j.items.length>1?'s':''} enregistrée${j.items.length>1?'s':''}</div></div>`;
+  Object.keys(j.par_annee).sort().reverse().forEach(a=>{
+    tot+=`<div class="exch-balance-card"><div class="ebc-title">Année ${a}${a===an?' (en cours)':''}</div><div class="ebc-num">${fmtHM(j.par_annee[a])}</div><div class="ebc-sub">repris en ${a}</div></div>`;
+  });
+  document.getElementById('hr-totaux').innerHTML=tot;
+  document.getElementById('hr-list').innerHTML = j.items.length ? j.items.map(r=>`
+    <div class="exch-row"><div class="exr-date">${fmtFR(r.date)}</div>
+      <div class="exr-who">${fmtHM(r.minutes)} reprises${r.note?` <span class="exr-note" style="display:inline" title="${r.note}">📝 ${r.note}</span>`:''}</div>
+      <div class="exr-actions"><button class="btn btn-sm btn-danger" onclick="delReprise('${r.id}')" title="Supprimer">🗑</button></div></div>`).join('')
+    : '<div style="color:var(--muted);text-align:center;padding:30px;background:var(--card);border-radius:10px;border:1px solid var(--border)">Aucune reprise d\'heures enregistrée.</div>';
+}
+async function addReprise(){
+  const body={date:document.getElementById('hr-date').value,heures:document.getElementById('hr-h').value,
+              minutes:document.getElementById('hr-m').value,note:document.getElementById('hr-note').value.trim()};
+  const r=await fetch(`/api/reprises/${curAgent}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok){ toast(j.error||'Erreur','error'); return; }
+  document.getElementById('hr-h').value=0; document.getElementById('hr-m').value=0; document.getElementById('hr-note').value='';
+  toast('Reprise enregistrée ✅'); renderHeures();
+}
+async function delReprise(id){
+  if(!confirm('Supprimer cette reprise d\'heures ?')) return;
+  const r=await fetch(`/api/reprises/${curAgent}/${id}`,{method:'DELETE'});
+  if(r.ok){ toast('Supprimée'); renderHeures(); } else toast('Erreur','error');
 }
 
 async function deleteExchange(eid){
@@ -5714,6 +6084,34 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape'){
   });
 })();
 
+// Âge exact (mois ET jour pris en compte) à partir d'une date AAAA-MM-JJ
+function ageExact(iso){
+  const p=String(iso||'').split('-').map(Number);
+  if(p.length!==3||!p[0]) return '?';
+  const t=new Date();
+  let a=t.getFullYear()-p[0];
+  if((t.getMonth()+1)<p[1] || ((t.getMonth()+1)===p[1] && t.getDate()<p[2])) a--;
+  return a;
+}
+// Compte existant sans date de naissance : on la demande (aucune donnée modifiée par ailleurs)
+async function ensureBirthDate(){
+  const me = await fetch('/api/auth/me').then(r=>r.json()).catch(()=>({}));
+  if(!me.logged_in || me.birth_date) return;
+  document.getElementById('birth-overlay').style.display='flex';
+}
+async function saveBirthDate(){
+  const v=document.getElementById('birth-input').value;
+  const err=document.getElementById('birth-error');
+  if(!v){ err.textContent='Indiquez votre date de naissance complète.'; err.style.display='block'; return; }
+  const r=await fetch('/api/agents/'+curAgent,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({birth_date:v})});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok){ err.textContent=j.error||'Erreur'; err.style.display='block'; return; }
+  document.getElementById('birth-overlay').style.display='none';
+  toast('Date de naissance enregistrée ✅');
+  loadAgents && loadAgents();
+  refresh();
+}
+
 // ── AUTH PAR AGENT ────────────────────────────────────────────
 let _authMode = 'login';
 function authMode(m){
@@ -5741,10 +6139,11 @@ async function doAuth(){
     const name = document.getElementById('auth-name').value.trim();
     if(!name){ _authErr('Nom obligatoire'); return; }
     const r45 = document.getElementById('auth-45').value;
+    if(!document.getElementById('auth-birth').value){ _authErr('Date de naissance obligatoire'); return; }
     payload = { id, pin, name,
       offset: parseInt(document.getElementById('auth-offset').value),
       regime_4_5: r45 === '' ? null : parseInt(r45),
-      birth_date: document.getElementById('auth-birth').value || null };
+      birth_date: document.getElementById('auth-birth').value };
     url = '/api/auth/register';
   } else {
     payload = { id, pin };
@@ -5846,19 +6245,14 @@ window.APP_VERSION = null;
 <script>
 /* ── Avis de mise à jour : affiché UNE fois par version à chaque utilisateur ── */
 (function(){
-  const APP_VERSION='2026-09-25-medex';
+  const APP_VERSION='2026-10-09-service';
   const NEWS=[
-    ['🔗','<b>Calendrier commun avec MEDEX Manager</b> — si vous utilisez aussi MEDEX '
-        +'(certificats médicaux, demandes de congé) : <b>Mon compte → Liaison MEDEX Manager</b>. '
-        +'Congés, maladies, grèves, remarques et postes deviennent communs aux deux programmes, '
-        +'<b>sans doublon</b>. Facultatif : sans liaison, rien ne change.'],
-    ['📄','<b>Documents MEDEX</b> — une maladie ou des vacances posées ici proposent le lien '
-        +'« Établir le document dans MEDEX » (formulaire déjà rempli). Un certificat ou une '
-        +'demande établi dans MEDEX apparaît ici avec le badge <b>DOCUMENT MEDEX</b>.'],
-    ['🚫','<b>Pas de doublon</b> — un même congé ne peut plus être encodé deux fois aux mêmes dates.'],
-    ['💻','<b>Installation sur PC</b> — raccourci HoraireManager, MEDEX Manager, Gestion des '
-        +'Rapports et modes d\'emploi en un double-clic : '
-        +'<b>medex-manager.onrender.com/download/Installer_Programmes_Namur.bat</b>.'],
+    ['📌','<b>Service fixe corrigé</b> — un service fixe Matin/Soir ne change que les plages M/S de votre grille : '
+        +'tous les repos (R, 36h, 38h) sont conservés. Le <b>4/5</b> s\'applique de la même façon qu\'avec le cycle.'],
+    ['🏛','<b>Échanges avec le planning</b> — si le planning vous fait travailler un jour où vous ne deviez pas, '
+        +'le jour est marqué <b>« à rendre »</b> (alerte, ancienneté, repère sur le calendrier) jusqu\'à ce que le planning vous le rende.'],
+    ['⏱','<b>Heures reprises</b> — nouvel onglet pour indiquer chaque reprise d\'heures, avec le total général et par année.'],
+    ['🎂','<b>Date de naissance</b> — obligatoire (calcul exact de l\'âge et des congés). Si elle manque sur votre compte, elle vous sera demandée une fois.'],
   ];
   function show(){
     if(localStorage.getItem('hm_seen_version')===APP_VERSION) return;
@@ -5870,7 +6264,7 @@ window.APP_VERSION = null;
       +'border:1px solid var(--border,#334155);border-radius:14px;max-width:540px;width:100%;'
       +'padding:22px;box-shadow:0 10px 40px rgba(0,0,0,.5);max-height:85vh;overflow-y:auto">'
       +'<div style="font-size:17px;font-weight:800;margin-bottom:4px">🆕 Mise à jour de l\'application</div>'
-      +'<div style="font-size:12px;color:var(--muted,#94a3b8);margin-bottom:14px">Nouveautés du 25/09/2026</div>'
+      +'<div style="font-size:12px;color:var(--muted,#94a3b8);margin-bottom:14px">Nouveautés du 09/10/2026</div>'
       +NEWS.map(n=>'<div style="display:flex;gap:10px;margin-bottom:12px;font-size:13.5px;line-height:1.5">'
         +'<div style="font-size:20px;flex-shrink:0">'+n[0]+'</div><div>'+n[1]+'</div></div>').join('')
       +'<button id="wn-ok" style="margin-top:6px;width:100%;padding:11px;border:none;border-radius:9px;'

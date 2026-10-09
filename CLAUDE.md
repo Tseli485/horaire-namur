@@ -26,7 +26,8 @@ render.yaml         # Config Render (disk /data 1 GB, env DATA_DIR=/data)
   "events":         [ { "aid", "date", "type", "label", "days" } ],
   "reliquats":      { "<aid>": { "<year>": float } },
   "capitals":       { "<aid>": { "sick_capital": int } },
-  "exchanges":      [ { "id", "aid1", "aid2", "date1", "date2", "status" } ],
+  "exchanges":      [ { "id", "agent_id", "type", "direction", "date_service", "date_remboursement", "status", "a_rendre", "jour_prevu" } ],
+  "reprises_heures":[ { "id", "agent_id", "date", "minutes", "note" } ],
   "remarks":        { "<aid>_<date>": "texte" },
   "shift_overrides":{ "<aid>_<date>": "M|S|R|…" },
   "fiches_rh":      { "<aid>": { "<year>": { "fiche", "importee_le", "historique" } } }
@@ -60,6 +61,18 @@ correspondance avec la fiche RH.
 
 - **`get_shift(d, offset)`** — position dans `MASTER_CYCLE[56]`, ancre `2026-01-01`.
 - **Régime 4/5** — jour désigné (lun=0…ven=4) toujours vert ; si ce jour est R/38 dans le cycle, il glisse vers la droite jusqu'au 1er M/S/36h.
+- **Service fixe** (`work_regime` = fixe_M / fixe_S / fixe_N) — la grille de l'équipe reste la référence :
+  seules les plages M/S deviennent la plage fixe ; **tous les repos R / 36 / 38 sont conservés**.
+  Le 4/5 se cumule avec les mêmes règles que pour un agent « cycle » (repos décalé, 36h isolé → plage fixe).
+  Mi-temps : remplace le cycle, incompatible avec le 4/5.
+- **Date de naissance** obligatoire (inscription + demandée une fois aux anciens comptes) ; âge exact via
+  `age_exact()` (mois ET jour). Congé annuel : âge au 01/01 + info du changement de tranche à l'anniversaire.
+- **Échanges** (`exchanges`) : type `collegue` (donné/reçu) ou `hierarchie` = demande du PLANNING. Un jour
+  prévu en repos/4-5/congé et presté à la demande du planning est « à rendre » (`a_rendre`, `jour_prevu`) :
+  reste `pending` avec ancienneté jusqu'à `date_remboursement` ; pastille d'alerte, repères calendrier
+  (`echanges` dans `/api/calendar` et `/api/day`). Anciens échanges sans `a_rendre` = à rendre (historique).
+- **Heures reprises** (`reprises_heures`, additif) : `{id, agent_id, date, minutes, note}` ;
+  `GET/POST /api/reprises/<aid>`, `DELETE /api/reprises/<aid>/<rid>` ; totaux général et par année.
 - **Fériés** — conservent le poste réel mais affichent la couleur bleue.
 - **iCal** — route `/ical/<aid>.ics` génère un flux VCALENDAR compatible Google.
 
@@ -78,7 +91,9 @@ correspondance avec la fiche RH.
 | DELETE | `/api/events` | Supprimer un événement |
 | GET | `/api/leaves_catalog` | Catalogue congés BOSA |
 | GET | `/api/exchanges/<aid>` | Échanges d'un agent |
-| POST | `/api/exchanges` | Créer un échange |
+| POST | `/api/exchanges` | Créer un échange (`hierarchie` : calcule `a_rendre`) |
+| GET | `/api/exchanges/<aid>/preview/<date>` | Ce qui était prévu ce jour-là (jour à rendre ?) |
+| GET/POST | `/api/reprises/<aid>` | Heures reprises + totaux |
 | PATCH | `/api/exchanges/<eid>` | Valider/refuser échange |
 | GET | `/ical/<aid>.ics` | Flux iCal |
 | GET | `/api/medex/status` | État de la liaison MEDEX |
