@@ -187,16 +187,51 @@ def parse_pages(pages):
     return {"agents": agents}
 
 
+_OCR_MAX_PAGES = 40
+_OCR_MIN_CHARS = 40
+_OCR_FIXES = [
+    (r"Num\S{0,3}ro de matricule", "Numéro de matricule"),
+    (r"R\S{0,3}vision de contrat", "Révision de contrat"),
+    (r"R\S{0,3}duction Absence", "Réduction Absence"),
+    (r"R\S{0,3}duction 19 j\.? ?abs\.?", "Réduction 19 j. abs"),
+    (r"Apr\S{0,3}s RT", "Après RT"),
+]
+
+
+def _ocr_page(page):
+    """OCR d'une page scannee (tesseract, langue fra) + correction des libelles abimes."""
+    try:
+        import pytesseract
+    except ImportError:
+        raise RuntimeError("OCR indisponible sur ce serveur (pytesseract absent)")
+    img = page.to_image(resolution=300).original.convert("L")
+    txt = pytesseract.image_to_string(img, lang="fra", config="--psm 6")
+    for pat, rep in _OCR_FIXES:
+        txt = re.sub(pat, rep, txt)
+    return txt
+
+
 def parse_pdf(source):
-    """`source` : chemin, objet fichier ou bytes. Retourne parse_pages(...)."""
+    """`source` : chemin, objet fichier ou bytes. Retourne parse_pages(...).
+    Les pages sans texte integre (scan) passent par l'OCR."""
     import io
     import pdfplumber
     if isinstance(source, (bytes, bytearray)):
         source = io.BytesIO(source)
+    pages = []
+    nb_ocr = 0
     with pdfplumber.open(source) as pdf:
-        pages = [p.extract_text() or "" for p in pdf.pages]
+        for p in pdf.pages:
+            txt = p.extract_text() or ""
+            if len(txt.strip()) < _OCR_MIN_CHARS:
+                if nb_ocr >= _OCR_MAX_PAGES:
+                    raise RuntimeError("PDF scanne trop long : l'OCR est limite a %d pages par import" % _OCR_MAX_PAGES)
+                txt = _ocr_page(p)
+                nb_ocr += 1
+            pages.append(txt)
     out = parse_pages(pages)
     out["nb_pages"] = len(pages)
+    out["ocr_pages"] = nb_ocr
     return out
 
 
